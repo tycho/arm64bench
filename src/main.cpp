@@ -11,9 +11,9 @@
 #include <cstring>
 
 #include "gen_integer.h"
+#include "gen_memory.h"
 
 // Forward declarations for test generators (not yet implemented):
-// #include "gen_memory.h"
 // #include "gen_branch.h"
 // #include "gen_fp_simd.h"
 // #include "gen_pitfalls.h"
@@ -122,8 +122,8 @@ int main(int argc, char** argv) {
 
     if (run_memory) {
         printf("── Memory / cache hierarchy tests ────────────────────────────\n");
-        // arm64bench::gen::run_memory_tests(default_params);
-        printf("  (not yet implemented)\n\n");
+        arm64bench::gen::run_memory_tests(default_params);
+        printf("\n");
     }
 
     if (run_branch) {

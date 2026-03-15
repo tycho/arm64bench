@@ -39,6 +39,7 @@ add_executable(arm64bench
     src/jit_buffer.cpp
     src/calibrate.cpp
     src/gen_integer.cpp
+    src/gen_memory.cpp
 )
 
 target_include_directories(arm64bench PRIVATE src)
