@@ -94,31 +94,43 @@ using namespace asmjit::a64;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 // RSB sweep: depths to test. Covers likely RSB sizes of all target platforms:
-//   Apple M1–M4 Firestorm:  ~50 entries  (Apple doesn't publish)
+//   Apple M1–M4 Firestorm:  50 entries  (confirmed empirically — see results)
 //   Cortex-A76/A78:          16 entries
 //   Cortex-X1/X2/X3:         16–32 entries
 //   Snapdragon Oryon:        ~48 entries (estimated)
 //   Cortex-A55:               8 entries
+//
+// 49/50/51 are included to pinpoint the M1 boundary with single-entry precision.
 static const uint32_t kRsbDepths[] = {
      1,  2,  3,  4,  5,  6,  7,  8,
     10, 12, 14, 16, 20, 24, 28, 32,
-    36, 40, 44, 48, 52, 56, 60, 64,
+    36, 40, 44, 48, 49, 50, 51, 52, 56, 60, 64,
 };
 static constexpr uint32_t kNumRsbDepths =
     static_cast<uint32_t>(sizeof(kRsbDepths) / sizeof(kRsbDepths[0]));
 
-// Indirect predictor sweep: numbers of distinct targets to cycle through.
-// 1 = always-same (baseline), up to 1024 (likely beyond any predictor).
-static const uint32_t kIndTargetCounts[] = {
+// Indirect predictor CYCLING test: numbers of distinct targets to cycle through
+// at a single BLR site. Tests misprediction penalty and cycling-pattern learning.
+// 1 = always-same (baseline), up to 1024.
+static const uint32_t kIndCycleCounts[] = {
     1, 2, 3, 4, 6, 8, 12, 16, 24, 32,
     48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
 };
-static constexpr uint32_t kNumIndTargetCounts =
-    static_cast<uint32_t>(sizeof(kIndTargetCounts) / sizeof(kIndTargetCounts[0]));
+static constexpr uint32_t kNumIndCycleCounts =
+    static_cast<uint32_t>(sizeof(kIndCycleCounts) / sizeof(kIndCycleCounts[0]));
 
-// Address table for the indirect branch test: pre-expanded cycling array.
-// Must be a power of 2 for the AND-mask wrapping trick.
-// 4096 entries × 8 bytes = 32KB — fits in L1 on all targets.
+// Indirect predictor CAPACITY test: numbers of distinct BLR SITES, each always
+// calling the same fixed target. Tests the predictor's (site→target) table size.
+// Capped at 64: larger values inflate loop body size and conflate prediction
+// throughput bandwidth with actual capacity limits.
+static const uint32_t kIndSiteCounts[] = {
+    1, 2, 4, 8, 12, 16, 24, 32, 48, 64,
+};
+static constexpr uint32_t kNumIndSiteCounts =
+    static_cast<uint32_t>(sizeof(kIndSiteCounts) / sizeof(kIndSiteCounts[0]));
+
+// Address table for the cycling test: pre-expanded array, power-of-2 size
+// for AND-mask wrapping. 4096 × 8B = 32KB — fits in L1 on all targets.
 static constexpr uint32_t kIndTableSize   = 4096;
 static constexpr uint32_t kIndTableMask   = kIndTableSize - 1;
 static constexpr uint32_t kIndTableBytes  = kIndTableSize * sizeof(uintptr_t);
@@ -136,12 +148,25 @@ static uint64_t rsb_loops_for_depth(uint32_t depth) {
     return (loops < 500'000) ? 500'000 : loops;
 }
 
-// Indirect: each BLR takes ~1ns when predicted, up to ~20ns when mispredicted.
-// 2M iterations at 1ns = 2ms (too short for shallow N). Scale similarly.
-// Target 100ms: loops = 100ms / (1ns * 1 BLR) = 100M for N=1 (overlong).
-// Use a fixed 5M for all N — samples are 5-50ms. Acceptable: we have 7 samples.
+// Indirect cycling test: loop count per target count N.
+// At N=1 (always predicted, ~3 clk/BLR at 3GHz): 5M loops = ~5ms — too short,
+// causing the 12% CoV we observed. Scale up for small N.
+// Target: ~50ms per sample = 50ms × 3GHz / 3 cycles = 50M loop-instructions.
+// For the capacity test (N sites, all predicted): same target.
 
-static constexpr uint64_t kIndLoops = 5'000'000;
+static uint64_t ind_cycle_loops_for_n(uint32_t /*n*/) {
+    // All cycle test entries converge to ~10 clk (mispredicting), so they're
+    // already ~16ms at 5M. Only N=1 is short (~5ms). Use 30M for all — it
+    // keeps N=1 clean (~30ms) and N≥2 at ~100ms. Cap at 30M.
+    return 30'000'000ULL;
+}
+
+static uint64_t ind_capacity_loops_for_n(uint32_t n) {
+    // Each iteration executes N BLR instructions. Target ~50ms per sample.
+    // At predicted ~3 clk/BLR: loops = 50ms × 3GHz / (3 × N) = 50M / N.
+    const uint64_t loops = 50'000'000ULL / n;
+    return (loops < 200'000) ? 200'000 : loops;
+}
 
 // ── RSB depth test builder ────────────────────────────────────────────────────
 
@@ -308,6 +333,82 @@ static JitPool::TestFn build_indirect_pred_loop(uintptr_t table_base,
     return g_jit_pool->compile(code);
 }
 
+// ── Indirect predictor CAPACITY test builder ──────────────────────────────────
+//
+// This tests the predictor's (call-site → target) table capacity, which is a
+// fundamentally different thing from the cycling test above.
+//
+// WHAT IT MEASURES:
+//   N distinct BLR instructions at N distinct code addresses, ALL calling the
+//   SAME target trampoline (address baked into x0 in the prologue). Each BLR
+//   creates one (site_address → target) association in the predictor's table.
+//
+//   When N ≤ predictor capacity: all N associations fit, all BLRs are
+//   predicted → latency ≈ same as a direct call (~3 clk/BLR).
+//
+//   When N > predictor capacity: some associations are evicted each time the
+//   loop runs, so the evicted BLR sites mispredict → latency rises.
+//
+// WHY THIS IS DIFFERENT FROM THE CYCLING TEST:
+//   Cycling test: 1 BLR site, N possible targets. Tests whether the predictor
+//     can learn a repeating N-target pattern at a single site.
+//     Result: no — the M1 predictor only tracks the last-seen target per site.
+//     Mispredicts every BLR once N≥2, regardless of pattern length.
+//
+//   Capacity test: N BLR sites, 1 target. Tests how many (site→target) pairs
+//     the predictor can hold simultaneously before evicting entries.
+//
+// GENERATED LOOP:
+//   prologue: save x19 (counter), x30 (LR)
+//   mov x0, #trampoline_addr   ← single target, never changes
+//   loop_top:
+//     BLR x0   ← site 1 at this PC
+//     BLR x0   ← site 2 at PC+4
+//     ...
+//     BLR x0   ← site N at PC+(N-1)*4
+//     sub x19, #1
+//     cbnz x19, loop_top
+//   epilogue
+//
+// BLR clobbers only x30 (= return address = instruction after the BLR).
+// The trampoline immediately RETs to that return address. x0 is untouched.
+// So x0 stays valid as the target address across all N BLR calls per iteration.
+
+static JitPool::TestFn build_ind_capacity_loop(uintptr_t trampoline_addr,
+                                                uint32_t  n_sites,
+                                                uint64_t  loops) {
+    CodeHolder code;
+    g_jit_pool->init_code_holder(code);
+    a64::Assembler a(&code);
+
+    // Minimal prologue: save only x19 (loop counter) and x30 (harness LR).
+    // x0 is caller-saved and holds the target — no need to save it.
+    a.sub(sp, sp, Imm(16));
+    a.stp(x19, x30, ptr(sp));
+
+    a.mov(x19, Imm(loops));
+    a.mov(x0, Imm(static_cast<uint64_t>(trampoline_addr)));
+
+    a.align(AlignMode::kCode, 64);
+
+    Label loop_top = a.new_label();
+    a.bind(loop_top);
+
+    // Emit n_sites BLR x0 instructions at n_sites distinct code addresses.
+    // Each BLR sets x30 = (address of next instruction), trampoline RETs there.
+    for (uint32_t s = 0; s < n_sites; ++s)
+        a.blr(x0);
+
+    a.sub(x19, x19, Imm(1));
+    a.cbnz(x19, loop_top);
+
+    a.ldp(x19, x30, ptr(sp));
+    a.add(sp, sp, Imm(16));
+    a.ret(x30);
+
+    return g_jit_pool->compile(code);
+}
+
 // ── Conditional branch throughput builder ────────────────────────────────────
 //
 // Generates a loop with `unroll` copies of a conditional branch per iteration.
@@ -430,26 +531,27 @@ static void run_rsb_tests(const BenchmarkParams& base) {
 // ════════════════════════════════════════════════════════════════════════════
 
 static void run_indirect_pred_tests(const BenchmarkParams& base) {
-    printf("\n── Indirect branch predictor capacity (BLR cycling N targets) ──\n");
-    printf("  min_ns and clk are per BLR instruction.\n"
-           "  Rising latency indicates predictor capacity exceeded.\n\n");
+    // ── Cycling pattern test (misprediction penalty probe) ─────────────────
+    // One BLR site cycling through N distinct targets in round-robin order.
+    // Measures: can the predictor learn a repeating N-target cycle?
+    // Result on M1: No — latency jumps immediately at N=2 and stays flat,
+    // indicating the predictor only tracks the last-seen target per site.
+    // The flat ~10 clk from N=2 to N=1024 is the raw misprediction penalty.
+    printf("\n── BLR cycling N targets (misprediction penalty probe) ─────────\n");
+    printf("  One BLR site cycling round-robin through N targets.\n"
+           "  Flat latency ≥ N=2 = predictor cannot learn cycling patterns.\n"
+           "  The N=1 latency is the predicted baseline; N=2 reveals penalty.\n\n");
 
-    // Allocate the cycling address table (heap, outside timed region).
     uintptr_t* table = static_cast<uintptr_t*>(malloc(kIndTableBytes));
     if (!table) {
         fprintf(stderr, "run_indirect_pred_tests: malloc failed\n");
         return;
     }
 
-    // We'll compile up to kMaxTargets trampolines and reuse them as needed.
-    // The largest sweep entry is kIndTargetCounts[last] = 1024.
     static constexpr uint32_t kMaxTargets = 1024;
     JitPool::TestFn trampoline_fns[kMaxTargets]  = {};
     uintptr_t       trampoline_addrs[kMaxTargets] = {};
 
-    // Compile all trampolines upfront. They stay alive until the end of this
-    // function. For small N, only the first N trampolines are used.
-    // (We build all kMaxTargets to avoid repeated compile/release churn.)
     if (!build_trampolines(kMaxTargets, trampoline_fns, trampoline_addrs)) {
         fprintf(stderr, "run_indirect_pred_tests: trampoline compile failed\n");
         free(table);
@@ -458,46 +560,96 @@ static void run_indirect_pred_tests(const BenchmarkParams& base) {
 
     double prev_clk = 0.0;
 
-    for (uint32_t ti = 0; ti < kNumIndTargetCounts; ++ti) {
-        const uint32_t n = kIndTargetCounts[ti];
+    for (uint32_t ti = 0; ti < kNumIndCycleCounts; ++ti) {
+        const uint32_t n     = kIndCycleCounts[ti];
+        const uint64_t loops = ind_cycle_loops_for_n(n);
 
-        // Fill the cycling table: table[i] = trampoline_addrs[i % n].
-        // Sequential cycling order — the predictor could learn this pattern
-        // if N is small enough. That's intentional: we want to know the
-        // capacity of the predictor working on a *learnable* pattern.
         for (uint32_t i = 0; i < kIndTableSize; ++i)
             table[i] = trampoline_addrs[i % n];
 
         JitPool::TestFn fn = build_indirect_pred_loop(
-            reinterpret_cast<uintptr_t>(table), kIndLoops);
+            reinterpret_cast<uintptr_t>(table), loops);
         if (!fn) continue;
 
         BenchmarkParams p       = base;
-        p.loops                 = kIndLoops;
-        p.instructions_per_loop = 1;   // one BLR per outer iteration
+        p.loops                 = loops;
+        p.instructions_per_loop = 1;
         p.bytes_per_insn        = 0;
 
-        char name[48];
-        snprintf(name, sizeof(name), "indirect BLR %4u targets", n);
+        char name[56];
+        snprintf(name, sizeof(name), "BLR cycling %4u targets", n);
 
         const BenchmarkResult r = benchmark(fn, name, p);
         g_jit_pool->release(fn);
 
-        // Annotate capacity threshold: ≥15% latency jump vs previous count.
         if (prev_clk > 0.0 && r.min_clocks_per_insn > prev_clk * 1.15) {
-            printf("  ↑ predictor capacity likely exceeded between %u and %u "
-                   "targets (%.2f → %.2f clk/BLR)\n",
-                   kIndTargetCounts[ti - 1], n,
+            printf("  ↑ misprediction onset between %u and %u targets"
+                   " (%.2f → %.2f clk/BLR)\n",
+                   kIndCycleCounts[ti - 1], n,
                    prev_clk, r.min_clocks_per_insn);
         }
         prev_clk = r.min_clocks_per_insn;
     }
 
-    // Release all trampolines.
     for (uint32_t i = 0; i < kMaxTargets; ++i)
         if (trampoline_fns[i]) g_jit_pool->release(trampoline_fns[i]);
 
     free(table);
+}
+
+static void run_ind_capacity_tests(const BenchmarkParams& base) {
+    // ── Site capacity test (predictor table size probe) ────────────────────
+    // N distinct BLR instructions at N distinct code addresses, all calling the
+    // same fixed target. Tests how many (site→target) entries the predictor
+    // can hold simultaneously before evictions cause mispredictions.
+    //
+    // Interpretation:
+    //   Flat latency as N grows → all N sites fit in the predictor.
+    //   Latency rising at some N → predictor table is full; evictions begin.
+    //   The saturation point N* is a lower bound on predictor table capacity.
+    printf("\n── BLR N sites → 1 target (predictor table capacity probe) ─────\n");
+    printf("  N distinct BLR sites, all calling the same fixed target.\n"
+           "  Rising latency identifies the (site→target) table capacity.\n\n");
+
+    // Build a single target trampoline.
+    JitPool::TestFn trampoline_fn   = nullptr;
+    uintptr_t       trampoline_addr = 0;
+    if (!build_trampolines(1, &trampoline_fn, &trampoline_addr)) {
+        fprintf(stderr, "run_ind_capacity_tests: trampoline compile failed\n");
+        return;
+    }
+
+    double prev_clk = 0.0;
+
+    for (uint32_t si = 0; si < kNumIndSiteCounts; ++si) {
+        const uint32_t n     = kIndSiteCounts[si];
+        const uint64_t loops = ind_capacity_loops_for_n(n);
+
+        JitPool::TestFn fn = build_ind_capacity_loop(trampoline_addr, n, loops);
+        if (!fn) continue;
+
+        BenchmarkParams p       = base;
+        p.loops                 = loops;
+        p.instructions_per_loop = n;  // N BLR instructions per loop iteration
+        p.bytes_per_insn        = 0;
+
+        char name[56];
+        snprintf(name, sizeof(name), "BLR %2u sites → 1 target", n);
+
+        const BenchmarkResult r = benchmark(fn, name, p);
+        g_jit_pool->release(fn);
+
+        // Flag when per-BLR latency rises ≥15% vs previous site count.
+        if (prev_clk > 0.0 && r.min_clocks_per_insn > prev_clk * 1.15) {
+            printf("  ↑ predictor capacity likely exceeded between %u and %u "
+                   "sites (%.2f → %.2f clk/BLR)\n",
+                   kIndSiteCounts[si - 1], n,
+                   prev_clk, r.min_clocks_per_insn);
+        }
+        prev_clk = r.min_clocks_per_insn;
+    }
+
+    if (trampoline_fn) g_jit_pool->release(trampoline_fn);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -606,6 +758,7 @@ static void run_cond_branch_tests(const BenchmarkParams& base) {
 void run_branch_tests(const BenchmarkParams& base_params) {
     run_rsb_tests(base_params);
     run_indirect_pred_tests(base_params);
+    run_ind_capacity_tests(base_params);
     run_cond_branch_tests(base_params);
 }
 
