@@ -836,6 +836,15 @@ static void run_cas_tests(const BenchmarkParams& base, void* buf) {
     // The traditional load-linked / store-conditional spinlock pattern.
     // Comparing with CASAL reveals whether the hardware fuses CASAL into
     // a single micro-op or expands it to an LL/SC internally.
+    //
+    // NOTE: No retry loop here. On macOS the OS scheduler may preempt a
+    // thread mid-exclusive-monitor window and clear the reservation, causing
+    // STLXR to fail. A retry loop would then livelock indefinitely.
+    // Instead we proceed regardless of the STLXR status bit (w2). In the
+    // rare case of a failed SC, that iteration measures slightly higher
+    // latency — this appears as noise in our CoV rather than an infinite
+    // loop. The benchmark is for *latency*, not for correctness of the
+    // store; the LDAXR ordering cost is what we're measuring.
     {
         auto fn = [&] {
             CodeHolder code; g_jit_pool->init_code_holder(code);
@@ -848,12 +857,11 @@ static void run_cas_tests(const BenchmarkParams& base, void* buf) {
             a.align(AlignMode::kCode, 64);
             Label top = a.new_label(); a.bind(top);
             for (uint32_t u = 0; u < unroll; ++u) {
-                Label retry = a.new_label();
-                a.bind(retry);
-                a.ldaxr(x1, ptr(x9));       // load-acquire-exclusive
-                a.cbnz(x1, retry);           // spurious: [x9] should always be 0
-                a.stlxr(w2, x0, ptr(x9));   // store-release-exclusive
-                a.cbnz(w2, retry);           // retry if SC failed
+                a.ldaxr(x1, ptr(x9));      // load-acquire-exclusive: x1 = [x9]
+                a.stlxr(w2, x0, ptr(x9)); // store-release-exclusive: [x9] = 0
+                // w2 = 0 on success, 1 on failure. We don't check or retry.
+                // The LDAXR→STLXR window contains zero other instructions,
+                // minimising the chance of preemption breaking the reservation.
             }
             a.sub(x19, x19, Imm(1));
             a.cbnz(x19, top);
@@ -862,7 +870,7 @@ static void run_cas_tests(const BenchmarkParams& base, void* buf) {
             a.ret(x30);
             return g_jit_pool->compile(code);
         }();
-        snprintf(name, sizeof(name), "LDAXR+STLXR (LL/SC, uncontended)");
+        snprintf(name, sizeof(name), "LDAXR+STLXR (LL/SC, no-retry)");
         run_one(name, fn, make_lat_params(base, loops, unroll));
     }
 }
