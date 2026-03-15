@@ -848,6 +848,11 @@ static void run_ind_unique_target_tests(const BenchmarkParams& base) {
     //   Rising clk/BLR at some N* → evictions begin; N* is a lower bound on
     //     the predictor's (indirect branch site → target) table capacity.
     //
+    // ADAPTIVE REFINEMENT: after the coarse sweep, if a boundary was detected
+    // between kIndUniqueSiteCounts[i-1] and kIndUniqueSiteCounts[i], we run a
+    // second fine-grained sweep stepping by 1 from boundary_lo+1 to boundary_hi.
+    // This pinpoints the exact capacity to within a single entry.
+    //
     // IMPORTANT: As N grows, the loop body grows too (N × MOV+BLR ≈ N×20B).
     // At N=256 the loop body is ~5KB — still within I-cache but may stress
     // the loop buffer. Any CoV spike at large N may reflect I-cache pressure
@@ -857,7 +862,8 @@ static void run_ind_unique_target_tests(const BenchmarkParams& base) {
            "  Flat clk/BLR = predictor holds all N entries.\n"
            "  Rising clk/BLR = evictions beginning (capacity exceeded).\n\n");
 
-    // Build all trampolines up front. kNumIndUniqueSiteCounts last entry is 256.
+    // Build all trampolines up front. kMaxUnique covers both the coarse sweep
+    // (max 256) and any fine-grained refinement within that range.
     static constexpr uint32_t kMaxUnique = 256;
     JitPool::TestFn trampoline_fns[kMaxUnique]  = {};
     uintptr_t       trampoline_addrs[kMaxUnique] = {};
@@ -867,34 +873,105 @@ static void run_ind_unique_target_tests(const BenchmarkParams& base) {
         return;
     }
 
-    double prev_clk = 0.0;
+    // ── Coarse sweep ─────────────────────────────────────────────────────────
+    double   prev_clk    = 0.0;
+    uint32_t boundary_lo = 0;   // last N before the first detected jump
+    uint32_t boundary_hi = 0;   // first N at or after the first detected jump
 
-    for (uint32_t si = 0; si < kNumIndUniqueSiteCounts; ++si) {
-        const uint32_t n     = kIndUniqueSiteCounts[si];
+    auto run_n = [&](uint32_t n, const char* fmt) -> double {
         const uint64_t loops = ind_unique_loops_for_n(n);
 
         JitPool::TestFn fn = build_ind_unique_target_loop(
             trampoline_addrs, n, loops);
-        if (!fn) continue;
+        if (!fn) return 0.0;
 
         BenchmarkParams p       = base;
         p.loops                 = loops;
-        p.instructions_per_loop = n;   // N BLR instructions per iteration
+        p.instructions_per_loop = n;
         p.bytes_per_insn        = 0;
 
         char name[64];
-        snprintf(name, sizeof(name), "BLR %3u sites → %3u targets", n, n);
+        snprintf(name, sizeof(name), fmt, n, n);
 
         const BenchmarkResult r = benchmark(fn, name, p);
         g_jit_pool->release(fn);
+        return r.min_clocks_per_insn;
+    };
 
-        if (prev_clk > 0.0 && r.min_clocks_per_insn > prev_clk * 1.15) {
-            printf("  ↑ predictor capacity likely exceeded between %u and %u "
-                   "sites (%.2f → %.2f clk/BLR)\n",
-                   kIndUniqueSiteCounts[si - 1], n,
-                   prev_clk, r.min_clocks_per_insn);
+    for (uint32_t si = 0; si < kNumIndUniqueSiteCounts; ++si) {
+        const uint32_t n   = kIndUniqueSiteCounts[si];
+        const double   clk = run_n(n, "BLR %3u sites → %3u targets");
+
+        if (clk <= 0.0) continue;
+
+        if (prev_clk > 0.0 && clk > prev_clk * 1.15) {
+            // First jump detected.
+            if (boundary_lo == 0) {
+                boundary_lo = kIndUniqueSiteCounts[si - 1];
+                boundary_hi = n;
+                printf("  ↑ predictor capacity likely exceeded between %u and %u "
+                       "sites (%.2f → %.2f clk/BLR)\n",
+                       boundary_lo, boundary_hi, prev_clk, clk);
+            } else {
+                // Subsequent rises (post-capacity convergence) — annotate but
+                // don't update the boundary pair (we already found the first one).
+                printf("  ↑ latency still rising at %u sites "
+                       "(%.2f → %.2f clk/BLR)\n",
+                       n, prev_clk, clk);
+            }
         }
-        prev_clk = r.min_clocks_per_insn;
+        prev_clk = clk;
+    }
+
+    // ── Fine-grained refinement ───────────────────────────────────────────────
+    // Only runs if the coarse sweep detected a boundary AND the gap between
+    // boundary_lo and boundary_hi is worth subdividing (i.e. > 1 step apart).
+    //
+    // DETECTION STRATEGY — baseline comparison, not step-to-step:
+    //   A set-associative predictor produces a gradual ramp rather than a
+    //   sharp cliff: each additional site above capacity evicts ~1/sets entries,
+    //   raising clk/BLR by a small but consistent increment per step. With a
+    //   step-to-step threshold (compare N vs N-1), the increment per step may
+    //   never exceed 1.05×, so we'd never trigger even though the cumulative
+    //   rise is large. Instead we compare every fine-sweep result against the
+    //   re-measured baseline at boundary_lo. The first N where clk > ref × 1.05
+    //   is the exact start of the ramp — i.e., one entry past capacity.
+    if (boundary_lo > 0 && boundary_hi > boundary_lo + 1
+            && boundary_hi <= kMaxUnique) {
+        printf("\n  Refining boundary between %u and %u sites (step 1):\n",
+               boundary_lo, boundary_hi);
+
+        // Re-run boundary_lo as the reference baseline.
+        // Fresh measurement taken back-to-back with fine-sweep neighbors so
+        // any thermal/frequency drift affects all of them equally.
+        const double ref_clk = run_n(boundary_lo,
+                                     "  BLR %3u sites → %3u targets (ref)");
+
+        bool boundary_printed = false;
+
+        for (uint32_t n = boundary_lo + 1; n < boundary_hi; ++n) {
+            const double clk = run_n(n, "  BLR %3u sites → %3u targets");
+            if (clk <= 0.0) continue;
+
+            // First N where clk departs more than 5% above the flat baseline.
+            // Using ref_clk (not prev step) catches gradual ramps.
+            if (!boundary_printed && ref_clk > 0.0 && clk > ref_clk * 1.05) {
+                printf("  ↑ boundary start: predictor capacity = %u entries "
+                       "(ref %.2f clk → %.2f clk at N=%u, +%.0f%% above baseline)\n",
+                       n - 1, ref_clk, clk, n,
+                       (clk / ref_clk - 1.0) * 100.0);
+                boundary_printed = true;
+            }
+        }
+
+        if (!boundary_printed && ref_clk > 0.0) {
+            printf("  (no clear boundary found in [%u, %u) — "
+                   "capacity may be ≥ %u)\n",
+                   boundary_lo + 1, boundary_hi, boundary_hi);
+        }
+
+        // Re-run boundary_hi to close the picture.
+        run_n(boundary_hi, "  BLR %3u sites → %3u targets (post)");
     }
 
     for (uint32_t i = 0; i < kMaxUnique; ++i)
