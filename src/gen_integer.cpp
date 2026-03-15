@@ -266,6 +266,51 @@ static void run_add_tests(const BenchmarkParams& base,
         }
     }
 
+    // ── ADD x64 imm throughput: sweep chain count ────────────────────────
+    // Same sweep as the register-form test above, but uses ADD xN, xN, #1
+    // (immediate form) instead of ADD xN, xN, x20.
+    //
+    // The critical difference: the immediate form has exactly ONE register
+    // source read per instruction (just the destination-as-source xN). The
+    // register-form test above reads xN AND x20 per instruction; when many
+    // chains issue simultaneously, all of them must read x20 in the same
+    // cycle, potentially stressing the register file's broadcast network.
+    //
+    // By contrast, this test has no shared register read at all. Each chain
+    // reads only its own private register, so the register file read bandwidth
+    // is not a bottleneck. This isolates pure ALU port count: the throughput
+    // floor here reflects only how many integer ALUs are available.
+    //
+    // INTERPRETATION: compare with the register-form sweep above.
+    //   - If imm-form saturates at a higher chain count → shared x20 read
+    //     was limiting the register-form test before the ALUs were full.
+    //   - If both sweeps saturate at the same count → register file broadcast
+    //     was NOT the bottleneck; the ALU port count is the shared limit.
+    //
+    // NOTE: the imm form (UBFM alias) encodes differently but decodes to the
+    // same micro-op class on all known ARM64 implementations. The latency
+    // test below confirms this; any latency difference there would invalidate
+    // using imm-form as an ALU port probe.
+    {
+        static const uint32_t kImmChainCounts[] = { 2, 3, 4, 6, 8, 10, 12, 16 };
+        for (uint32_t nc : kImmChainCounts) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.add(xr(u % nc), xr(u % nc), Imm(1));
+            });
+            snprintf(name, sizeof(name),
+                     "ADD x64 imm tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
+    }
+
     // ── ADD w32 latency ───────────────────────────────────────────────────
     // On virtually all ARM64 cores, 32-bit ADD uses the same execution unit
     // as 64-bit ADD with identical latency. A measurable difference here
@@ -280,10 +325,12 @@ static void run_add_tests(const BenchmarkParams& base,
         run_one(name, fn, make_params(base, loops, unroll));
     }
 
-    // ── ADD immediate latency ─────────────────────────────────────────────
+    // ── ADD x64 imm latency ───────────────────────────────────────────────
     // ADD Xd, Xn, #imm12 encodes differently from the register form but
-    // should decode to the same micro-op on most implementations. Confirms
-    // that the front-end doesn't add extra latency for immediate operands.
+    // should decode to the same micro-op on all known implementations.
+    // Confirms that the immediate encoding doesn't add front-end latency.
+    // If this matches the register-form latency, the imm throughput sweep
+    // above is a valid ALU port count probe.
     {
         auto cfg = default_cfg(loops, unroll);
         auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
@@ -498,22 +545,45 @@ static void run_multiply_tests(const BenchmarkParams& base,
     }
 
     // ── MUL x64 throughput sweep ──────────────────────────────────────────
-    // Sweep 2..4 independent chains. When adding chains stops helping,
-    // the multiply units are saturated.
-    static const uint32_t kMulChains[] = { 2, 3, 4 };
-    for (uint32_t nc : kMulChains) {
-        if (nc > unroll) continue;
-        auto cfg      = default_cfg(loops, unroll);
-        cfg.source_val = 0xDEADBEEFDEADBEEFULL; // odd multiplier in x20
-        for (uint32_t i = 0; i < nc; ++i)
-            cfg.init_vals[i] = static_cast<uint64_t>(i + 1); // non-zero seeds
+    // Sweep independent chains to find the multiply unit saturation point.
+    //
+    // Theory: with L=3 cycle latency and R multiply units, the throughput
+    // floor is 1/R clk/insn (resource-limited) once N ≥ L×R chains are in
+    // flight. Fewer chains are latency-limited at L/N clk/insn.
+    //
+    //   1 unit:  saturation at N=3 chains → floor 1.0 clk/insn
+    //   2 units: saturation at N=6 chains → floor 0.5 clk/insn
+    //   3 units: saturation at N=9 chains → floor 0.333 clk/insn
+    //
+    // Sweeping to 8 chains is sufficient to distinguish 1, 2, or 3 units.
+    //
+    // UNROLL ROUNDING: applied for the same reason as the ADD sweep — to
+    // ensure every chain gets the same number of instructions per iteration.
+    //
+    // NOTE: x20 is the shared multiplier (odd constant). This puts broadcast
+    // pressure on the register file, but with MUL's 3-cycle latency the
+    // max issue rate is R ≤ 3/cycle even with infinite units. That rate is
+    // well within what register file broadcast networks handle without stall.
+    {
+        static const uint32_t kMulChains[] = { 2, 3, 4, 6, 8 };
+        for (uint32_t nc : kMulChains) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
 
-        auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
-            a.mul(xr(u % nc), xr(u % nc), x20);
-        });
-        snprintf(name, sizeof(name), "MUL x64 tput         (%u chains, %ux unroll)",
-                 nc, unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+            auto cfg      = default_cfg(loops, actual_unroll);
+            cfg.source_val = 0xDEADBEEFDEADBEEFULL; // odd multiplier in x20
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = static_cast<uint64_t>(i + 1); // non-zero seeds
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.mul(xr(u % nc), xr(u % nc), x20);
+            });
+            snprintf(name, sizeof(name),
+                     "MUL x64 tput         (%u chains, %ux unroll)",
+                     nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
     }
 
     // ── MADD: accumulator critical path ───────────────────────────────────
