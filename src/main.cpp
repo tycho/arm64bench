@@ -14,9 +14,7 @@
 #include "gen_memory.h"
 #include "gen_branch.h"
 #include "gen_fp_simd.h"
-
-// Forward declarations for test generators (not yet implemented):
-// #include "gen_pitfalls.h"
+#include "gen_pitfalls.h"
 
 static void print_usage(const char* prog) {
     printf("Usage: %s [options]\n\n", prog);
@@ -140,8 +138,8 @@ int main(int argc, char** argv) {
 
     if (run_pitfalls) {
         printf("── Apple vs Snapdragon pathology tests ───────────────────────\n");
-        // arm64bench::gen::run_pitfall_tests(default_params);
-        printf("  (not yet implemented)\n\n");
+        arm64bench::gen::run_pitfall_tests(default_params);
+        printf("\n");
     }
 
     // g_jit_pool goes out of scope here, releasing all compiled functions.
