@@ -10,14 +10,13 @@
 #include <cstdio>
 #include <cstring>
 
-// ── Forward declarations for test generators (not yet implemented) ──────────
-// namespace arm64bench::gen {
-//     void run_integer_tests();
-//     void run_memory_tests();
-//     void run_branch_tests();
-//     void run_fp_simd_tests();
-//     void run_pitfall_tests();
-// }
+#include "gen_integer.h"
+
+// Forward declarations for test generators (not yet implemented):
+// #include "gen_memory.h"
+// #include "gen_branch.h"
+// #include "gen_fp_simd.h"
+// #include "gen_pitfalls.h"
 
 static void print_usage(const char* prog) {
     printf("Usage: %s [options]\n\n", prog);
@@ -118,8 +117,7 @@ int main(int argc, char** argv) {
 
     if (run_integer) {
         printf("── Integer ALU tests ─────────────────────────────────────────\n");
-        // arm64bench::gen::run_integer_tests(default_params);
-        printf("  (not yet implemented)\n\n");
+        arm64bench::gen::run_integer_tests(default_params);
     }
 
     if (run_memory) {

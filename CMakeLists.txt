@@ -37,6 +37,7 @@ add_executable(arm64bench
     src/timer.cpp
     src/harness.cpp
     src/jit_buffer.cpp
+    src/gen_integer.cpp
 )
 
 target_include_directories(arm64bench PRIVATE src)
