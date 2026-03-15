@@ -487,11 +487,21 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
     printf("\n── Load latency (random pointer chase, %u-byte stride) ──────────\n",
            static_cast<uint32_t>(kNodeStride));
 
+    // Boundary detection thresholds.
+    // A latency jump of ≥2× between consecutive buffer sizes almost certainly
+    // represents a cache level boundary. A jump of 1.5–2× combined with
+    // elevated CoV indicates the buffer is split across two levels (straddling).
+    static constexpr double kBoundaryRatio   = 2.0;  // clean jump: fully in new level
+    static constexpr double kStraddleRatio   = 1.5;  // partial jump: buffer split
+    static constexpr double kStraddleCoV     = 2.0;  // CoV% threshold for straddling
+
+    double prev_min_ns   = 0.0;  // min_ns_per_insn from the previous iteration
+    size_t prev_buf_size = 0;
+
     for (size_t si = 0; si < kNumBufSizes; ++si) {
         const size_t   buf_size = kBufSizes[si];
         const uint64_t loops    = lat_loops_for_size(buf_size);
 
-        // Set up the random pointer chain within the first buf_size bytes.
         void* head = setup_pointer_chase(buf, buf_size, kNodeStride);
         if (!head) {
             fprintf(stderr, "  [skipped: setup_pointer_chase failed]\n");
@@ -504,8 +514,8 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
 
         BenchmarkParams p         = base;
         p.loops                   = loops;
-        p.instructions_per_loop   = 1;   // one LDR per iteration
-        p.bytes_per_insn          = 0;   // not a bandwidth test
+        p.instructions_per_loop   = 1;
+        p.bytes_per_insn          = 0;
 
         char size_str[16];
         format_buf_size(size_str, sizeof(size_str), buf_size);
@@ -513,8 +523,33 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
         char name[64];
         snprintf(name, sizeof(name), "load latency %s", size_str);
 
-        benchmark(fn, name, p);
+        const BenchmarkResult r = benchmark(fn, name, p);
         g_jit_pool->release(fn);
+
+        // ── Boundary annotation ───────────────────────────────────────────
+        // Compare this result against the previous buffer size. Only annotate
+        // when there's a meaningful jump — skip the very first result and any
+        // result where the latency didn't increase significantly.
+        if (prev_min_ns > 0.0 && r.min_ns_per_insn > prev_min_ns) {
+            const double ratio = r.min_ns_per_insn / prev_min_ns;
+
+            char prev_str[16];
+            format_buf_size(prev_str, sizeof(prev_str), prev_buf_size);
+
+            if (ratio >= kStraddleRatio
+                       && r.coeff_variation_pct >= kStraddleCoV) {
+                printf("  ↑ straddling cache boundary (%.1f× slower than %s,"
+                       " %.1f%% CoV — buffer spans two levels)\n",
+                       ratio, prev_str, r.coeff_variation_pct);
+            } else if (ratio >= kBoundaryRatio) {
+                printf("  ↑ cache level boundary (%.1f× slower than %s)\n",
+                       ratio, prev_str);
+
+            }
+        }
+
+        prev_min_ns   = r.min_ns_per_insn;
+        prev_buf_size = buf_size;
     }
 }
 
