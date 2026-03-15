@@ -41,6 +41,7 @@ add_executable(arm64bench
     src/gen_integer.cpp
     src/gen_memory.cpp
     src/gen_branch.cpp
+    src/gen_fp_simd.cpp
 )
 
 target_include_directories(arm64bench PRIVATE src)
