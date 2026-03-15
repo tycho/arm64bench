@@ -91,7 +91,7 @@ static const a64::Gp kXRegs[] = {
     x0, x1, x2, x3, x4, x5, x6, x7,
     x8, x9, x10, x11, x12, x13, x14, x15,
 };
-static inline const a64::Gp& xr(uint32_t i) { return kXRegs[i]; }
+[[maybe_unused]] static inline const a64::Gp& xr(uint32_t i) { return kXRegs[i]; }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -444,11 +444,11 @@ static JitPool::TestFn build_seq_store_bw(uintptr_t buf_base, size_t buf_size,
 
 static void format_buf_size(char* out, size_t outlen, size_t bytes) {
     if (bytes >= 1024ULL * 1024 * 1024)
-        snprintf(out, outlen, "%4zuGB", bytes / (1024ULL * 1024 * 1024));
+        snprintf(out, outlen, "%4uGB", static_cast<uint32_t>(bytes / (1024ULL * 1024 * 1024)));
     else if (bytes >= 1024 * 1024)
-        snprintf(out, outlen, "%4zuMB", bytes / (1024 * 1024));
+        snprintf(out, outlen, "%4uMB", static_cast<uint32_t>(bytes / (1024 * 1024)));
     else
-        snprintf(out, outlen, "%4zuKB", bytes / 1024);
+        snprintf(out, outlen, "%4uKB", static_cast<uint32_t>(bytes / 1024));
 }
 
 // ── Latency sweep ─────────────────────────────────────────────────────────────
