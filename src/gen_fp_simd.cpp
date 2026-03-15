@@ -526,7 +526,7 @@ static void run_neon_f64_tests(const BenchmarkParams& base,
         const uint32_t au = (unroll / nc) * nc;
         if (au) {
             auto fn = build_fp_loop(loops, au,
-                [nc](a64::Assembler& a) {
+                [](a64::Assembler& a) {
                     a.fmov(d_src(), 1.0);
                     a.dup(vd2_src(), d16.d(0));
                     for (uint32_t i = 0; i < nc; ++i) {
@@ -534,7 +534,7 @@ static void run_neon_f64_tests(const BenchmarkParams& base,
                         a.dup(vd2(i), kDRegs[i].d(0));
                     }
                 },
-                [nc](a64::Assembler& a, uint32_t u) {
+                [](a64::Assembler& a, uint32_t u) {
                     a.fadd(vd2(u % nc), vd2(u % nc), vd2_src());
                 });
             snprintf(name, sizeof(name),
@@ -564,7 +564,7 @@ static void run_neon_f64_tests(const BenchmarkParams& base,
         const uint32_t au = (unroll / nc) * nc;
         if (au) {
             auto fn = build_fp_loop(loops, au,
-                [nc](a64::Assembler& a) {
+                [](a64::Assembler& a) {
                     a.fmov(dr(nc),     1.5); a.dup(vd2(nc),     kDRegs[nc].d(0));
                     a.fmov(dr(nc + 1), 2.0); a.dup(vd2(nc + 1), kDRegs[nc+1].d(0));
                     for (uint32_t i = 0; i < nc; ++i) {
@@ -572,7 +572,7 @@ static void run_neon_f64_tests(const BenchmarkParams& base,
                         a.dup(vd2(i), kDRegs[i].d(0));
                     }
                 },
-                [nc](a64::Assembler& a, uint32_t u) {
+                [](a64::Assembler& a, uint32_t u) {
                     a.fmla(vd2(u % nc), vd2(nc), vd2(nc + 1));
                 });
             snprintf(name, sizeof(name),
@@ -654,12 +654,12 @@ static void run_neon_int_tests(const BenchmarkParams& base,
         const uint32_t au = (unroll / nc) * nc;
         if (au) {
             auto fn = build_fp_loop(loops, au,
-                [nc](a64::Assembler& a) {
+                [](a64::Assembler& a) {
                     a.movi(vs4(nc),     Imm(3));
                     a.movi(vs4(nc + 1), Imm(7));
                     for (uint32_t i = 0; i < nc; ++i) a.movi(vs4(i), Imm(1));
                 },
-                [nc](a64::Assembler& a, uint32_t u) {
+                [](a64::Assembler& a, uint32_t u) {
                     a.mla(vs4(u % nc), vs4(nc), vs4(nc + 1));
                 });
             snprintf(name, sizeof(name),
