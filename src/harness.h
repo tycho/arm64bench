@@ -54,6 +54,16 @@ struct BenchmarkParams {
     // are flagged as noisy in the output. High CoV suggests OS interference,
     // frequency scaling mid-run, or a test that is right at a cache boundary.
     double      noise_threshold_pct = 5.0;
+
+    // Optional: bytes of memory traffic per "instruction" (harness normalization
+    // unit). When non-zero, the harness computes and displays memory bandwidth.
+    //
+    // For memory tests, set instructions_per_loop = cache_lines_per_pass and
+    // bytes_per_insn = 64 (one cache line). Then:
+    //   bandwidth (GB/s) = bytes_per_insn / min_ns_per_insn
+    // since ns/cache_line × 10^-9 s/ns gives s/cache_line, and
+    // bytes / (s/cache_line) / 10^9 = bytes * 10^9 / (ns * 10^9) = bytes / ns.
+    uint32_t    bytes_per_insn      = 0;
 };
 
 // ── Results ─────────────────────────────────────────────────────────────────
@@ -81,6 +91,10 @@ struct BenchmarkResult {
 
     // Total instructions per call: loops * instructions_per_loop.
     uint64_t    total_instructions;
+
+    // Memory bandwidth in GB/s. Non-zero only when BenchmarkParams::bytes_per_insn
+    // was set. Derived from min_ns_per_insn and bytes_per_insn.
+    double      bandwidth_gbs;
 };
 
 // ── Interface ───────────────────────────────────────────────────────────────

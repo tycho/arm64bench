@@ -167,19 +167,20 @@ void print_csv_header() {
            "min_ns_per_insn,median_ns_per_insn,"
            "min_clocks_per_insn,"
            "coeff_variation_pct,noisy,"
-           "total_instructions\n");
+           "total_instructions,bandwidth_gbs\n");
 }
 
 static void print_result(const char* name, const BenchmarkResult& r) {
     if (s_output_mode == OutputMode::CSV) {
-        printf("%s,%.4f,%.4f,%.4f,%.2f,%d,%llu\n",
+        printf("%s,%.4f,%.4f,%.4f,%.2f,%d,%llu,%.2f\n",
                name,
                r.min_ns_per_insn,
                r.median_ns_per_insn,
                r.min_clocks_per_insn,
                r.coeff_variation_pct,
                r.noisy ? 1 : 0,
-               static_cast<unsigned long long>(r.total_instructions));
+               static_cast<unsigned long long>(r.total_instructions),
+               r.bandwidth_gbs);
     } else {
         // Console: fixed-width columns designed to align across a typical run.
         //
@@ -198,9 +199,14 @@ static void print_result(const char* name, const BenchmarkResult& r) {
         else
             printf("  ??? .??? clk");
 
-        printf("  CoV %4.1f%%%s\n",
+        printf("  CoV %4.1f%%%s",
                r.coeff_variation_pct,
                r.noisy ? "  !" : "   ");
+
+        if (r.bandwidth_gbs > 0.0)
+            printf("  →%7.1f GB/s", r.bandwidth_gbs);
+
+        printf("\n");
     }
 
     fflush(stdout);
@@ -281,6 +287,12 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
         // clk/insn = (ns/insn) * 1e-9 * Hz_cpu
         result.min_clocks_per_insn =
             result.min_ns_per_insn * 1e-9 * static_cast<double>(g_cpu_freq_hz);
+    }
+
+    if (params.bytes_per_insn > 0 && result.min_ns_per_insn > 0.0) {
+        // bandwidth (GB/s) = bytes / ns  (units cancel: B/ns = B*1e9/s / 1e9 = GB/s)
+        result.bandwidth_gbs =
+            static_cast<double>(params.bytes_per_insn) / result.min_ns_per_insn;
     }
 
     print_result(name, result);
