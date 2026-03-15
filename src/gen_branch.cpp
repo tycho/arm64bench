@@ -120,14 +120,25 @@ static constexpr uint32_t kNumIndCycleCounts =
     static_cast<uint32_t>(sizeof(kIndCycleCounts) / sizeof(kIndCycleCounts[0]));
 
 // Indirect predictor CAPACITY test: numbers of distinct BLR SITES, each always
-// calling the same fixed target. Tests the predictor's (site→target) table size.
-// Capped at 64: larger values inflate loop body size and conflate prediction
-// throughput bandwidth with actual capacity limits.
+// calling the same fixed target. Reveals OOO BLR throughput, not table capacity
+// (since all sites share one target, the predictor needs only 1 entry).
 static const uint32_t kIndSiteCounts[] = {
     1, 2, 4, 8, 12, 16, 24, 32, 48, 64,
 };
 static constexpr uint32_t kNumIndSiteCounts =
     static_cast<uint32_t>(sizeof(kIndSiteCounts) / sizeof(kIndSiteCounts[0]));
+
+// Indirect predictor UNIQUE-TARGET test: N BLR sites, N distinct targets.
+// This forces the predictor to maintain N separate (site→target) entries
+// simultaneously. Sweep to find where entries are evicted and latency rises.
+// Capped at 256: MOV+BLR per site = 20 bytes, 256 sites = 5KB of loop body,
+// still within prefetch/branch-predictor tracking budget.
+static const uint32_t kIndUniqueSiteCounts[] = {
+     1,  2,  4,  8,  12,  16,  24,  32,
+    48, 64, 96, 128, 192, 256,
+};
+static constexpr uint32_t kNumIndUniqueSiteCounts =
+    static_cast<uint32_t>(sizeof(kIndUniqueSiteCounts) / sizeof(kIndUniqueSiteCounts[0]));
 
 // Address table for the cycling test: pre-expanded array, power-of-2 size
 // for AND-mask wrapping. 4096 × 8B = 32KB — fits in L1 on all targets.
@@ -409,7 +420,84 @@ static JitPool::TestFn build_ind_capacity_loop(uintptr_t trampoline_addr,
     return g_jit_pool->compile(code);
 }
 
-// ── Conditional branch throughput builder ────────────────────────────────────
+// ── Indirect predictor unique-target test builder ─────────────────────────────
+//
+// N distinct BLR sites, each calling a DIFFERENT target trampoline.
+// Every (site_PC, target_addr) pair is unique — the predictor must track all
+// N associations simultaneously to avoid mispredictions.
+//
+// GENERATED LOOP:
+//   loop_top:
+//     mov x0, #addr_0    ← 1–4 instructions depending on address width
+//     blr x0             ← site 0: predictor entry (loop_top+0, addr_0)
+//     mov x0, #addr_1
+//     blr x0             ← site 1: predictor entry (loop_top+20, addr_1)
+//     ...
+//     mov x0, #addr_{N-1}
+//     blr x0             ← site N-1
+//     sub x19, x19, #1
+//     cbnz x19, loop_top
+//
+// WHY MOV IS SAFE HERE:
+//   MOV x0 is a 1-cycle operation on all ARM64 cores. It does NOT create a
+//   dependency between adjacent BLR instructions — x0 is written fresh before
+//   each BLR, so the OOO engine can still look ahead and speculatively execute
+//   the next BLR using the (predicted, not-yet-retired) result of the upcoming
+//   MOV. The sequence is not serially dependent; it can pipeline freely.
+//
+//   The only true dependency chain is:
+//     BLR site_k → trampoline RET → returns to MOV x0, #addr_{k+1} → BLR site_{k+1}
+//   This is the same chain the 1-target test has, so the per-BLR overhead is
+//   comparable. Any additional latency at large N comes from predictor misses.
+//
+// NOTE: AsmJit emits MOVZ + up to 3× MOVK for 64-bit immediates, so each
+// "mov x0, #addr" is 1–4 instructions. The harness normalises by N (BLR count
+// only), so the MOV overhead inflates the raw elapsed time but NOT the reported
+// clk/BLR — the per-BLR number is derived from loops×N total_BLRs, not
+// loops×N×(MOV_count+1). This is intentional: we want clk/BLR to reflect
+// the cost attributable to branch prediction.
+
+static uint64_t ind_unique_loops_for_n(uint32_t n) {
+    // Target ~50ms per sample. Each iteration: N BLR calls, each ~3–10 clk.
+    // Conservative estimate: 10 clk/BLR → loops = 50ms×3GHz / (10×N) = 15M/N.
+    const uint64_t loops = 15'000'000ULL / n;
+    return (loops < 100'000) ? 100'000 : loops;
+}
+
+static JitPool::TestFn build_ind_unique_target_loop(
+        const uintptr_t* addrs,  // addrs[0..n_sites)
+        uint32_t         n_sites,
+        uint64_t         loops) {
+    CodeHolder code;
+    g_jit_pool->init_code_holder(code);
+    a64::Assembler a(&code);
+
+    a.sub(sp, sp, Imm(16));
+    a.stp(x19, x30, ptr(sp));
+
+    a.mov(x19, Imm(loops));
+
+    a.align(AlignMode::kCode, 64);
+
+    Label loop_top = a.new_label();
+    a.bind(loop_top);
+
+    for (uint32_t s = 0; s < n_sites; ++s) {
+        // Load the unique target for site s into x0.
+        // BLR x0 then executes at a distinct PC each iteration.
+        a.mov(x0, Imm(static_cast<uint64_t>(addrs[s])));
+        a.blr(x0);
+    }
+
+    a.sub(x19, x19, Imm(1));
+    a.cbnz(x19, loop_top);
+
+    a.ldp(x19, x30, ptr(sp));
+    a.add(sp, sp, Imm(16));
+    a.ret(x30);
+
+    return g_jit_pool->compile(code);
+}
 //
 // Generates a loop with `unroll` copies of a conditional branch per iteration.
 //
@@ -598,18 +686,17 @@ static void run_indirect_pred_tests(const BenchmarkParams& base) {
 }
 
 static void run_ind_capacity_tests(const BenchmarkParams& base) {
-    // ── Site capacity test (predictor table size probe) ────────────────────
-    // N distinct BLR instructions at N distinct code addresses, all calling the
-    // same fixed target. Tests how many (site→target) entries the predictor
-    // can hold simultaneously before evictions cause mispredictions.
-    //
-    // Interpretation:
-    //   Flat latency as N grows → all N sites fit in the predictor.
-    //   Latency rising at some N → predictor table is full; evictions begin.
-    //   The saturation point N* is a lower bound on predictor table capacity.
-    printf("\n── BLR N sites → 1 target (predictor table capacity probe) ─────\n");
-    printf("  N distinct BLR sites, all calling the same fixed target.\n"
-           "  Rising latency identifies the (site→target) table capacity.\n\n");
+    // ── BLR throughput (single target, multiple sites) ─────────────────────
+    // N BLR instructions per loop iteration, ALL calling the same target.
+    // Since every site predicts to the same address, only ONE predictor entry
+    // is ever needed — this is NOT a capacity test. Instead it reveals:
+    //   - The OOO engine's BLR throughput ceiling (how many can overlap)
+    //   - The RSB/return-prediction mechanism for non-varying targets
+    // The per-BLR latency decreases as N grows because the OOO can pipeline
+    // more BLR+RET pairs in flight simultaneously.
+    printf("\n── BLR N sites → 1 target (OOO throughput, all same target) ────\n");
+    printf("  Decreasing clk/BLR with N = OOO pipelining BLR+RET pairs.\n"
+           "  Not a capacity test — all sites predict to the same target.\n\n");
 
     // Build a single target trampoline.
     JitPool::TestFn trampoline_fn   = nullptr;
@@ -751,6 +838,69 @@ static void run_cond_branch_tests(const BenchmarkParams& base) {
     }
 }
 
+static void run_ind_unique_target_tests(const BenchmarkParams& base) {
+    // ── BLR N sites → N unique targets (genuine predictor capacity probe) ──
+    // Each of the N BLR instructions has a DISTINCT target trampoline.
+    // The predictor must maintain N independent (site→target) entries.
+    //
+    // Interpretation:
+    //   Flat clk/BLR across all N → predictor holds all entries; no evictions.
+    //   Rising clk/BLR at some N* → evictions begin; N* is a lower bound on
+    //     the predictor's (indirect branch site → target) table capacity.
+    //
+    // IMPORTANT: As N grows, the loop body grows too (N × MOV+BLR ≈ N×20B).
+    // At N=256 the loop body is ~5KB — still within I-cache but may stress
+    // the loop buffer. Any CoV spike at large N may reflect I-cache pressure
+    // rather than predictor pressure. The annotation threshold is conservative.
+    printf("\n── BLR N sites → N unique targets (predictor capacity probe) ───\n");
+    printf("  N BLR sites each with a distinct target trampoline.\n"
+           "  Flat clk/BLR = predictor holds all N entries.\n"
+           "  Rising clk/BLR = evictions beginning (capacity exceeded).\n\n");
+
+    // Build all trampolines up front. kNumIndUniqueSiteCounts last entry is 256.
+    static constexpr uint32_t kMaxUnique = 256;
+    JitPool::TestFn trampoline_fns[kMaxUnique]  = {};
+    uintptr_t       trampoline_addrs[kMaxUnique] = {};
+
+    if (!build_trampolines(kMaxUnique, trampoline_fns, trampoline_addrs)) {
+        fprintf(stderr, "run_ind_unique_target_tests: trampoline compile failed\n");
+        return;
+    }
+
+    double prev_clk = 0.0;
+
+    for (uint32_t si = 0; si < kNumIndUniqueSiteCounts; ++si) {
+        const uint32_t n     = kIndUniqueSiteCounts[si];
+        const uint64_t loops = ind_unique_loops_for_n(n);
+
+        JitPool::TestFn fn = build_ind_unique_target_loop(
+            trampoline_addrs, n, loops);
+        if (!fn) continue;
+
+        BenchmarkParams p       = base;
+        p.loops                 = loops;
+        p.instructions_per_loop = n;   // N BLR instructions per iteration
+        p.bytes_per_insn        = 0;
+
+        char name[64];
+        snprintf(name, sizeof(name), "BLR %3u sites → %3u targets", n, n);
+
+        const BenchmarkResult r = benchmark(fn, name, p);
+        g_jit_pool->release(fn);
+
+        if (prev_clk > 0.0 && r.min_clocks_per_insn > prev_clk * 1.15) {
+            printf("  ↑ predictor capacity likely exceeded between %u and %u "
+                   "sites (%.2f → %.2f clk/BLR)\n",
+                   kIndUniqueSiteCounts[si - 1], n,
+                   prev_clk, r.min_clocks_per_insn);
+        }
+        prev_clk = r.min_clocks_per_insn;
+    }
+
+    for (uint32_t i = 0; i < kMaxUnique; ++i)
+        if (trampoline_fns[i]) g_jit_pool->release(trampoline_fns[i]);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
@@ -759,6 +909,7 @@ void run_branch_tests(const BenchmarkParams& base_params) {
     run_rsb_tests(base_params);
     run_indirect_pred_tests(base_params);
     run_ind_capacity_tests(base_params);
+    run_ind_unique_target_tests(base_params);
     run_cond_branch_tests(base_params);
 }
 
