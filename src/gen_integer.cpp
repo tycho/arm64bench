@@ -311,6 +311,53 @@ static void run_add_tests(const BenchmarkParams& base,
         }
     }
 
+    // ── ADD x64 self-form throughput: sweep chain count ─────────────────
+    // ADD xN, xN, xN — Rd=Rn=Rm. Each instruction left-shifts xN by 1
+    // (doubles it), and is the only reader/writer of xN. Unlike the
+    // register-form sweep (which reads shared x20) and the imm-form sweep
+    // (which has one register read), this instruction has TWO register
+    // source reads — but both specify the same register name.
+    //
+    // The architectural encoding requires the processor to read Rn and Rm
+    // separately, but since they name the same physical register, a
+    // well-designed register file can supply both values from a single
+    // read port via internal broadcast. The question is whether the
+    // implementation actually does this.
+    //
+    // THREE POSSIBLE OUTCOMES vs. imm-form:
+    //   Same saturation floor → same-name double-read costs nothing; the
+    //     register file treats Rn=Rm as a single read. Self-form and
+    //     immediate form are equivalent probes of ALU port count.
+    //   Slightly higher floor → same-name double-read has a small cost,
+    //     perhaps consuming an extra read port per cycle even when Rn=Rm.
+    //   Substantially higher floor → the implementation does not
+    //     special-case Rn=Rm and pays full two-read bandwidth cost,
+    //     similar to the shared-x20 register-form sweep.
+    //
+    // This disambiguates whether the imm-form sweep is truly representative
+    // of "clean" single-source throughput, or whether the instruction
+    // encoding itself matters.
+    {
+        static const uint32_t kSelfChainCounts[] = { 2, 3, 4, 6, 8, 10, 12, 16 };
+        for (uint32_t nc : kSelfChainCounts) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                const auto& r = xr(u % nc);
+                a.add(r, r, r);    // xN = xN + xN  (Rd = Rn = Rm)
+            });
+            snprintf(name, sizeof(name),
+                     "ADD x64 self tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
+    }
+
     // ── ADD w32 latency ───────────────────────────────────────────────────
     // On virtually all ARM64 cores, 32-bit ADD uses the same execution unit
     // as 64-bit ADD with identical latency. A measurable difference here
@@ -431,6 +478,44 @@ static void run_sub_logical_tests(const BenchmarkParams& base,
             snprintf(name, sizeof(name), "%s tput (4 chains, %ux unroll)",
                      op.label, unroll);
             run_one(name, fn, make_params(base, loops, unroll));
+        }
+    }
+
+    // ── NEG x64 extended throughput sweep ─────────────────────────────────
+    // NEG is unary: it reads exactly one register (no shared operand, no
+    // broadcast pressure). This makes it an ideal single-source throughput
+    // probe comparable to ADD imm and ADD self-form.
+    //
+    // Comparing NEG saturation vs ADD imm saturation reveals whether the
+    // integer ALU ports that handle NEG are the same ports, a subset, or
+    // a superset of those that handle ADD.
+    //
+    // On M1 (expected): NEG saturates at the same floor as ADD imm (~4–5
+    // ops/cycle) since both are dispatched to the main integer ALU cluster.
+    // Any difference would indicate a dedicated or restricted NEG pipe.
+    //
+    // UNROLL ROUNDING applied to keep per-chain instruction counts equal.
+    {
+        static const uint32_t kNegChains[] = { 6, 8, 10, 12, 16 };
+        for (uint32_t nc : kNegChains) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc;
+            // Alternate seeds so adjacent chains start with different values;
+            // not required for correctness (NEG is involutory regardless) but
+            // avoids the trivially-identical state that might get optimized by
+            // a very aggressive microarchitecture.
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.neg(xr(u % nc), xr(u % nc));
+            });
+            snprintf(name, sizeof(name),
+                     "NEG x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
         }
     }
 }
@@ -782,16 +867,66 @@ static void run_bit_tests(const BenchmarkParams& base,
         run_one(name, fn, make_params(base, loops, unroll));
     }
 
-    // ── CLZ throughput: 4 chains ──────────────────────────────────────────
+    // ── CLZ and RBIT extended throughput sweeps ───────────────────────────
+    // Both CLZ and RBIT are unary single-source instructions with no shared
+    // register reads, making them clean throughput probes.
+    //
+    // CLZ: result oscillates (CLZ(63)=58, CLZ(58)=59, ...) but the chain
+    //   is real — each CLZ must wait for the previous result.
+    //
+    // RBIT: strictly involutory (RBIT(RBIT(x)) = x), which means the chain
+    //   alternates between x and ~bitreverse(x). Still a genuine dependency
+    //   chain. RBIT is arguably the purest single-source bit-op probe
+    //   because its period-2 behaviour makes the value analysis trivial.
+    //
+    // KEY QUESTION: do CLZ and RBIT saturate at the same floor as ADD imm
+    // (~0.220 clk/insn on M1), confirming they share the main integer ALU
+    // ports? Or do they saturate at a different floor, indicating they
+    // dispatch to a dedicated or partially-shared bit-manipulation unit?
+    //
+    // M1 Firestorm is known to have a separate "complex integer" unit in
+    // addition to the main ALU cluster. If CLZ/RBIT route there instead of
+    // (or in addition to) the main ALUs, the saturation floor will differ.
     {
-        auto cfg = default_cfg(loops, unroll);
-        for (uint32_t i = 0; i < 4; ++i)
-            cfg.init_vals[i] = kSeed ^ (static_cast<uint64_t>(i + 1) << 16);
-        auto fn = build_loop(cfg, [](a64::Assembler& a, uint32_t u) {
-            a.clz(xr(u % 4), xr(u % 4));
-        });
-        snprintf(name, sizeof(name), "CLZ x64 tput         (4 chains, %ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        static const uint32_t kBitChains[] = { 4, 6, 8, 10, 12, 16 };
+
+        // CLZ sweep
+        for (uint32_t nc : kBitChains) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc;
+            // Distinct non-zero seeds so chains start in meaningfully
+            // different states; XOR with position to avoid all-same.
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = kSeed ^ (static_cast<uint64_t>(i + 1) << 16);
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.clz(xr(u % nc), xr(u % nc));
+            });
+            snprintf(name, sizeof(name),
+                     "CLZ x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
+
+        // RBIT sweep
+        for (uint32_t nc : kBitChains) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = kSeed ^ (static_cast<uint64_t>(i + 1) << 8);
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.rbit(xr(u % nc), xr(u % nc));
+            });
+            snprintf(name, sizeof(name),
+                     "RBIT x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
     }
 }
 
