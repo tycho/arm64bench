@@ -102,10 +102,9 @@ static constexpr size_t kCacheLine  = 64;
 // while keeping chains long enough for large buffers.
 static constexpr size_t kNodeStride = 256;
 
-// Latency test: iterations of the pointer-chase loop per timed call.
-// At worst-case DRAM latency (~100 ns/load) this gives ~200ms per sample.
-// At L1 latency (~1.3 ns/load) it gives ~2.6ms — enough for tick-alignment.
-static constexpr uint64_t kLatLoops = 2'000'000;
+// Latency test: loop count is now computed per buffer size by lat_loops_for_size()
+// to ensure each sample runs long enough for stable timing. See that function
+// for the target-duration rationale.
 
 // Bandwidth test: cache lines per inner step (kBwStep = kBwLines * kCacheLine).
 // 8 cache lines per step = 32 LDP instructions, providing 32-way memory-level
@@ -452,32 +451,61 @@ static void format_buf_size(char* out, size_t outlen, size_t bytes) {
 }
 
 // ── Latency sweep ─────────────────────────────────────────────────────────────
+//
+// Loop count scaling rationale:
+//   At L1 latency (~1.5ns/load), a fixed 2M-loop run gives only ~3ms per sample.
+//   With the ARM generic timer at 24MHz (~42ns/tick), timer granularity alone
+//   contributes ~1.4% error on a 3ms sample, and any OS interrupt during the
+//   window dominates the CoV. We need at minimum ~50ms per sample for stable
+//   L1 results; 150ms is more comfortable.
+//
+//   We estimate expected latency conservatively from buffer size and set loops
+//   accordingly. The estimates are intentionally pessimistic (slower than real)
+//   so that actual sample durations meet or exceed the target. DRAM loops are
+//   capped at kLatLoopsMax to prevent excessively long runs.
+//
+//   Target sample duration: ~150ms.
+//     L1  (~2ns/ld):  150ms / 2ns  = 75M loops
+//     L2  (~8ns/ld):  150ms / 8ns  = 19M loops  → round to 20M
+//     SLC (~35ns/ld): 150ms / 35ns =  4.3M loops → round to 5M
+//     DRAM (~110ns/ld): 150ms/110ns = 1.4M loops → round to 2M (cap)
+
+static constexpr uint64_t kLatLoopsMax  = 2'000'000;  // cap for DRAM
+
+static uint64_t lat_loops_for_size(size_t buf_size) {
+    // Conservative expected latency per cache level.
+    // These are lower bounds — if the real latency is higher, the sample is
+    // longer than 150ms, which is fine. If faster, we still get a clean result
+    // because we never go below what's needed.
+    if      (buf_size <=  128ULL * 1024)     return 75'000'000;   // L1
+    else if (buf_size <=    8ULL * 1024*1024) return 20'000'000;  // L2/SLC
+    else if (buf_size <=   32ULL * 1024*1024) return  5'000'000;  // SLC/DRAM edge
+    else                                       return  kLatLoopsMax;  // DRAM
+}
 
 static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
-    printf("\n── Load latency (random pointer chase, %zu-byte stride) ──────────\n",
-           kNodeStride);
-
-    BenchmarkParams p = base;
-    p.loops               = kLatLoops;
-    p.instructions_per_loop = 1;    // one LDR per iteration
-    p.bytes_per_insn      = 0;      // not a bandwidth test
-    // Fewer warmup/samples for latency: DRAM runs can be slow (200ms/sample).
-    // Use the base values but allow callers to override via base_params.
+    printf("\n── Load latency (random pointer chase, %u-byte stride) ──────────\n",
+           static_cast<uint32_t>(kNodeStride));
 
     for (size_t si = 0; si < kNumBufSizes; ++si) {
-        const size_t buf_size = kBufSizes[si];
+        const size_t   buf_size = kBufSizes[si];
+        const uint64_t loops    = lat_loops_for_size(buf_size);
 
         // Set up the random pointer chain within the first buf_size bytes.
         void* head = setup_pointer_chase(buf, buf_size, kNodeStride);
         if (!head) {
-            fprintf(stderr, "  [skipped: setup_pointer_chase failed for %zuKB]\n",
-                    buf_size / 1024);
+            fprintf(stderr, "  [skipped: setup_pointer_chase failed]\n");
             continue;
         }
 
         JitPool::TestFn fn = build_latency_chase(
-            reinterpret_cast<uintptr_t>(head), kLatLoops);
+            reinterpret_cast<uintptr_t>(head), loops);
         if (!fn) continue;
+
+        BenchmarkParams p         = base;
+        p.loops                   = loops;
+        p.instructions_per_loop   = 1;   // one LDR per iteration
+        p.bytes_per_insn          = 0;   // not a bandwidth test
 
         char size_str[16];
         format_buf_size(size_str, sizeof(size_str), buf_size);
@@ -493,11 +521,11 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
 // ── Bandwidth sweep ───────────────────────────────────────────────────────────
 
 static void run_bw_sweep(void* buf, const BenchmarkParams& base, bool is_store) {
-    printf("\n── Sequential %s bandwidth (%u-stream %s, %zu-byte step) ─────────\n",
+    printf("\n── Sequential %s bandwidth (%u-stream %s, %u-byte step) ─────────\n",
            is_store ? "store" : "load",
-           kBwLines * 4u,  // LDP/STP count per step (4 per cache line × kBwLines)
+           kBwLines * 4u,
            is_store ? "STP" : "LDP",
-           kBwStep);
+           static_cast<uint32_t>(kBwStep));
 
     for (size_t si = 0; si < kNumBufSizes; ++si) {
         const size_t buf_size = kBufSizes[si];
