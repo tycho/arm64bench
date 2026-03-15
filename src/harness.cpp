@@ -88,6 +88,10 @@ struct PriorityGuard {
         struct sched_param p{};
         p.sched_priority = sched_get_priority_max(SCHED_FIFO);
         elevated = (pthread_setschedparam(pthread_self(), SCHED_FIFO, &p) == 0);
+
+#if defined(__APPLE__)
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     }
 
     ~PriorityGuard() {
