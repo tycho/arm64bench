@@ -32,7 +32,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <asmjit/asmjit.h>
+#include <asmjit/core.h>
+#include <asmjit/a64.h>
 
 namespace arm64bench {
 

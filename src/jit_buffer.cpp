@@ -26,11 +26,11 @@ JitPool::JitPool() {
 }
 
 void JitPool::init_code_holder(asmjit::CodeHolder& code) {
-    const asmjit::Error err = code.init(_rt.environment(), _rt.cpuFeatures());
+    const asmjit::Error err = code.init(_rt.environment(), _rt.cpu_features());
     if (err != asmjit::kErrorOk) {
         fprintf(stderr,
                 "JitPool::init_code_holder failed: %s\n",
-                asmjit::DebugUtils::errorAsString(err));
+                asmjit::DebugUtils::error_as_string(err));
     }
 }
 
@@ -40,7 +40,7 @@ JitPool::TestFn JitPool::compile(asmjit::CodeHolder& code) {
     if (err != asmjit::kErrorOk) {
         fprintf(stderr,
                 "JitPool::compile failed: %s\n",
-                asmjit::DebugUtils::errorAsString(err));
+                asmjit::DebugUtils::error_as_string(err));
         return nullptr;
     }
     return fn;
@@ -53,7 +53,7 @@ void JitPool::release(TestFn fn) {
     if (err != asmjit::kErrorOk) {
         fprintf(stderr,
                 "JitPool::release failed: %s\n",
-                asmjit::DebugUtils::errorAsString(err));
+                asmjit::DebugUtils::error_as_string(err));
     }
 }
 
