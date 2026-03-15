@@ -121,32 +121,9 @@ double ticks_to_cycles(RawTick delta) {
     return ticks_to_ns_f(delta) * 1e-9 * static_cast<double>(g_cpu_freq_hz);
 }
 
-// ── CPU frequency calibration ───────────────────────────────────────────────
-//
-// We cannot read the current CPU frequency directly on ARM64 macOS or Windows:
-//   - CNTFRQ_EL0 gives the *timer* frequency (24MHz), not the CPU frequency.
-//   - There is no ARM64 equivalent of the x86 CPUID nominal frequency leaf.
-//   - macOS hw.cpufrequency_max sysctl is absent on Apple Silicon.
-//   - Windows ARM64 has no public API for current P-state frequency.
-//
-// Strategy: time a known-length instruction loop with the wall clock and
-// infer frequency from iterations / elapsed_seconds.
-//
-// The calibration loop is implemented in a separate translation unit (or via
-// the JIT) once the JIT infrastructure is available. For now this function
-// returns a placeholder and sets g_cpu_freq_hz to 0, which causes cycle
-// estimates to be suppressed in output.
-//
-// TODO: replace with a JIT-generated chained-ADD loop once jit_buffer is wired
-//       in from main(). The loop should run long enough (~200ms) to amortize
-//       timer granularity. Run it 3 times and take the maximum inferred
-//       frequency (minimum elapsed time = maximum operations per second).
-
-uint64_t calibrate_cpu_freq() {
-    // Placeholder: CPU frequency calibration not yet implemented.
-    // Cycle counts will be suppressed in output until this is wired in.
-    g_cpu_freq_hz = 0;
-    return 0;
-}
+// calibrate_cpu_freq() is implemented in calibrate.cpp, which uses the JIT
+// pool to emit a known-latency instruction loop and times it against the
+// wall clock. It is declared in timer.h and lives in a separate translation
+// unit to avoid a circular dependency: timer.cpp must not include jit_buffer.h.
 
 } // namespace arm64bench

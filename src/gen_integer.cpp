@@ -222,23 +222,48 @@ static void run_add_tests(const BenchmarkParams& base,
     // ── ADD x64 throughput: sweep chain count ─────────────────────────────
     // Each chain accumulates into a distinct register (x0, x1, x2, ...).
     // Chains are entirely independent: the CPU's out-of-order engine can
-    // issue multiple ADD instructions per cycle across different chains.
+    // issue to multiple integer ALU ports simultaneously.
     //
-    // When clk/insn stops improving as we add chains, we've saturated the
-    // available integer ALU ports. That saturation point tells you how many
-    // independent ADDs the core can issue per cycle.
-    static const uint32_t kChainCounts[] = { 2, 3, 4, 6, 8 };
-    for (uint32_t nc : kChainCounts) {
-        if (nc > unroll) continue;
-        auto cfg = default_cfg(loops, unroll);
-        auto fn  = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
-            // Round-robin across nc registers. x20 is the constant addend,
-            // kept out of [0, nc) to avoid any false dependency.
-            a.add(xr(u % nc), xr(u % nc), x20);
-        });
-        snprintf(name, sizeof(name),
-                 "ADD x64 tput         (%u chains, %ux unroll)", nc, unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+    // UNROLL ROUNDING: the unroll count is rounded DOWN to the nearest
+    // multiple of nc so that every chain gets exactly the same number of
+    // instructions. Without this, e.g. nc=6 and unroll=32 gives x0 and x1
+    // one extra instruction each (32 = 5×6 + 2), making them the critical
+    // path and slightly inflating the measured time.
+    //
+    // MAX CHAINS: x0–x15 are our scratch registers (16 total). x20 holds
+    // the constant addend. We stop at 16 chains.
+    //
+    // SATURATION DETECTION: when adding more chains produces no further
+    // improvement in clk/insn, all integer ALU ports are saturated. The
+    // number of chains at that point is a lower bound on the ALU port count.
+    // (It's a lower bound because the OOO window, register file read bandwidth,
+    // or issue queue capacity might limit us before the ALUs do.)
+    //
+    // x20 is used as a shared constant addend for all chains. This means the
+    // register file must supply x20 as a read operand on every instruction,
+    // which is a read-bandwidth stress. On most implementations the register
+    // file has enough read ports for this not to be the bottleneck.
+    {
+        static const uint32_t kChainCounts[] = { 2, 3, 4, 6, 8, 10, 12, 16 };
+        for (uint32_t nc : kChainCounts) {
+            // Round unroll down to nearest multiple of nc, minimum nc itself
+            // (at least 1 instruction per chain per iteration).
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            // Initialise all nc chain registers (default_cfg only inits 8).
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = static_cast<uint64_t>(i + 1); // 1..nc
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.add(xr(u % nc), xr(u % nc), x20);
+            });
+            snprintf(name, sizeof(name),
+                     "ADD x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
     }
 
     // ── ADD w32 latency ───────────────────────────────────────────────────
