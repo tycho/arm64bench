@@ -36,6 +36,7 @@ add_executable(arm64bench
     src/main.cpp
     src/timer.cpp
     src/harness.cpp
+    src/cycle_counter.cpp
     src/jit_buffer.cpp
     src/calibrate.cpp
     src/gen_integer.cpp

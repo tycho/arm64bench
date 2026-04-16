@@ -45,6 +45,13 @@ struct BenchmarkParams {
     // the best approximation of the true hardware throughput.
     uint32_t    discard_highest     = 1;
 
+    // Untimed calls to the test function immediately before each timed
+    // sample (in addition to the global num_warmup at session start).
+    // Re-primes the L1 I/D-cache after any thread migration that occurred
+    // during the preceding inter-sample sleep. 1 is sufficient for most
+    // tests; 0 disables the per-sample warmup.
+    uint32_t    num_per_sample_warmup = 1;
+
     // Milliseconds to sleep between timed samples.
     // Gives the OS scheduler time to service other threads, and gives the
     // CPU frequency governor time to re-stabilize after the burst of work.
@@ -80,9 +87,13 @@ struct BenchmarkResult {
     double      coeff_variation_pct;
     bool        noisy;              // true iff CoV% > noise_threshold_pct
 
-    // Estimated clock cycles per instruction. 0.0 if g_cpu_freq_hz is not set.
-    // Derived from min_ns_per_insn and the calibrated CPU frequency.
+    // Estimated clock cycles per instruction.
+    // When cycles_are_direct is true: measured directly from the hardware PMU
+    //   cycle counter (P-state immune; accurate regardless of frequency changes).
+    // When cycles_are_direct is false: derived from min_ns_per_insn and the
+    //   calibrated CPU frequency (g_cpu_freq_hz); 0.0 if frequency is unknown.
     double      min_clocks_per_insn;
+    bool        cycles_are_direct;     // true = PMU counter, false = freq×time
 
     // Raw minimum elapsed nanoseconds for a complete call to the test function.
     // Useful for sanity-checking: should be roughly loops * instructions_per_loop
@@ -111,11 +122,15 @@ using TestFn = void (*)();
 //   2. Brief sleep to let the CPU frequency settle after warm-up load.
 //   3. Elevate thread priority for the duration of timed sampling.
 //   4. For each of num_samples:
-//        a. Call wait_for_tick() to align to a timer boundary.
-//        b. Call fn() and record elapsed ticks.
-//        c. Sleep inter_sample_ms before the next sample.
+//        a. num_per_sample_warmup untimed calls (re-prime L1 after migration).
+//        b. Call wait_for_tick() to align to a timer boundary.
+//        c. Read hardware cycle counter (if available).
+//        d. Call fn() and record elapsed ticks.
+//        e. Read hardware cycle counter again.
+//        f. Sleep inter_sample_ms before the next sample.
 //   5. Drop priority, sort samples, discard the discard_highest slowest.
 //   6. Compute and print statistics. Return BenchmarkResult.
+//      min_clocks_per_insn comes from PMU counters if available, else freq×time.
 BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& params);
 
 // ── Output control ──────────────────────────────────────────────────────────

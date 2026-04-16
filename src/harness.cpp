@@ -4,6 +4,7 @@
 
 #include "harness.h"
 #include "timer.h"
+#include "cycle_counter.h"
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
@@ -234,6 +235,8 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
 
     const double inv_insns = 1.0 / static_cast<double>(total_insns);
 
+    const bool use_pmu = cycle_counter_available();
+
     // ── Warm-up ───────────────────────────────────────────────────────────
     // Untimed calls to bring the I-cache, D-cache, and branch predictor into
     // a steady state before we start measuring. Without this, the first timed
@@ -248,23 +251,33 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
     // A short sleep lets the governor settle before we start measuring.
     sleep_ms(params.inter_sample_ms);
 
-    double sample_ns[kMaxSamples];
+    double   sample_ns[kMaxSamples];
+    uint64_t sample_cyc[kMaxSamples] = {};   // 0 when PMU not available
 
     // ── Timed sampling (priority-elevated) ───────────────────────────────
     {
         PriorityGuard priority_guard;
 
         for (uint32_t s = 0; s < num_samples; ++s) {
-            // Align to a timer tick boundary. wait_for_tick() returns the
-            // counter value at the moment the tick advanced, so t0 is exact.
-            // The overhead between wait_for_tick() returning and fn() being
-            // called is a single indirect branch — negligible relative to
-            // the millions of instructions fn() will execute.
-            const RawTick t0 = wait_for_tick();
-            fn();
-            const RawTick t1 = tick_now();
+            // Per-sample mini warm-up: re-prime L1 I/D-cache after any thread
+            // migration that may have occurred during the preceding inter-sample
+            // sleep. Even a P→P core migration on Apple Silicon leaves L1 cold;
+            // one untimed call re-warms it before we measure.
+            for (uint32_t w = 0; w < params.num_per_sample_warmup; ++w)
+                fn();
 
-            sample_ns[s] = ticks_to_ns_f(t1 - t0);
+            // Align to a timer tick boundary so t0 is at a known position.
+            // The overhead from wait_for_tick() returning to the cycle-counter
+            // read is a single indirect branch — negligible (~50 cycles) relative
+            // to the millions of instructions fn() will execute.
+            const RawTick  t0   = wait_for_tick();
+            const uint64_t cyc0 = cycle_counter_read();  // 0 if PMU unavailable
+            fn();
+            const uint64_t cyc1 = cycle_counter_read();
+            const RawTick  t1   = tick_now();
+
+            sample_ns[s]  = ticks_to_ns_f(t1 - t0);
+            sample_cyc[s] = cyc1 - cyc0;
 
             // Sleep between samples (but not after the last one — no point
             // paying the sleep cost when we're done collecting).
@@ -279,6 +292,16 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
     // compute_stats sorts sample_ns in-place; that's fine since we own it.
     const Stats stats = compute_stats(sample_ns, num_samples, discard_highest);
 
+    // Minimum cycle count across all samples. PMU counts are per-thread and
+    // immune to migration, so we don't need to discard any; the minimum
+    // represents the cleanest (least-preempted) execution.
+    uint64_t min_cycles = UINT64_MAX;
+    if (use_pmu) {
+        for (uint32_t s = 0; s < num_samples; ++s)
+            if (sample_cyc[s] > 0 && sample_cyc[s] < min_cycles)
+                min_cycles = sample_cyc[s];
+    }
+
     BenchmarkResult result{};
     result.total_instructions  = total_insns;
     result.min_total_ns        = stats.min;
@@ -287,10 +310,16 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
     result.coeff_variation_pct = stats.coeff_variation_pct;
     result.noisy               = (stats.coeff_variation_pct > params.noise_threshold_pct);
 
-    if (g_cpu_freq_hz > 0) {
+    if (use_pmu && min_cycles != UINT64_MAX) {
+        // Direct PMU measurement: P-state immune, no frequency conversion needed.
+        result.min_clocks_per_insn = static_cast<double>(min_cycles) * inv_insns;
+        result.cycles_are_direct   = true;
+    } else if (g_cpu_freq_hz > 0) {
+        // Fallback: derive from wall-clock time and calibrated frequency.
         // clk/insn = (ns/insn) * 1e-9 * Hz_cpu
         result.min_clocks_per_insn =
             result.min_ns_per_insn * 1e-9 * static_cast<double>(g_cpu_freq_hz);
+        result.cycles_are_direct = false;
     }
 
     if (params.bytes_per_insn > 0 && result.min_ns_per_insn > 0.0) {

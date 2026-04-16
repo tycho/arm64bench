@@ -7,6 +7,7 @@
 #include "harness.h"
 #include "jit_buffer.h"
 #include "timer.h"
+#include "cycle_counter.h"
 #include <cstdio>
 #include <cstring>
 
@@ -95,18 +96,27 @@ int main(int argc, char** argv) {
     // CPU frequency: prefer explicit override, otherwise calibrate.
     if (override_mhz > 0) {
         arm64bench::g_cpu_freq_hz = override_mhz * 1'000'000ULL;
-        printf("CPU frequency: %llu MHz (user override)\n\n",
+        printf("CPU frequency: %llu MHz (user override)\n",
                static_cast<unsigned long long>(override_mhz));
     } else {
         printf("Calibrating CPU frequency...\n");
         const uint64_t hz = arm64bench::calibrate_cpu_freq();
         if (hz > 0) {
-            printf("CPU frequency: ~%llu MHz (calibrated)\n\n",
+            printf("CPU frequency: ~%llu MHz (calibrated)\n",
                    static_cast<unsigned long long>(hz / 1'000'000ULL));
         } else {
             printf("CPU frequency: unknown (clock cycle counts will be suppressed)\n"
-                   "  Pass --MHz <n> to provide it manually.\n\n");
+                   "  Pass --MHz <n> to provide it manually.\n");
         }
+    }
+
+    // Initialise hardware PMU cycle counters. When available, CPI measurements
+    // are read directly from the PMU and are immune to P-state changes. When
+    // unavailable, they fall back to wall-clock time × calibrated frequency.
+    if (arm64bench::cycle_counter_init()) {
+        printf("CPU cycle source: hardware PMU (P-state immune)\n\n");
+    } else {
+        printf("CPU cycle source: calibrated clock (may drift under thermal throttle)\n\n");
     }
 
     // ── Run selected test categories ────────────────────────────────────────
