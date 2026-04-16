@@ -25,6 +25,14 @@
 
 namespace arm64bench {
 
+// ── Global reference function (Tier 2 ratio normalization) ──────────────────
+
+static ReferenceParams s_ref{};
+
+void set_reference_function(const ReferenceParams& ref) {
+    s_ref = ref;
+}
+
 // ── Output mode ─────────────────────────────────────────────────────────────
 
 static OutputMode s_output_mode = OutputMode::Console;
@@ -170,18 +178,19 @@ static Stats compute_stats(double* samples, uint32_t count, uint32_t discard_hig
 void print_csv_header() {
     printf("name,"
            "min_ns_per_insn,median_ns_per_insn,"
-           "min_clocks_per_insn,"
+           "min_clocks_per_insn,cycle_source,"
            "coeff_variation_pct,noisy,"
            "total_instructions,bandwidth_gbs\n");
 }
 
 static void print_result(const char* name, const BenchmarkResult& r) {
     if (s_output_mode == OutputMode::CSV) {
-        printf("%s,%.4f,%.4f,%.4f,%.2f,%d,%llu,%.2f\n",
+        printf("%s,%.4f,%.4f,%.4f,%d,%.2f,%d,%llu,%.2f\n",
                name,
                r.min_ns_per_insn,
                r.median_ns_per_insn,
                r.min_clocks_per_insn,
+               static_cast<int>(r.cycle_source),
                r.coeff_variation_pct,
                r.noisy ? 1 : 0,
                static_cast<unsigned long long>(r.total_instructions),
@@ -189,20 +198,30 @@ static void print_result(const char* name, const BenchmarkResult& r) {
     } else {
         // Console: fixed-width columns designed to align across a typical run.
         //
+        // The cycle source tag after "clk" indicates measurement tier:
+        //   (space) = PMU hardware counter (Tier 1; most reliable)
+        //   ~       = ratio-normalized vs reference (Tier 2; drift-resistant)
+        //   *       = calibrated clock wall-time (Tier 3; may drift)
+        //   ?       = unknown (frequency not available)
+        //
         // Example:
-        //   ADD (chained) x32          : min   0.305 ns  med   0.307 ns   1.220 clk  CoV  0.3%
-        //   ADD (indep)   x32          : min   0.038 ns  med   0.040 ns   0.153 clk  CoV  0.8%
-        //   SDIV (chained) x8          : min   8.127 ns  med   8.201 ns  32.508 clk  CoV  1.1%
+        //   ADD latency x32 : min   0.226 ns  med   0.226 ns   0.998 clk  CoV  0.1%
+        //   FDIV f32    x8  : min   4.310 ns  med   4.312 ns  19.009 clk~ CoV  0.2%
 
         printf("%-36s: min %7.3f ns  med %7.3f ns",
                name,
                r.min_ns_per_insn,
                r.median_ns_per_insn);
 
-        if (r.min_clocks_per_insn > 0.0)
-            printf("  %7.3f clk", r.min_clocks_per_insn);
-        else
-            printf("  ??? .??? clk");
+        if (r.min_clocks_per_insn > 0.0) {
+            // Tag: space=PMU, ~=ratio, *=calibrated
+            const char tag =
+                r.cycle_source == CycleSource::Ratio      ? '~' :
+                r.cycle_source == CycleSource::Calibrated ? '*' : ' ';
+            printf("  %7.3f clk%c", r.min_clocks_per_insn, tag);
+        } else {
+            printf("  ??? .??? clk?");
+        }
 
         printf("  CoV %4.1f%%%s",
                r.coeff_variation_pct,
@@ -236,6 +255,9 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
     const double inv_insns = 1.0 / static_cast<double>(total_insns);
 
     const bool use_pmu = cycle_counter_available();
+    const bool use_ref = (s_ref.fn != nullptr && s_ref.total_insns > 0);
+    const double ref_inv_insns = use_ref
+        ? (1.0 / static_cast<double>(s_ref.total_insns)) : 0.0;
 
     // ── Warm-up ───────────────────────────────────────────────────────────
     // Untimed calls to bring the I-cache, D-cache, and branch predictor into
@@ -245,6 +267,8 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
     // what we're trying to measure.
     for (uint32_t i = 0; i < params.num_warmup; ++i)
         fn();
+    if (use_ref)
+        s_ref.fn();   // warm reference I-cache at session start too
 
     // Brief sleep after warm-up: the warm-up loop raises the CPU's power
     // demand, which may briefly boost the frequency above its steady state.
@@ -252,7 +276,9 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
     sleep_ms(params.inter_sample_ms);
 
     double   sample_ns[kMaxSamples];
-    uint64_t sample_cyc[kMaxSamples] = {};   // 0 when PMU not available
+    uint64_t sample_cyc[kMaxSamples]   = {};   // 0 when PMU not available
+    double   sample_ratio[kMaxSamples] = {};   // 0 when reference not available
+    bool     any_ratio_unstable        = false;
 
     // ── Timed sampling (priority-elevated) ───────────────────────────────
     {
@@ -266,18 +292,77 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
             for (uint32_t w = 0; w < params.num_per_sample_warmup; ++w)
                 fn();
 
-            // Align to a timer tick boundary so t0 is at a known position.
-            // The overhead from wait_for_tick() returning to the cycle-counter
-            // read is a single indirect branch — negligible (~50 cycles) relative
-            // to the millions of instructions fn() will execute.
-            const RawTick  t0   = wait_for_tick();
-            const uint64_t cyc0 = cycle_counter_read();  // 0 if PMU unavailable
-            fn();
-            const uint64_t cyc1 = cycle_counter_read();
-            const RawTick  t1   = tick_now();
+            if (use_ref) {
+                // ── Reference sandwich (Tier 2) ───────────────────────────
+                // Time the reference function immediately before and after the
+                // test. The ratio (test_ns/insn) / avg(ref_ns/insn) cancels the
+                // clock frequency, giving a P-state-immune CPI estimate.
+                //
+                // If the two reference probes diverge by more than instability_pct,
+                // the CPU clock changed between them (external P-state event).
+                // Discard this attempt and retry up to retry_limit times.
 
-            sample_ns[s]  = ticks_to_ns_f(t1 - t0);
-            sample_cyc[s] = cyc1 - cyc0;
+                for (uint32_t attempt = 0; attempt <= s_ref.retry_limit; ++attempt) {
+                    // Prime reference I-cache (fn warmup above may have evicted it).
+                    s_ref.fn();
+
+                    // Reference BEFORE: tick-aligned for accuracy.
+                    const RawTick rb_t0 = wait_for_tick();
+                    s_ref.fn();
+                    const RawTick rb_t1  = tick_now();
+                    const double  ref_before_ns = ticks_to_ns_f(rb_t1 - rb_t0);
+
+                    // Test: tick-aligned + PMU cycle counter if available.
+                    const RawTick  t0   = wait_for_tick();
+                    const uint64_t cyc0 = cycle_counter_read();
+                    fn();
+                    const uint64_t cyc1 = cycle_counter_read();
+                    const RawTick  t1   = tick_now();
+                    const double   test_ns = ticks_to_ns_f(t1 - t0);
+
+                    // Prime reference I-cache again (fn may have evicted it).
+                    s_ref.fn();
+
+                    // Reference AFTER: tick-aligned.
+                    const RawTick ra_t0 = wait_for_tick();
+                    s_ref.fn();
+                    const RawTick ra_t1 = tick_now();
+                    const double  ref_after_ns = ticks_to_ns_f(ra_t1 - ra_t0);
+
+                    // Stability: how much did the reference drift?
+                    const double ref_diverge_pct = (ref_before_ns > 0.0)
+                        ? (std::abs(ref_after_ns - ref_before_ns) / ref_before_ns * 100.0)
+                        : 100.0;
+                    const bool stable = (ref_diverge_pct <= s_ref.instability_pct);
+
+                    if (stable || attempt == s_ref.retry_limit) {
+                        sample_ns[s]  = test_ns;
+                        sample_cyc[s] = cyc1 - cyc0;
+
+                        // ratio = (test_ns/insn) / (ref_avg_ns/ref_insn)
+                        // When ref is a 1-cycle chain, ratio == CPI of the test.
+                        const double ref_avg_ns = (ref_before_ns + ref_after_ns) * 0.5;
+                        if (ref_avg_ns > 0.0) {
+                            sample_ratio[s] =
+                                (test_ns * inv_insns) / (ref_avg_ns * ref_inv_insns);
+                        }
+                        if (!stable) any_ratio_unstable = true;
+                        break;
+                    }
+                    // Clock changed mid-sandwich; retry.
+                }
+            } else {
+                // ── Plain tick-aligned measurement (no reference) ─────────
+                // Align to a timer tick boundary so t0 is at a known position.
+                const RawTick  t0   = wait_for_tick();
+                const uint64_t cyc0 = cycle_counter_read();  // 0 if PMU unavailable
+                fn();
+                const uint64_t cyc1 = cycle_counter_read();
+                const RawTick  t1   = tick_now();
+
+                sample_ns[s]  = ticks_to_ns_f(t1 - t0);
+                sample_cyc[s] = cyc1 - cyc0;
+            }
 
             // Sleep between samples (but not after the last one — no point
             // paying the sleep cost when we're done collecting).
@@ -292,14 +377,22 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
     // compute_stats sorts sample_ns in-place; that's fine since we own it.
     const Stats stats = compute_stats(sample_ns, num_samples, discard_highest);
 
-    // Minimum cycle count across all samples. PMU counts are per-thread and
-    // immune to migration, so we don't need to discard any; the minimum
-    // represents the cleanest (least-preempted) execution.
+    // Minimum cycle count (PMU): per-thread counts are immune to migration, so
+    // we take the global minimum across all samples.
     uint64_t min_cycles = UINT64_MAX;
     if (use_pmu) {
         for (uint32_t s = 0; s < num_samples; ++s)
             if (sample_cyc[s] > 0 && sample_cyc[s] < min_cycles)
                 min_cycles = sample_cyc[s];
+    }
+
+    // Minimum ratio (Tier 2): lowest CPI ratio across all samples.
+    double min_ratio = 0.0;
+    if (use_ref) {
+        for (uint32_t s = 0; s < num_samples; ++s)
+            if (sample_ratio[s] > 0.0 &&
+                (min_ratio == 0.0 || sample_ratio[s] < min_ratio))
+                min_ratio = sample_ratio[s];
     }
 
     BenchmarkResult result{};
@@ -309,17 +402,23 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
     result.median_ns_per_insn  = stats.median * inv_insns;
     result.coeff_variation_pct = stats.coeff_variation_pct;
     result.noisy               = (stats.coeff_variation_pct > params.noise_threshold_pct);
+    result.ratio_unstable      = any_ratio_unstable;
 
     if (use_pmu && min_cycles != UINT64_MAX) {
-        // Direct PMU measurement: P-state immune, no frequency conversion needed.
+        // Tier 1: direct PMU measurement — P-state immune.
         result.min_clocks_per_insn = static_cast<double>(min_cycles) * inv_insns;
-        result.cycles_are_direct   = true;
+        result.cycle_source        = CycleSource::PMU;
+    } else if (use_ref && min_ratio > 0.0) {
+        // Tier 2: ratio normalization vs 1-cycle reference — drift-resistant.
+        result.min_clocks_per_insn = min_ratio;
+        result.cycle_source        = CycleSource::Ratio;
     } else if (g_cpu_freq_hz > 0) {
-        // Fallback: derive from wall-clock time and calibrated frequency.
-        // clk/insn = (ns/insn) * 1e-9 * Hz_cpu
+        // Tier 3: wall-clock × calibrated frequency — may drift under throttle.
         result.min_clocks_per_insn =
             result.min_ns_per_insn * 1e-9 * static_cast<double>(g_cpu_freq_hz);
-        result.cycles_are_direct = false;
+        result.cycle_source = CycleSource::Calibrated;
+    } else {
+        result.cycle_source = CycleSource::Unknown;
     }
 
     if (params.bytes_per_insn > 0 && result.min_ns_per_insn > 0.0) {

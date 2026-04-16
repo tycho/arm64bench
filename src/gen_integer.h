@@ -20,4 +20,12 @@ namespace arm64bench::gen {
 // classes (e.g. divide) are derived from base_params internally.
 void run_integer_tests(const BenchmarkParams& base_params);
 
+// Create a JIT function that runs a chained ADD latency loop suitable for
+// use as the Tier 2 ratio normalization reference. Each iteration executes
+// (unroll) ADD instructions in a serial dependency chain (each output feeds
+// the next input), so the expected throughput is 1 cycle per instruction on
+// all modern ARM64 cores. The caller owns the returned pointer; release it
+// via g_jit_pool->release() when done (typically at process exit).
+TestFn create_add_latency_ref(uint64_t loops, uint32_t unroll);
+
 } // namespace arm64bench::gen

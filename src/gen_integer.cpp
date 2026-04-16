@@ -168,6 +168,19 @@ static JitPool::TestFn build_loop(const LoopConfig& cfg, F&& emit_body) {
     return fn;
 }
 
+// ── Reference function for Tier 2 ratio normalization ────────────────────────
+
+TestFn create_add_latency_ref(uint64_t loops, uint32_t unroll) {
+    // Serial ADD chain: x0 = x0 + x20, repeated (unroll) times per iteration.
+    // Each ADD depends on the previous result, forcing strictly serial execution.
+    // Expected latency: 1 cycle/instruction on all modern ARM64 microarchitectures,
+    // so ratio = test_ns_per_insn / ref_ns_per_insn directly gives CPI of the test.
+    LoopConfig cfg = default_cfg(loops, unroll);
+    return build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+        a.add(x0, x0, x20);   // x0 ← x0 + x20 (chained on x0; x20 is constant)
+    });
+}
+
 // ── Benchmark helpers ─────────────────────────────────────────────────────────
 
 // Build a BenchmarkParams for a function that runs (loops) outer iterations

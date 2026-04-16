@@ -110,13 +110,26 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Initialise hardware PMU cycle counters. When available, CPI measurements
-    // are read directly from the PMU and are immune to P-state changes. When
-    // unavailable, they fall back to wall-clock time × calibrated frequency.
-    if (arm64bench::cycle_counter_init()) {
-        printf("CPU cycle source: hardware PMU (P-state immune)\n\n");
+    // Initialise hardware PMU cycle counters (Tier 1).
+    const bool pmu_ok = arm64bench::cycle_counter_init();
+
+    // Build the Tier 2 ratio-normalization reference function (ADD latency chain).
+    // Always created so it is available as fallback when PMU is unavailable.
+    // 500 000 iterations × 32 unroll = 16 M ADD instructions per call (~5 ms at 3 GHz).
+    {
+        static constexpr uint64_t kRefLoops  = 500'000;
+        static constexpr uint32_t kRefUnroll = 32;
+        arm64bench::ReferenceParams ref;
+        ref.fn          = arm64bench::gen::create_add_latency_ref(kRefLoops, kRefUnroll);
+        ref.total_insns = kRefLoops * kRefUnroll;
+        arm64bench::set_reference_function(ref);
+    }
+
+    if (pmu_ok) {
+        printf("CPU cycle source: hardware PMU (Tier 1 — P-state immune)\n\n");
     } else {
-        printf("CPU cycle source: calibrated clock (may drift under thermal throttle)\n\n");
+        printf("CPU cycle source: ratio normalization vs ADD reference"
+               " (Tier 2 — drift-resistant)\n\n");
     }
 
     // ── Run selected test categories ────────────────────────────────────────
