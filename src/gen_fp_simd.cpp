@@ -844,7 +844,7 @@ static void run_crossdomain_tests(const BenchmarkParams& base,
 //   CRC32:  CRC32B/H/W/X, CRC32CB/CH/CW/CX (Castagnoli variant)
 //
 // All Apple Silicon, Snapdragon X Elite, and ARMv8.1+ Linux targets support
-// these extensions. Guards use __ARM_FEATURE_CRYPTO / __ARM_FEATURE_CRC32.
+// these extensions. Instructions are JIT-emitted; no compile-time guards needed.
 //
 // ── AES microarchitecture notes ──────────────────────────────────────────
 //
@@ -866,13 +866,9 @@ static void run_crossdomain_tests(const BenchmarkParams& base,
 // Q0 holds the first half of {a,b,c,d,e,f,g,h}; Q1 holds the second half.
 // Both are read and written (or written via SHA256H2). Only Q0 is chained.
 
-#if defined(__ARM_FEATURE_CRYPTO) || defined(__ARM_FEATURE_CRC32)
-
 static void run_crypto_tests(const BenchmarkParams& base,
                               uint64_t loops, uint32_t unroll) {
     char name[80];
-
-#if defined(__ARM_FEATURE_CRYPTO)
 
     // ── AESE latency ──────────────────────────────────────────────────────
     // AESE V0.16B, V1.16B: V0 ← SubBytes(ShiftRows(V0)) XOR V1
@@ -996,10 +992,6 @@ static void run_crypto_tests(const BenchmarkParams& base,
         run_one(name, fn, make_params(base, loops, unroll));
     }
 
-#endif // __ARM_FEATURE_CRYPTO
-
-#if defined(__ARM_FEATURE_CRC32)
-
     // ── CRC32B latency ────────────────────────────────────────────────────
     // CRC32B W0, W0, W1 — CRC-32 of byte W1[7:0], accumulated in W0.
     // W0 chains (CRC state). W1 = constant data byte.
@@ -1037,11 +1029,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
         snprintf(name, sizeof(name), "CRC32X latency        (%ux unroll)", unroll);
         run_one(name, fn, make_params(base, loops, unroll));
     }
-
-#endif // __ARM_FEATURE_CRC32
 }
-
-#endif // __ARM_FEATURE_CRYPTO || __ARM_FEATURE_CRC32
 
 // ════════════════════════════════════════════════════════════════════════════
 // Section 9: Advanced SIMD — dot product, widening multiply, and FP16
@@ -1252,10 +1240,8 @@ void run_fp_simd_tests(const BenchmarkParams& base_params) {
     printf("\n── Cross-domain latency (GPR ↔ FP) ─────────────────────────────\n");
     run_crossdomain_tests(base_params, loops, unroll);
 
-#if defined(__ARM_FEATURE_CRYPTO) || defined(__ARM_FEATURE_CRC32)
     printf("\n── Cryptography extensions ─────────────────────────────────────\n");
     run_crypto_tests(base_params, loops, unroll);
-#endif
 
     printf("\n── Advanced SIMD (dot-product / widening / FP16) ───────────────\n");
     run_advanced_simd_tests(base_params, loops, unroll);
