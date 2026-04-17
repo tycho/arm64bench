@@ -55,6 +55,9 @@
 #else
 #  include <sys/mman.h>
 #endif
+#if defined(__APPLE__)
+#  include <sys/sysctl.h>
+#endif
 
 namespace arm64bench::gen {
 
@@ -154,6 +157,7 @@ static void run_barrier_tests(const BenchmarkParams& base);
 static void run_nontemporal_tests(const BenchmarkParams& base, void* buf, size_t bufsz);
 static void run_misaligned_tests(const BenchmarkParams& base, void* buf);
 static void run_cas_tests(const BenchmarkParams& base, void* buf);
+static void run_lrcpc_tests(const BenchmarkParams& base);
 
 // ── STL forwarding loop builder ───────────────────────────────────────────────
 //
@@ -898,6 +902,240 @@ static void run_cas_tests(const BenchmarkParams& base, void* buf) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Section 6: LRCPC load-acquire variants (FEAT_LRCPC / FEAT_LRCPC2)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// FEAT_LRCPC (ARMv8.3) adds LDAPR: Load-Acquire RCpc Register.
+// "RCpc" = Release Consistency Processor Consistent — a weaker acquire than
+// LDAR: it is only a one-way barrier (prevents later loads from being observed
+// before the LDAPR), but does NOT prevent stores from completing afterward.
+// This matches the x86/TSO memory model's load semantics exactly.
+//
+// FEAT_LRCPC2 (ARMv8.4) adds LDAPUR and STLUR: unscaled-offset variants of
+// LDAPR and STLR, enabling use from arbitrary offsets without a prior ADD.
+//
+// WHY THIS MATTERS — the FEX 50% speedup:
+//   FEX-Emu (x86-on-ARM64 translator) used LDAR for x86 load emulation.
+//   Switching to LDAPUR (correct weaker semantic, no full-barrier overhead)
+//   gave a ~50% speedup overnight on some workloads. The key is that LDAPUR
+//   does not need to drain the store buffer before completing, unlike LDAR.
+//
+// HARDWARE BUG DETECTOR:
+//   Some ARM cores have incorrect LRCPC implementations: they treat
+//   LDAPR/LDAPUR as full LDAR internally, eliminating the benefit.
+//   The tests here expose this:
+//
+//   LDAPR latency ≈ LDR latency  → correct, one-way barrier is nearly free
+//   LDAPR latency ≈ LDAR latency → buggy, treated as full acquire barrier
+//
+//   Additionally, if LDAPR and LDAPUR give *different* latencies, the two
+//   instruction forms are going through different pipelines — a separate
+//   implementation quality signal.
+//
+// STORE-TO-LOAD FORWARDING with LRCPC:
+//   Does adding release/acquire ordering to a store+load pair affect whether
+//   the value forwards through the store buffer? Four combinations:
+//     STR  → LDAPR  (relaxed store, LRCPC load)
+//     STLR → LDAPR  (release store, LRCPC load)
+//     STR  → LDAPUR (relaxed store, LRCPC2 load)
+//     STLUR→ LDAPUR (release store, LRCPC2 load)
+//   Compare to STLR → LDAR from the barrier section (full ordered pair).
+//   If forwarding is preserved: ordering semantics don't inhibit the store
+//   buffer bypass. If latency rises: the barrier drained the store buffer.
+
+// ── LRCPC instruction emission helpers ───────────────────────────────────────
+//
+// AsmJit (this version) does not expose ldapr/ldapur/stlur as named assembler
+// methods. We embed raw 32-bit instruction words using their ARM Architecture
+// Reference Manual encodings from the AsmJit isa_aarch64.json database.
+//
+//  LDAPR Xd, [Xn]          (FEAT_LRCPC)
+//    encoding: 11111000|101|11111|1|10000|Rn|Rd  → base 0xF8BFC000
+//
+//  LDAPUR Xd, [Xn, #off]   (FEAT_LRCPC2)  off ∈ [-256, 255]
+//    encoding: 11011001|010|offS:9|00|Rn|Rd      → base 0xD9400000
+//
+//  STLUR Xs, [Xn, #off]    (FEAT_LRCPC2)  off ∈ [-256, 255]
+//    encoding: 11011001|000|offS:9|00|Rn|Rs      → base 0xD9000000
+
+static void emit_ldapr_x(a64::Assembler& a, const Gp& Rd, const Gp& Rn) {
+    uint32_t w = 0xF8BFC000u | (Rn.id() << 5) | Rd.id();
+    a.embed(&w, 4);
+}
+
+static void emit_ldapur_x(a64::Assembler& a, const Gp& Rd, const Gp& Rn, int32_t off = 0) {
+    uint32_t w = 0xD9400000u | ((uint32_t(off) & 0x1FFu) << 12) | (Rn.id() << 5) | Rd.id();
+    a.embed(&w, 4);
+}
+
+static void emit_stlur_x(a64::Assembler& a, const Gp& Rs, const Gp& Rn, int32_t off = 0) {
+    uint32_t w = 0xD9000000u | ((uint32_t(off) & 0x1FFu) << 12) | (Rn.id() << 5) | Rs.id();
+    a.embed(&w, 4);
+}
+
+// ── Runtime feature detection ─────────────────────────────────────────────
+
+#if defined(__APPLE__)
+static bool has_feat_lrcpc() {
+    int val = 0; size_t len = sizeof(val);
+    return sysctlbyname("hw.optional.arm.FEAT_LRCPC",
+                        &val, &len, nullptr, 0) == 0 && val != 0;
+}
+static bool has_feat_lrcpc2() {
+    int val = 0; size_t len = sizeof(val);
+    return sysctlbyname("hw.optional.arm.FEAT_LRCPC2",
+                        &val, &len, nullptr, 0) == 0 && val != 0;
+}
+#else
+// Qualcomm Snapdragon X1 (Oryon) supports both FEAT_LRCPC and FEAT_LRCPC2.
+// If running on hardware that lacks these features, the JIT'd code will
+// raise EXCEPTION_ILLEGAL_INSTRUCTION / SIGILL on first execution.
+static bool has_feat_lrcpc()  { return true; }
+static bool has_feat_lrcpc2() { return true; }
+#endif
+
+static void run_lrcpc_tests(const BenchmarkParams& base) {
+    const bool lrcpc  = has_feat_lrcpc();
+    const bool lrcpc2 = has_feat_lrcpc2();
+
+    if (!lrcpc && !lrcpc2) {
+        printf("\n── LRCPC tests skipped (FEAT_LRCPC not detected) ────────────────\n");
+        return;
+    }
+
+    printf("\n── LRCPC load-acquire (FEAT_LRCPC / FEAT_LRCPC2) ───────────────\n");
+    printf("  LDAPR (FEAT_LRCPC): one-way acquire barrier (weaker than LDAR).\n"
+           "  On CPUs where LDAR > LDR: correct LDAPR ≈ LDR, buggy ≈ LDAR.\n"
+           "  On Apple M-series: LDAR = LDR (no store to drain in pointer chain),\n"
+           "    so LDAPR = LDAR = LDR is CORRECT — check forwarding tests below.\n"
+           "  LDAPUR/STLUR (FEAT_LRCPC2): unscaled-offset variants.\n\n");
+
+    const uint64_t loops  = 3'000'000;
+    const uint32_t unroll = 8;
+    char name[80];
+    auto make_p = [&](uint64_t l, uint32_t u) { return make_lat_params(base, l, u); };
+
+    // ── LDAPR pointer chain (FEAT_LRCPC) ─────────────────────────────────
+    // Pointer chase using LDAPR instead of LDR/LDAR.
+    // Compare to: "LDR x64 (L1 chain, baseline)" and "LDAR x64 (load-acquire)"
+    // from the barrier section above.
+    if (lrcpc) {
+        auto fn = [&] {
+            CodeHolder code; g_jit_pool->init_code_holder(code);
+            a64::Assembler a(&code);
+            a.sub(sp, sp, Imm(32));
+            a.stp(x19, x30, ptr(sp));
+            a.mov(x19, Imm(loops));
+            a.add(x9, sp, Imm(16));
+            a.str(x9, ptr(x9));
+            emit_ldapr_x(a, x0, x9);  // prime
+            a.align(AlignMode::kCode, 64);
+            Label top = a.new_label(); a.bind(top);
+            for (uint32_t u = 0; u < unroll; ++u)
+                emit_ldapr_x(a, x0, x0);
+            a.sub(x19, x19, Imm(1));
+            a.cbnz(x19, top);
+            a.ldp(x19, x30, ptr(sp));
+            a.add(sp, sp, Imm(32));
+            a.ret(x30);
+            return g_jit_pool->compile(code);
+        }();
+        snprintf(name, sizeof(name), "LDAPR  x64 (FEAT_LRCPC,  L1 chain)");
+        run_one(name, fn, make_p(loops, unroll));
+    }
+
+    // ── LDAPUR pointer chain (FEAT_LRCPC2) ───────────────────────────────
+    // LDAPUR Xt, [Xn, #0]: same ordering semantics as LDAPR, unscaled offset.
+    // On correct hardware: identical latency to LDAPR.
+    // If LDAPUR ≠ LDAPR: the two forms are on different pipelines.
+    if (lrcpc2) {
+        auto fn = [&] {
+            CodeHolder code; g_jit_pool->init_code_holder(code);
+            a64::Assembler a(&code);
+            a.sub(sp, sp, Imm(32));
+            a.stp(x19, x30, ptr(sp));
+            a.mov(x19, Imm(loops));
+            a.add(x9, sp, Imm(16));
+            a.str(x9, ptr(x9));
+            emit_ldapur_x(a, x0, x9, 0);  // prime
+            a.align(AlignMode::kCode, 64);
+            Label top = a.new_label(); a.bind(top);
+            for (uint32_t u = 0; u < unroll; ++u)
+                emit_ldapur_x(a, x0, x0, 0);
+            a.sub(x19, x19, Imm(1));
+            a.cbnz(x19, top);
+            a.ldp(x19, x30, ptr(sp));
+            a.add(sp, sp, Imm(32));
+            a.ret(x30);
+            return g_jit_pool->compile(code);
+        }();
+        snprintf(name, sizeof(name), "LDAPUR x64 (FEAT_LRCPC2, L1 chain)");
+        run_one(name, fn, make_p(loops, unroll));
+    }
+
+    // ── Store-to-load forwarding with LRCPC instructions ─────────────────
+    // Same scratch-slot methodology as run_store_forwarding_tests.
+    // x9 = pointer to 16-byte stack slot; x0 is the value being forwarded.
+
+    printf("\n  LRCPC store-to-load forwarding (compare to STR→LDR baseline above):\n\n");
+
+    struct LrcpcFwdCase {
+        const char* label;
+        bool        need_lrcpc2_store;   // STLUR vs STLR
+        bool        need_lrcpc2_load;    // LDAPUR vs LDAPR
+    };
+
+    // Four combinations: {relaxed,release} store × {LDAPR,LDAPUR} load.
+    const LrcpcFwdCase fwd_cases[] = {
+        { "STR   → LDAPR  (relaxed→rcpc-acq)", false, false },
+        { "STLR  → LDAPR  (release→rcpc-acq)", false, false },  // uses STLR
+        { "STR   → LDAPUR (relaxed→rcpc2-acq)", false, true },
+        { "STLUR → LDAPUR (release→rcpc2-acq)", true,  true },
+    };
+
+    for (uint32_t ci = 0; ci < 4; ++ci) {
+        const auto& c = fwd_cases[ci];
+        const bool use_stlr  = (ci == 1);           // STLR (no offset, FEAT_V8)
+        const bool use_stlur = c.need_lrcpc2_store;  // STLUR (FEAT_LRCPC2)
+        const bool use_ldapur = c.need_lrcpc2_load;  // LDAPUR vs LDAPR
+
+        if ((use_stlur || use_ldapur) && !lrcpc2) continue;
+        if (!use_stlur && !use_ldapur && !lrcpc)  continue;
+
+        auto fn = [&] {
+            CodeHolder code; g_jit_pool->init_code_holder(code);
+            a64::Assembler a(&code);
+            a.sub(sp, sp, Imm(16));
+            a.stp(x19, x30, ptr(sp));
+            a.mov(x19, Imm(loops));
+            a.mov(x0,  Imm(0x0102030405060708ULL));
+            a.sub(sp, sp, Imm(16));
+            a.mov(x9, sp);
+            a.align(AlignMode::kCode, 64);
+            Label top = a.new_label(); a.bind(top);
+            for (uint32_t u = 0; u < unroll; ++u) {
+                // Store.
+                if (use_stlur)     emit_stlur_x(a, x0, x9, 0);
+                else if (use_stlr) a.stlr(x0, ptr(x9));
+                else               a.str (x0, ptr(x9));
+                // Load.
+                if (use_ldapur) emit_ldapur_x(a, x0, x9, 0);
+                else            emit_ldapr_x (a, x0, x9);
+            }
+            a.sub(x19, x19, Imm(1));
+            a.cbnz(x19, top);
+            a.add(sp, sp, Imm(16));
+            a.ldp(x19, x30, ptr(sp));
+            a.add(sp, sp, Imm(16));
+            a.ret(x30);
+            return g_jit_pool->compile(code);
+        }();
+        snprintf(name, sizeof(name), "%-46s", c.label);
+        run_one(name, fn, make_p(loops, unroll));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -916,6 +1154,7 @@ void run_pitfall_tests(const BenchmarkParams& base_params) {
 
     run_store_forwarding_tests(base_params);
     run_barrier_tests(base_params);
+    run_lrcpc_tests(base_params);
     run_nontemporal_tests(base_params, buf, kBufSize);
     run_misaligned_tests(base_params, buf);
     run_cas_tests(base_params, buf);

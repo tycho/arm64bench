@@ -22,6 +22,11 @@
 //
 //   CAS latency — the true cost of a single compare-and-swap on each
 //     platform, which bounds the throughput of single-threaded spinlocks.
+//
+//   LRCPC load-acquire (FEAT_LRCPC / FEAT_LRCPC2) — LDAPR and LDAPUR latency
+//     chains vs LDR and LDAR. Exposes incorrect LRCPC implementations where
+//     the CPU treats LDAPR as a full LDAR. Also tests store-to-load forwarding
+//     through STLR/STLUR → LDAPR/LDAPUR pairs.
 
 #include "harness.h"
 
