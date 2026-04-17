@@ -350,29 +350,56 @@ static void run_barrier_tests(const BenchmarkParams& base) {
         return make_lat_params(base, l, u);
     };
 
+    // ── Shuffled L1 pointer ring ───────────────────────────────────────────
+    // Build a 64-node ring (512 bytes, fits in L1) with a Fisher-Yates shuffle
+    // so that every load returns a *different* address. Placed on the stack so
+    // it stays alive for the entire run_barrier_tests call.
+    //
+    // WHY NOT a self-referential chain ([x9] = x9)?
+    //   On Apple M5 (and possibly earlier), a chain where every load always
+    //   returns the same value (itself) is defeated by load value prediction:
+    //   the CPU learns the constant result and "executes" the loads in 0 cycles.
+    //   A shuffled ring visits 64 distinct addresses, defeating value predictors.
+    //   LDAR/LDAPR/LDAR are unaffected — their ordering semantics prevent
+    //   speculative value use regardless of chain shape.
+    constexpr uint32_t kRingN = 64;
+    alignas(64) uintptr_t ring_buf[kRingN];
+    {
+        uint32_t perm[kRingN];
+        for (uint32_t i = 0; i < kRingN; ++i) perm[i] = i;
+        uint64_t rng = 0xDEADBEEF12345678ULL;
+        auto xs = [&]() -> uint64_t {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng;
+        };
+        for (uint32_t i = kRingN - 1; i > 0; --i) {
+            uint32_t j = xs() % (i + 1);
+            uint32_t t = perm[i]; perm[i] = perm[j]; perm[j] = t;
+        }
+        for (uint32_t i = 0; i < kRingN; ++i)
+            ring_buf[perm[i]] = reinterpret_cast<uintptr_t>(
+                                    &ring_buf[perm[(i + 1) % kRingN]]);
+    }
+    const uintptr_t ring_head = reinterpret_cast<uintptr_t>(&ring_buf[0]);
+
     // ── LDR baseline (plain load, no ordering) ────────────────────────────
-    // LDR x0, [x9]: pointer-chasing load from a stack slot.
-    // This is the latency reference. A barrier adds overhead on top of this.
+    // Pointer-chase through the shuffled L1 ring. This is the true L1 load
+    // latency reference; a barrier adds overhead on top of this.
     {
         auto fn = [&] {
             CodeHolder code; g_jit_pool->init_code_holder(code);
             a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(32));
+            a.sub(sp, sp, Imm(16));
             a.stp(x19, x30, ptr(sp));
             a.mov(x19, Imm(loops));
-            // Store sp+16 into itself as the "next address", making a trivial
-            // pointer chain that always loads from the same L1-resident slot.
-            a.add(x9, sp, Imm(16));
-            a.str(x9, ptr(x9));   // [x9] = x9 (points to itself)
-            a.ldr(x0, ptr(x9));   // prime x0
+            a.mov(x0, Imm(static_cast<uint64_t>(ring_head)));
             a.align(AlignMode::kCode, 64);
             Label top = a.new_label(); a.bind(top);
             for (uint32_t u = 0; u < unroll; ++u)
-                a.ldr(x0, ptr(x0));   // x0 = *x0 (self-referential, L1 hit)
+                a.ldr(x0, ptr(x0));
             a.sub(x19, x19, Imm(1));
             a.cbnz(x19, top);
             a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(32));
+            a.add(sp, sp, Imm(16));
             a.ret(x30);
             return g_jit_pool->compile(code);
         }();
@@ -381,19 +408,16 @@ static void run_barrier_tests(const BenchmarkParams& base) {
     }
 
     // ── LDAR: load-acquire ────────────────────────────────────────────────
-    // Same pointer chain but using LDAR instead of LDR.
-    // LDAR prevents reordering of subsequent accesses before this load.
-    // On M1: typically 1–3 cycles more than plain LDR.
+    // Same ring, LDAR instead of LDR. LDAR prevents reordering of later
+    // accesses before this load and inhibits load value speculation.
     {
         auto fn = [&] {
             CodeHolder code; g_jit_pool->init_code_holder(code);
             a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(32));
+            a.sub(sp, sp, Imm(16));
             a.stp(x19, x30, ptr(sp));
             a.mov(x19, Imm(loops));
-            a.add(x9, sp, Imm(16));
-            a.str(x9, ptr(x9));
-            a.ldar(x0, ptr(x9));  // prime with LDAR
+            a.mov(x0, Imm(static_cast<uint64_t>(ring_head)));
             a.align(AlignMode::kCode, 64);
             Label top = a.new_label(); a.bind(top);
             for (uint32_t u = 0; u < unroll; ++u)
@@ -401,7 +425,7 @@ static void run_barrier_tests(const BenchmarkParams& base) {
             a.sub(x19, x19, Imm(1));
             a.cbnz(x19, top);
             a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(32));
+            a.add(sp, sp, Imm(16));
             a.ret(x30);
             return g_jit_pool->compile(code);
         }();
@@ -487,32 +511,30 @@ static void run_barrier_tests(const BenchmarkParams& base) {
     }
 
     // ── LDR + DMB ISH (acquire pattern) vs LDAR ───────────────────────────
-    // The traditional way to implement a load-acquire is LDR followed by
-    // DMB. LDAR is the preferred single-instruction equivalent.
+    // The traditional way to implement a load-acquire is LDR followed by DMB.
+    // LDAR is the preferred single-instruction equivalent.
     // If LDR+DMB total cost ≈ LDAR cost, the hardware is folding them.
     // If LDR+DMB is more expensive, LDAR is genuinely faster.
-    // We measure 4×(LDR+DMB) per iteration to see the combined cost.
+    // Uses the same shuffled L1 ring as the LDR baseline.
     {
         const uint32_t pair_unroll = 4;  // 4 pairs = 8 instructions
         auto fn = [&] {
             CodeHolder code; g_jit_pool->init_code_holder(code);
             a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(32));
+            a.sub(sp, sp, Imm(16));
             a.stp(x19, x30, ptr(sp));
             a.mov(x19, Imm(loops));
-            a.add(x9, sp, Imm(16));
-            a.str(x9, ptr(x9));
-            a.ldr(x0, ptr(x9));
+            a.mov(x0, Imm(static_cast<uint64_t>(ring_head)));
             a.align(AlignMode::kCode, 64);
             Label top = a.new_label(); a.bind(top);
             for (uint32_t u = 0; u < pair_unroll; ++u) {
-                a.ldr(x0, ptr(x0));    // load
-                a.dmb(Imm(Predicate::DB::kISH));  // acquire barrier
+                a.ldr(x0, ptr(x0));
+                a.dmb(Imm(Predicate::DB::kISH));
             }
             a.sub(x19, x19, Imm(1));
             a.cbnz(x19, top);
             a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(32));
+            a.add(sp, sp, Imm(16));
             a.ret(x30);
             return g_jit_pool->compile(code);
         }();
