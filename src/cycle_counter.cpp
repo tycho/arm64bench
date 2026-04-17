@@ -20,11 +20,24 @@
 // advances at a CPU-cycle rate before marking the counter as available.
 // This catches the case where kpc calls succeed but return zeros or garbage.
 //
-// ── Other platforms ────────────────────────────────────────────────────────
+// ── Windows ARM64 (Qualcomm Snapdragon / Oryon) ────────────────────────────
 //
-// Stubs return false/0. Future work:
-//   Linux:        perf_event_open(PERF_COUNT_HW_CPU_CYCLES) per-thread
-//   Windows ARM64: no reliable userspace cycle counter exists
+// On Qualcomm Snapdragon systems, the PMU driver (qpmu.sys) typically sets
+// PMUSERENR_EL0.EN = 1, allowing EL0 userspace to read PMCCNTR_EL0 directly
+// without a kernel trap. We probe by attempting a read inside a Structured
+// Exception Handler (__try/__except). If access is denied (PMUSERENR_EL0.EN
+// not set), the MRS is trapped by EL1 and Windows delivers
+// EXCEPTION_ILLEGAL_INSTRUCTION; the handler catches it and we fall back to
+// Tier 2 ratio normalization.
+//
+// Note: __rdtsc() on Windows ARM64 maps to CNTVCT_EL0 (the fixed-frequency
+// generic timer, ~24 MHz on Snapdragon), NOT PMCCNTR_EL0 (CPU cycles). It is
+// not suitable for cycle counting and is not used here.
+//
+// ── Linux ──────────────────────────────────────────────────────────────────
+//
+// Not yet implemented. perf_event_open(PERF_COUNT_HW_CPU_CYCLES) per-thread
+// is the right path.
 
 #include "cycle_counter.h"
 #include "timer.h"
@@ -178,7 +191,111 @@ uint64_t cycle_counter_read() {
 
 } // namespace arm64bench
 
-#else // ── Non-Apple stub ────────────────────────────────────────────────────
+#elif defined(_WIN32) // ── Windows ARM64 ────────────────────────────────────
+
+// __builtin_arm_rsr64 is a Clang built-in for reading ARM64 system registers
+// by name. arm64bench requires Clang (MSVC is rejected), so this is safe.
+// It compiles to a single MRS instruction; no constant encoding required.
+
+#include <windows.h>
+
+namespace arm64bench {
+
+static bool s_available      = false;
+static bool s_init_attempted = false;
+
+// Probe PMCCNTR_EL0 inside a minimal SEH frame. If PMUSERENR_EL0.EN is not
+// set, the MRS is trapped by EL1 and Windows raises an exception here.
+// Using EXCEPTION_EXECUTE_HANDLER catches any exception code (the specific
+// code may be EXCEPTION_ILLEGAL_INSTRUCTION or EXCEPTION_PRIV_INSTRUCTION
+// depending on the Qualcomm driver version).
+static bool probe_pmccntr(uint64_t* out) {
+    __try {
+        *out = __builtin_arm_rsr64("PMCCNTR_EL0");
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool cycle_counter_init() {
+    if (s_init_attempted)
+        return s_available;
+    s_init_attempted = true;
+
+    // Probe access; bail out if EL0 reads are not permitted.
+    uint64_t c_before = 0;
+    if (!probe_pmccntr(&c_before))
+        return false;
+
+    // PMCCNTR_EL0 is a per-CPU register: each physical core has its own
+    // counter. If the thread migrates between reads, we get values from two
+    // different counters — the delta can be billions of cycles and makes the
+    // implied frequency absurdly high. Pin to the current CPU for the duration
+    // of this sanity check to prevent that.
+    const DWORD cpu = GetCurrentProcessorNumber();
+    const DWORD_PTR old_mask = SetThreadAffinityMask(
+        GetCurrentThread(), DWORD_PTR(1) << cpu);
+
+    // Sanity check: verify the counter advances at a plausible CPU-cycle rate.
+    // On Windows, RawTick is QPC ticks (not ns), so use tick_frequency() to
+    // compute a 1ms spin duration and ticks_to_ns_f() for the ns denominator.
+    const uint64_t one_ms_ticks = tick_frequency() / 1000;
+
+    if (!probe_pmccntr(&c_before)) {  // re-read after affinity change settles
+        if (old_mask)
+            SetThreadAffinityMask(GetCurrentThread(), old_mask);
+        return false;
+    }
+
+    const RawTick wall_start = tick_now();
+    volatile uint64_t v = 1;
+    while (tick_now() - wall_start < one_ms_ticks)
+        v ^= v * 6364136223846793005ULL + 1442695040888963407ULL;
+    (void)v;
+    const double wall_elapsed_ns = ticks_to_ns_f(tick_now() - wall_start);
+
+    uint64_t c_after = 0;
+    if (!probe_pmccntr(&c_after)) {
+        if (old_mask)
+            SetThreadAffinityMask(GetCurrentThread(), old_mask);
+        return false;
+    }
+
+    if (old_mask) SetThreadAffinityMask(GetCurrentThread(), old_mask);
+
+    const uint64_t cycle_delta = c_after - c_before;
+
+    // implied_ghz = cycles / elapsed_ns  (since GHz = cycles / ns)
+    const double implied_ghz = (wall_elapsed_ns > 0.0)
+        ? (static_cast<double>(cycle_delta) / wall_elapsed_ns)
+        : 0.0;
+
+    // Accept 0.2–20 GHz; rejects stuck-at-zero counters and implausible values.
+    if (implied_ghz < 0.2 || implied_ghz > 20.0)
+        return false;
+
+    s_available = true;
+    return true;
+}
+
+bool cycle_counter_available() {
+    return s_available;
+}
+
+// Hot path: read directly without SEH. init() already verified access works.
+uint64_t cycle_counter_read() {
+    if (!s_available)
+        return 0;
+    return __builtin_arm_rsr64("PMCCNTR_EL0");
+}
+
+} // namespace arm64bench
+
+#else // ── Non-Apple, non-Windows stub (Linux etc.) ──────────────────────────
+
+// TODO: Linux — perf_event_open(PERF_COUNT_HW_CPU_CYCLES) per-thread.
 
 namespace arm64bench {
 
@@ -188,4 +305,4 @@ uint64_t cycle_counter_read()      { return 0; }
 
 } // namespace arm64bench
 
-#endif // __APPLE__
+#endif // __APPLE__ / _WIN32

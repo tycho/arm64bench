@@ -67,17 +67,31 @@ static void sleep_ms(uint32_t ms) {
 
 struct PriorityGuard {
 #if defined(_WIN32)
-    int     old_thread_priority;
-    DWORD   old_process_priority_class;
+    int       old_thread_priority;
+    DWORD     old_process_priority_class;
+    DWORD_PTR old_affinity_mask;  // 0 if affinity was not changed
 
     PriorityGuard() {
-        old_thread_priority       = GetThreadPriority(GetCurrentThread());
+        old_thread_priority        = GetThreadPriority(GetCurrentThread());
         old_process_priority_class = GetPriorityClass(GetCurrentProcess());
         SetPriorityClass(GetCurrentProcess(),  HIGH_PRIORITY_CLASS);
         SetThreadPriority(GetCurrentThread(),  THREAD_PRIORITY_HIGHEST);
+
+        // PMCCNTR_EL0 is per-CPU: pin the thread to its current core so that
+        // both ends of every cycle_counter_read() delta hit the same counter.
+        // Without this, a migration during a timed sample produces a wildly
+        // wrong cycle count (reads values from two different CPUs' counters).
+        old_affinity_mask = 0;
+        if (cycle_counter_available()) {
+            const DWORD cpu = GetCurrentProcessorNumber();
+            old_affinity_mask = SetThreadAffinityMask(
+                GetCurrentThread(), DWORD_PTR(1) << cpu);
+        }
     }
 
     ~PriorityGuard() {
+        if (old_affinity_mask)
+            SetThreadAffinityMask(GetCurrentThread(), old_affinity_mask);
         SetThreadPriority(GetCurrentThread(),  old_thread_priority);
         SetPriorityClass(GetCurrentProcess(),  old_process_priority_class);
     }

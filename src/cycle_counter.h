@@ -15,8 +15,10 @@
 //     research; this is what Instruments, `time -l`, and Xcode use).
 //     kpc_force_all_ctrs_set() may require root; the implementation
 //     attempts it and continues gracefully on failure.
-//   Windows ARM64: not yet implemented (no reliable in-process per-thread
-//     cycle counter; QueryProcessorCycleTime uses 100ns units, not cycles).
+//   Windows ARM64 (Snapdragon/Oryon): reads PMCCNTR_EL0 directly if
+//     PMUSERENR_EL0.EN is set by the Qualcomm PMU driver (qpmu.sys).
+//     Probed at init time via SEH; falls back to ratio normalization if
+//     the register is not accessible from EL0.
 //   Linux: not yet implemented (perf_event_open is the right path).
 //
 // Typical usage:
