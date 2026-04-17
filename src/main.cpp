@@ -10,6 +10,9 @@
 #include "cycle_counter.h"
 #include <cstdio>
 #include <cstring>
+#if defined(_WIN32)
+#include <Windows.h>
+#endif
 
 #include "gen_integer.h"
 #include "gen_memory.h"
@@ -79,6 +82,10 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);
+#endif
 
     // Default: run integer and memory tests if nothing specified.
     if (!run_integer && !run_memory && !run_branch && !run_simd && !run_lse && !run_pitfalls)
