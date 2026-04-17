@@ -474,7 +474,7 @@ static void run_sub_logical_tests(const BenchmarkParams& base,
             auto fn  = build_loop(cfg, [emit_lat](a64::Assembler& a, uint32_t) {
                 emit_lat(a);
             });
-            snprintf(name, sizeof(name), "%s latency       (%ux unroll)",
+            snprintf(name, sizeof(name), "%s latency        (%ux unroll)",
                      op.label, unroll);
             run_one(name, fn, make_params(base, loops, unroll));
         }
@@ -562,7 +562,7 @@ static void run_shift_tests(const BenchmarkParams& base,
         auto fn = build_loop(cfg, [body](a64::Assembler& a, uint32_t) {
             body(a);
         });
-        snprintf(name, sizeof(name), "%s latency       (%ux unroll)", label, unroll);
+        snprintf(name, sizeof(name), "%s latency        (%ux unroll)", label, unroll);
         run_one(name, fn, make_params(base, loops, unroll));
     };
 
@@ -876,7 +876,7 @@ static void run_bit_tests(const BenchmarkParams& base,
         auto cfg  = default_cfg(loops, unroll);
         cfg.init_vals[0] = kSeed;
         auto fn = build_loop(cfg, [emit](a64::Assembler& a, uint32_t) { emit(a); });
-        snprintf(name, sizeof(name), "%s      (%ux unroll)", op.label, unroll);
+        snprintf(name, sizeof(name), "%-18s   (%ux unroll)", op.label, unroll);
         run_one(name, fn, make_params(base, loops, unroll));
     }
 
@@ -1057,6 +1057,248 @@ static void run_mixed_tests(const BenchmarkParams& base,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Section 8: Integer instruction gaps
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Instructions that are present in the existing coverage but deserve more
+// thorough throughput sweeps, plus new instructions not yet tested.
+//
+// EXTR (extract register):
+//   EXTR Xd, Xn, Xm, #lsb  — Xd = (Xn:Xm)[lsb+63:lsb]
+//   Equivalent to a 64-bit right-rotation of the 128-bit concatenation (Xn:Xm).
+//   Used heavily in cryptography (GCM, ChaCha20) and arbitrary-precision
+//   arithmetic. Architecturally, EXTR with Xn=Xm is ROR.
+//   Latency expected: 1 cycle (shares the shifter/bitfield unit with LSL/LSR).
+//
+// UMULH (unsigned multiply high):
+//   UMULH Xd, Xn, Xm  — Xd = (Xn * Xm) >> 64  (upper 64 bits of 128-bit product)
+//   Used for: 128-bit multiply, Montgomery modular reduction (crypto), hash
+//   functions (MurmurHash3, xxHash), compiler division-by-constant elimination.
+//   Latency: same as MUL on virtually all implementations (3 cycles), since
+//   both use the same 128-bit multiplier hardware. The throughput reveals
+//   whether the multiplier can sustain one result per cycle for this form.
+
+static void run_integer_gap_tests(const BenchmarkParams& base,
+                                   uint64_t loops, uint32_t unroll) {
+    char name[80];
+
+    // ── EXTR latency ──────────────────────────────────────────────────────
+    // EXTR x0, x1, x0, #32: x0 = upper-32-of-x0 | lower-32-of-x1
+    // Chains through x0; x1 is a stable constant (= 2 from default_cfg).
+    // Expected: 1 cycle latency on all modern ARM64 cores.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.extr(x0, x1, x0, Imm(32));
+        });
+        snprintf(name, sizeof(name), "EXTR x64 latency       (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── EXTR throughput sweep ─────────────────────────────────────────────
+    // Each chain: EXTR xN, x_const, xN, #32 — all read x1 as the upper source.
+    // This stresses the register-file broadcast for x1 (shared constant read)
+    // similar to the ADD x64 throughput sweep.
+    {
+        static const uint32_t kExtrChains[] = { 4, 6, 8, 10, 12, 16 };
+        for (uint32_t nc : kExtrChains) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.extr(xr(u % nc), x1, xr(u % nc), Imm(32));
+            });
+            snprintf(name, sizeof(name),
+                     "EXTR x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
+    }
+
+    // ── UMULH latency ─────────────────────────────────────────────────────
+    // UMULH x0, x0, x20: x0 = upper-64(x0 × x20)
+    // Chain through x0; x20 = odd constant from default_cfg.source_val.
+    //
+    // Note: with small initial x0 values, UMULH often produces 0 for the
+    // first few iterations (since x0 < 2^32 and x20 < 2^32 → product < 2^64).
+    // This does NOT affect latency measurement: the CPU must still wait for
+    // the previous UMULH to produce its result before starting the next one.
+    // Zero is not a special-cased input for the multiplier on any known core.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        cfg.source_val   = 0xDEADBEEFDEADBEEFULL;   // large odd constant
+        cfg.init_vals[0] = 0xCAFEBABECAFEBABEULL;   // large initial value
+        auto fn = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.umulh(x0, x0, x20);
+        });
+        snprintf(name, sizeof(name), "UMULH x64 latency      (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── UMULH throughput sweep ────────────────────────────────────────────
+    // Reveal the number of multiplier units that support UMULH.
+    // On all known ARM64 implementations, UMULH uses the same 128-bit
+    // multiplier as MUL, so UMULH saturation should match MUL saturation.
+    {
+        static const uint32_t kUmulhChains[] = { 2, 3, 4, 6, 8 };
+        for (uint32_t nc : kUmulhChains) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.source_val = 0xDEADBEEFDEADBEEFULL;
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = 0xCAFEBABECAFEBABEULL ^ static_cast<uint64_t>(i + 1);
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.umulh(xr(u % nc), xr(u % nc), x20);
+            });
+            snprintf(name, sizeof(name),
+                     "UMULH x64 tput (%u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Section 9: Conditional select (CSEL / CSINV / CSNEG)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// CSEL Xd, Xn, Xm, cond  → Xd = (cond) ? Xn : Xm
+// CSINV Xd, Xn, Xm, cond → Xd = (cond) ? Xn : ~Xm
+// CSNEG Xd, Xn, Xm, cond → Xd = (cond) ? Xn : -Xm
+//
+// These instructions read the NZCV condition flags register. Measuring
+// their latency is tricky because:
+//   1. The loop counter uses SUB + CBNZ (never writes NZCV) — good.
+//   2. We need a flag-writing instruction to feed each CSEL.
+//
+// LATENCY CHAIN DESIGN
+//   Interleave ADDS x0, x0, x20 with CSEL x0, x0, x1, NE in alternating
+//   unroll slots. The chain is:
+//
+//     ADDS: x0_new = x0 + x20, NZCV_new = flags(x0 + x20)   [x20 ≠ 0 → NE always]
+//     CSEL: x0_out = (NE) ? x0_new : x1                      [always selects x0_new]
+//
+//   Each CSEL depends on both x0_new (data dep) and NZCV_new (flag dep) from
+//   the preceding ADDS. The ADDS in the next slot depends on x0_out from CSEL.
+//   This forms a strict serial chain through (ADDS + CSEL) pairs.
+//
+//   Reported clk/insn = (ADDS_lat + CSEL_lat) / 2.
+//   Since ADDS_lat = 1 cycle on all modern ARM64 cores:
+//     clk/insn ≈ 1.0 means CSEL_lat = 1 cycle.
+//     clk/insn ≈ 1.5 means CSEL_lat = 2 cycles.
+//
+// THROUGHPUT DESIGN
+//   N independent (ADDS+CSEL) pair chains across N registers.
+//   Interleaving pattern: N ADDS slots followed by N CSEL slots.
+//   OOO execution with flag renaming allows all N ADDS to issue in
+//   parallel, and all N CSELs to issue in parallel once the ADDs complete.
+//
+//   Throughput floor = max(1/n_adds_units, 1/n_csel_units) cycles per insn.
+//   Saturation chain count reveals the bottleneck unit count.
+
+static void run_csel_tests(const BenchmarkParams& base,
+                            uint64_t loops, uint32_t unroll) {
+    char name[80];
+
+    // ── ADDS + CSEL latency chain ──────────────────────────────────────────
+    // Alternating ADDS (even slots) and CSEL (odd slots) in the unrolled body.
+    // x20 = 0x12345678 (non-zero constant from default_cfg → NE always set).
+    // x1  = 2 (false arm of CSEL, never selected since NE=true).
+    {
+        auto cfg = default_cfg(loops, unroll);
+        cfg.init_vals[0] = 1ULL;   // x0: chain accumulator
+        cfg.init_vals[1] = 2ULL;   // x1: false arm (never selected)
+        auto fn = build_loop(cfg, [](a64::Assembler& a, uint32_t u) {
+            if (u % 2 == 0)
+                a.adds(x0, x0, x20);                     // flags: NE=true (x20 ≠ 0)
+            else
+                a.csel(x0, x0, x1, CondCode::kNE);       // always selects x0 (true arm)
+        });
+        snprintf(name, sizeof(name), "ADDS+CSEL chain      (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── ADDS + CSINV latency chain ─────────────────────────────────────────
+    // CSINV: true arm (NE) selects Xn = x0 unchanged.
+    // False arm would produce ~x1 = ~2, but is never taken.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        cfg.init_vals[0] = 1ULL;
+        cfg.init_vals[1] = 2ULL;
+        auto fn = build_loop(cfg, [](a64::Assembler& a, uint32_t u) {
+            if (u % 2 == 0)
+                a.adds(x0, x0, x20);
+            else
+                a.csinv(x0, x0, x1, CondCode::kNE);      // always selects x0
+        });
+        snprintf(name, sizeof(name), "ADDS+CSINV chain     (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── ADDS + CSNEG latency chain ─────────────────────────────────────────
+    // CSNEG: true arm (NE) selects Xn = x0 unchanged.
+    // False arm would produce -(x1) = -2, but is never taken.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        cfg.init_vals[0] = 1ULL;
+        cfg.init_vals[1] = 2ULL;
+        auto fn = build_loop(cfg, [](a64::Assembler& a, uint32_t u) {
+            if (u % 2 == 0)
+                a.adds(x0, x0, x20);
+            else
+                a.csneg(x0, x0, x1, CondCode::kNE);      // always selects x0
+        });
+        snprintf(name, sizeof(name), "ADDS+CSNEG chain     (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── CSEL throughput sweep ─────────────────────────────────────────────
+    // nc independent ADDS+CSEL pair chains. Interleaved pattern:
+    //   slots 0..nc-1    : ADDS x[i], x[i], x20  (all nc chains)
+    //   slots nc..2nc-1  : CSEL x[i], x[i], xzr, ne  (all nc chains)
+    //
+    // OOO flag renaming ensures each CSEL reads its own chain's NZCV,
+    // keeping chains fully independent.
+    //
+    // xzr (always zero) is the false arm — never selected since NE=true.
+    //
+    // Interpretation: saturation chain count ≈ min(n_adds_units, n_csel_units).
+    // Each pair is 2 instructions; clk/insn at saturation ≈ 1 / min_units.
+    {
+        static const uint32_t kCselChains[] = { 2, 4, 6, 8 };
+        for (uint32_t nc : kCselChains) {
+            const uint32_t period       = 2 * nc;
+            const uint32_t actual_unroll = (unroll >= period)
+                ? (unroll / period) * period : period;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
+
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                const uint32_t phase = u % (2 * nc);
+                const uint32_t chain = phase % nc;
+                if (phase < nc)
+                    a.adds(xr(chain), xr(chain), x20);
+                else
+                    a.csel(xr(chain), xr(chain), xzr, CondCode::kNE);
+            });
+            snprintf(name, sizeof(name),
+                     "CSEL tput  (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1084,6 +1326,12 @@ void run_integer_tests(const BenchmarkParams& base_params) {
 
     printf("\n── Mixed / port pressure ───────────────────────────────────────\n");
     run_mixed_tests(base_params, loops, unroll);
+
+    printf("\n── Integer gaps ─────────────────────────────────────────────────\n");
+    run_integer_gap_tests(base_params, loops, unroll);
+
+    printf("\n── Conditional select ───────────────────────────────────────────\n");
+    run_csel_tests(base_params, loops, unroll);
 }
 
 } // namespace arm64bench::gen

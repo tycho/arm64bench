@@ -743,6 +743,487 @@ static void run_mixed_fp_tests(const BenchmarkParams& base,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Section 7: Cross-domain latency (GPR ↔ FP/SIMD register file)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// These tests measure the latency penalty for moving values between the
+// integer (GPR) and floating-point/SIMD execution domains.
+//
+// On all ARM64 microarchitectures, GPR and SIMD/FP registers are physically
+// separate files with dedicated execution ports. Moving a value from one to
+// the other crosses an interconnect that has non-zero latency.
+//
+// FMOV Dn, Xn — copies integer bits from a GPR into the lower 64 bits of
+//   a SIMD/FP register (no conversion; the bits are reinterpreted as FP only
+//   by subsequent FP instructions).
+//
+// FMOV Xn, Dn — reverse direction.
+//
+// SCVTF Dn, Xn — convert a signed 64-bit integer in Xn to IEEE-754 double
+//   precision in Dn. This both crosses the domain and performs a conversion.
+//
+// FCVTZS Xn, Dn — convert a double-precision float in Dn to a signed 64-bit
+//   integer in Xn with truncation toward zero.
+//
+// ── Measurement approach ──────────────────────────────────────────────────
+//
+// Because each FMOV produces a result in a different domain from its input,
+// a single FMOV cannot be chained with itself. Instead, tests use round-trip
+// pairs: two complementary instructions that form a full dependency chain
+// through both domains. With unroll=2N alternating instructions:
+//
+//   GPR→FP pair:   FMOV D0, X0 → FMOV X0, D0 (repeated N times)
+//   Conv pair:     SCVTF D0, X0 → FCVTZS X0, D0 (repeated N times)
+//
+// The reported clk/insn is the average latency per instruction in the pair.
+// If both directions have equal latency L, clk/insn = L.
+//
+// ── Architecture differentiation ─────────────────────────────────────────
+//
+// Apple M-series: domain crossing via FMOV is reportedly 0–1 extra cycles
+//   over baseline. The forwarding network is tightly integrated.
+//
+// Cortex-A76/A78/X1: typically 0–2 cycle domain crossing overhead.
+//
+// Qualcomm Oryon: characteristics not yet published.
+
+static void run_crossdomain_tests(const BenchmarkParams& base,
+                                   uint64_t loops, uint32_t unroll) {
+    char name[80];
+
+    // Ensure even unroll: tests use pairs of complementary instructions.
+    const uint32_t u2 = (unroll >= 2) ? (unroll / 2) * 2 : 2;
+
+    // ── FMOV round-trip: GPR → FP → GPR ──────────────────────────────────
+    // Chain: X0 → (FMOV D0,X0) → D0 → (FMOV X0,D0) → X0 → ...
+    // clk/insn = avg(latency_GPR→FP, latency_FP→GPR).
+    {
+        auto fn = build_fp_loop(loops, u2,
+            [](a64::Assembler& a) {
+                // Seed: a 64-bit pattern that reads back as 1.0 in double.
+                a.mov(x0, Imm(0x3FF0000000000000LL));
+                a.fmov(d0, x0);
+            },
+            [](a64::Assembler& a, uint32_t u) {
+                if (u & 1) a.fmov(x0, d0);   // FP → GPR
+                else       a.fmov(d0, x0);   // GPR → FP
+            });
+        snprintf(name, sizeof(name),
+                 "FMOV GPR↔FP round-trip (%ux)", u2);
+        run_one(name, fn, make_params(base, loops, u2));
+    }
+
+    // ── SCVTF / FCVTZS round-trip: integer → double → integer ────────────
+    // Chain: X0 → (SCVTF D0,X0) → D0 → (FCVTZS X0,D0) → X0 → ...
+    // Initial value X0 = 1 is stable: 1 → 1.0 → 1 → 1.0 → ...
+    // clk/insn = avg(latency_SCVTF, latency_FCVTZS).
+    {
+        auto fn = build_fp_loop(loops, u2,
+            [](a64::Assembler& a) {
+                a.mov(x0, Imm(1));
+                a.scvtf(d0, x0);   // seed d0 = 1.0
+            },
+            [](a64::Assembler& a, uint32_t u) {
+                if (u & 1) a.fcvtzs(x0, d0);  // double → int64 (truncate)
+                else       a.scvtf (d0, x0);  // int64 → double
+            });
+        snprintf(name, sizeof(name),
+                 "SCVTF/FCVTZS d64 round-trip (%ux)", u2);
+        run_one(name, fn, make_params(base, loops, u2));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Section 8: Cryptography extensions (ARMv8-A)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// ARMv8-A Cryptography extensions provide single-instruction acceleration for:
+//   AES:    AESE/AESD (round), AESMC/AESIMC (MixColumns)
+//   SHA-256: SHA256H, SHA256H2 (compression), SHA256SU0/SU1 (message schedule)
+//   Poly multiply: PMULL/PMULL2 (poly8×8→16 lanes, or poly64×64→128 for GCM)
+//   CRC32:  CRC32B/H/W/X, CRC32CB/CH/CW/CX (Castagnoli variant)
+//
+// All Apple Silicon, Snapdragon X Elite, and ARMv8.1+ Linux targets support
+// these extensions. Guards use __ARM_FEATURE_CRYPTO / __ARM_FEATURE_CRC32.
+//
+// ── AES microarchitecture notes ──────────────────────────────────────────
+//
+// Typical ARM cores fuse consecutive AESE+AESMC (and AESD+AESIMC) pairs on
+// the same register into a single micro-op, reducing the pair to 1 cycle.
+// Apple M-series: 2 AES execution units, each can execute 1 fused pair/cycle.
+// At 2 independent AES streams, throughput saturates: 1 round pair/cycle total.
+//
+// ── PMULL poly64 (GCM) ───────────────────────────────────────────────────
+//
+// GCM (Galois/Counter Mode) authentication uses PMULL Vd.1Q, Vn.1D, Vm.1D
+// to compute a 128-bit carry-less multiply. Latency on Apple M-series ~2 cyc.
+//
+// Chaining: Vd.1Q (128-bit output) → Vd.1D (lower 64 bits as next input).
+//
+// ── SHA-256 notes ─────────────────────────────────────────────────────────
+//
+// SHA256H Q0, Q1, V2.4S implements one round of SHA-256 compression.
+// Q0 holds the first half of {a,b,c,d,e,f,g,h}; Q1 holds the second half.
+// Both are read and written (or written via SHA256H2). Only Q0 is chained.
+
+#if defined(__ARM_FEATURE_CRYPTO) || defined(__ARM_FEATURE_CRC32)
+
+static void run_crypto_tests(const BenchmarkParams& base,
+                              uint64_t loops, uint32_t unroll) {
+    char name[80];
+
+#if defined(__ARM_FEATURE_CRYPTO)
+
+    // ── AESE latency ──────────────────────────────────────────────────────
+    // AESE V0.16B, V1.16B: V0 ← SubBytes(ShiftRows(V0)) XOR V1
+    // V1 = constant round key. Chain through V0.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[1].b16(), Imm(0x5A));  // constant round key
+                a.movi(kVRegs[0].b16(), Imm(0x01));  // data
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.aese(kVRegs[0].b16(), kVRegs[1].b16());
+            });
+        snprintf(name, sizeof(name), "AESE latency          (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── AESMC latency ─────────────────────────────────────────────────────
+    // AESMC V0.16B, V0.16B: V0 ← MixColumns(V0)
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) { a.movi(kVRegs[0].b16(), Imm(0x01)); },
+            [](a64::Assembler& a, uint32_t) {
+                a.aesmc(kVRegs[0].b16(), kVRegs[0].b16());
+            });
+        snprintf(name, sizeof(name), "AESMC latency         (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── AESE+AESMC pair latency ───────────────────────────────────────────
+    // One AES-128 encryption round: AESE immediately followed by AESMC on
+    // the same register. Hardware may fuse this into 1 micro-op.
+    // Emits unroll/2 pairs = unroll instructions.
+    {
+        const uint32_t u2 = (unroll / 2) * 2;
+        auto fn = build_fp_loop(loops, u2,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[1].b16(), Imm(0x5A));  // round key
+                a.movi(kVRegs[0].b16(), Imm(0x01));  // data
+            },
+            [](a64::Assembler& a, uint32_t u) {
+                if (u & 1) a.aesmc(kVRegs[0].b16(), kVRegs[0].b16());
+                else       a.aese (kVRegs[0].b16(), kVRegs[1].b16());
+            });
+        snprintf(name, sizeof(name), "AESE+AESMC latency    (%ux unroll)", u2);
+        run_one(name, fn, make_params(base, loops, u2));
+    }
+
+    // ── AESE+AESMC throughput ─────────────────────────────────────────────
+    // N independent AES data streams, all using the same constant key V(n).
+    // Each stream: AESE Vi.16B, Vkey.16B → AESMC Vi.16B, Vi.16B
+    // Reveals number of AES execution units (saturation chain count).
+    {
+        static const uint32_t kChains[] = { 2, 4, 6 };
+        for (uint32_t nc : kChains) {
+            const uint32_t key_reg = nc;
+            const uint32_t u2 = nc * 2;  // 2 instructions per stream
+            auto fn = build_fp_loop(loops, u2,
+                [nc, key_reg](a64::Assembler& a) {
+                    a.movi(kVRegs[key_reg].b16(), Imm(0x5A));
+                    for (uint32_t i = 0; i < nc; ++i)
+                        a.movi(kVRegs[i].b16(), Imm(static_cast<uint64_t>(i + 1)));
+                },
+                [key_reg](a64::Assembler& a, uint32_t u) {
+                    const uint32_t chain = u / 2;
+                    if (u & 1) a.aesmc(kVRegs[chain].b16(), kVRegs[chain].b16());
+                    else       a.aese (kVRegs[chain].b16(), kVRegs[key_reg].b16());
+                });
+            snprintf(name, sizeof(name), "AESE+AESMC tput (%u streams, %ux)", nc, u2);
+            run_one(name, fn, make_params(base, loops, u2));
+        }
+    }
+
+    // ── PMULL poly64 latency (GCM form: 64×64 → 128) ─────────────────────
+    // PMULL V0.1Q, V0.1D, V1.1D
+    // Chain: V0.1D (lower 64 bits of V0) → V0.1Q (full 128-bit result).
+    // V1 = constant multiplier (analogous to GCM authentication key H).
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[1].b16(), Imm(0x03));   // constant multiplier
+                a.movi(kVRegs[0].b16(), Imm(0xAA));   // data
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.pmull(kVRegs[0].q(), kVRegs[0].d(), kVRegs[1].d());
+            });
+        snprintf(name, sizeof(name), "PMULL poly64 latency  (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── SHA256SU0 latency ─────────────────────────────────────────────────
+    // SHA256SU0 V0.4S, V1.4S — message schedule step 0. Chains through V0.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[1].s4(), Imm(0x5A));
+                a.movi(kVRegs[0].s4(), Imm(0x01));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.sha256su0(kVRegs[0].s4(), kVRegs[1].s4());
+            });
+        snprintf(name, sizeof(name), "SHA256SU0 latency     (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── SHA256H latency ───────────────────────────────────────────────────
+    // SHA256H Q0, Q1, V2.4S — compression round A. Q0 = f(Q0, Q1, V2.4S).
+    // Q1 (second state half) and V2 (message words) held constant.
+    // Chain through Q0 (first state half: a, b, c, d).
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].s4(),  Imm(0x5A));   // message words W[t..t+3]
+                a.movi(kVRegs[1].b16(), Imm(0x03));   // second state half (constant)
+                a.movi(kVRegs[0].b16(), Imm(0x01));   // first state half (chains)
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.sha256h(kVRegs[0].q(), kVRegs[1].q(), kVRegs[2].s4());
+            });
+        snprintf(name, sizeof(name), "SHA256H latency       (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+#endif // __ARM_FEATURE_CRYPTO
+
+#if defined(__ARM_FEATURE_CRC32)
+
+    // ── CRC32B latency ────────────────────────────────────────────────────
+    // CRC32B W0, W0, W1 — CRC-32 of byte W1[7:0], accumulated in W0.
+    // W0 chains (CRC state). W1 = constant data byte.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.mov(x1, Imm(0xAB));
+                a.mov(x0, Imm(0xFFFFFFFF));
+            },
+            [](a64::Assembler& a, uint32_t) { a.crc32b(w0, w0, w1); });
+        snprintf(name, sizeof(name), "CRC32B latency        (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── CRC32W latency ────────────────────────────────────────────────────
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.mov(x1, Imm(0xABCD1234));
+                a.mov(x0, Imm(0xFFFFFFFF));
+            },
+            [](a64::Assembler& a, uint32_t) { a.crc32w(w0, w0, w1); });
+        snprintf(name, sizeof(name), "CRC32W latency        (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── CRC32X latency ────────────────────────────────────────────────────
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.mov(x1, Imm(0xABCD123456789ABCULL));
+                a.mov(x0, Imm(0xFFFFFFFF));
+            },
+            [](a64::Assembler& a, uint32_t) { a.crc32x(w0, w0, x1); });
+        snprintf(name, sizeof(name), "CRC32X latency        (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+#endif // __ARM_FEATURE_CRC32
+}
+
+#endif // __ARM_FEATURE_CRYPTO || __ARM_FEATURE_CRC32
+
+// ════════════════════════════════════════════════════════════════════════════
+// Section 9: Advanced SIMD — dot product, widening multiply, and FP16
+// ════════════════════════════════════════════════════════════════════════════
+//
+// ── SDOT / UDOT (ARMv8.2-A DotProd extension) ────────────────────────────
+//
+// SDOT Vd.4S, Vn.16B, Vm.16B performs 4 independent signed int8 dot
+// products of 4-element groups:
+//   Vd[i] += Vn[4i..4i+3] · Vm[4i..4i+3]   (for i in 0..3)
+//
+// This is the primary instruction for quantized neural network inference
+// on ARM (analogous to VNNI on x86). On Apple M-series and Snapdragon X1,
+// it typically delivers 1 instruction per cycle throughput with multiple units.
+//
+// ── SMLAL / UMLAL (widening multiply-accumulate) ──────────────────────────
+//
+// SMLAL Vd.4S, Vn.4H, Vm.4H — signed 16×16 → 32-bit widening multiply-add.
+//   Vd[i] += Vn[i] * Vm[i]  (for i in 0..3, inputs 16-bit, acc 32-bit)
+//
+// Used in fixed-point DSP / audio codecs. On modern Apple Silicon it likely
+// shares the same MAC pipeline as FMLA.
+//
+// ── FMLA 8×f16 (FP16 FMA) ────────────────────────────────────────────────
+//
+// FMLA Vd.8H, Vn.8H, Vm.8H — fp16 fused multiply-accumulate (8 lanes).
+// Requires __ARM_FEATURE_FP16_VECTOR_ARITHMETIC.
+//
+// Apple M-series supports fp16 natively in the FP pipeline. If f16 and f32
+// FMA share the same units (same latency / same saturation count), then
+// fp16 doubles the FLOPS throughput of f32 for the same pipeline width.
+//
+// ── FMLAL 4S (FP16 multiply → FP32 accumulate) ───────────────────────────
+//
+// FMLAL Vd.4S, Vn.4H, Vm.4H — multiply 4 fp16 pairs, accumulate to f32.
+// Used in mixed-precision ML (compute in fp16, accumulate in fp32 to avoid
+// overflow). Requires __ARM_FEATURE_FP16_FML.
+
+static void run_advanced_simd_tests(const BenchmarkParams& base,
+                                     uint64_t loops, uint32_t unroll) {
+    char name[80];
+
+#if defined(__ARM_FEATURE_DOTPROD)
+
+    // ── SDOT v4s latency ──────────────────────────────────────────────────
+    // SDOT V0.4S, V1.16B, V2.16B — V0 is the accumulator (chains).
+    // V1 and V2 are constant signed-byte data.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].b16(), Imm(0x02));
+                a.movi(kVRegs[1].b16(), Imm(0x03));
+                a.movi(kVRegs[0].s4(),  Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.sdot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
+            });
+        snprintf(name, sizeof(name), "SDOT v4s latency      (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── SDOT v4s throughput: sweep 2..6 chains ────────────────────────────
+    {
+        static const uint32_t kChains[] = { 2, 3, 4, 6 };
+        for (uint32_t nc : kChains) {
+            const uint32_t au = (unroll / nc) * nc;
+            if (!au) continue;
+            const uint32_t va = nc, vb = nc + 1;
+            auto fn = build_fp_loop(loops, au,
+                [nc, va, vb](a64::Assembler& a) {
+                    a.movi(kVRegs[vb].b16(), Imm(0x02));
+                    a.movi(kVRegs[va].b16(), Imm(0x03));
+                    for (uint32_t i = 0; i < nc; ++i)
+                        a.movi(kVRegs[i].s4(), Imm(0));
+                },
+                [nc, va, vb](a64::Assembler& a, uint32_t u) {
+                    a.sdot(kVRegs[u % nc].s4(), kVRegs[va].b16(), kVRegs[vb].b16());
+                });
+            snprintf(name, sizeof(name),
+                     "SDOT v4s tput (%u chains, %ux unroll)", nc, au);
+            run_one(name, fn, make_params(base, loops, au));
+        }
+    }
+
+    // ── UDOT v4s latency (unsigned) ───────────────────────────────────────
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].b16(), Imm(0x02));
+                a.movi(kVRegs[1].b16(), Imm(0x03));
+                a.movi(kVRegs[0].s4(),  Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.udot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
+            });
+        snprintf(name, sizeof(name), "UDOT v4s latency      (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+#endif // __ARM_FEATURE_DOTPROD
+
+    // ── SMLAL v4s latency (int16×int16 → int32 widening accumulate) ───────
+    // SMLAL V0.4S, V1.4H, V2.4H — V0 chains; V1, V2 constant (16-bit int)
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].h4(), Imm(0x03));
+                a.movi(kVRegs[1].h4(), Imm(0x07));
+                a.movi(kVRegs[0].s4(), Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.smlal(kVRegs[0].s4(), kVRegs[1].h4(), kVRegs[2].h4());
+            });
+        snprintf(name, sizeof(name), "SMLAL v4s latency     (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+
+    // ── FMLA 8×f16 latency ────────────────────────────────────────────────
+    // FMLA V0.8H, V1.8H, V2.8H — fp16 FMA (8 lanes). V0 accumulator chains.
+    // Init all regs via MOVI with 0x3C, LSL #8 → 0x3C00 = fp16(1.0).
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].h8(), Imm(0x3C), Imm(8));  // fp16(1.0) in all lanes
+                a.movi(kVRegs[1].h8(), Imm(0x3C), Imm(8));
+                a.movi(kVRegs[0].h8(), Imm(0x3C), Imm(8));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.fmla(kVRegs[0].h8(), kVRegs[1].h8(), kVRegs[2].h8());
+            });
+        snprintf(name, sizeof(name), "FMLA v8f16 acc-chain  (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── FMLA 8×f16 throughput: 4 chains ──────────────────────────────────
+    {
+        const uint32_t nc = 4;
+        const uint32_t au = (unroll / nc) * nc;
+        if (au) {
+            auto fn = build_fp_loop(loops, au,
+                [](a64::Assembler& a) {
+                    a.movi(kVRegs[nc    ].h8(), Imm(0x3C), Imm(8));
+                    a.movi(kVRegs[nc + 1].h8(), Imm(0x3C), Imm(8));
+                    for (uint32_t i = 0; i < nc; ++i)
+                        a.movi(kVRegs[i].h8(), Imm(0x3C), Imm(8));
+                },
+                [](a64::Assembler& a, uint32_t u) {
+                    a.fmla(kVRegs[u % nc].h8(), kVRegs[nc].h8(), kVRegs[nc + 1].h8());
+                });
+            snprintf(name, sizeof(name),
+                     "FMLA v8f16 tput (%u chains, %ux unroll)", nc, au);
+            run_one(name, fn, make_params(base, loops, au));
+        }
+    }
+
+#endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+
+#if defined(__ARM_FEATURE_FP16_FML)
+
+    // ── FMLAL v4s latency (f16×f16 → f32 widening accumulate) ────────────
+    // FMLAL V0.4S, V1.4H, V2.4H — V0.4S is the f32 accumulator (chains).
+    // V1 and V2 are fp16 inputs. Useful for mixed-precision ML inference.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].h4(), Imm(0x3C), Imm(8));  // fp16(1.0) in 4 lanes
+                a.movi(kVRegs[1].h4(), Imm(0x3C), Imm(8));
+                a.movi(kVRegs[0].s4(), Imm(0));              // f32(0.0) accumulator
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.fmlal(kVRegs[0].s4(), kVRegs[1].h4(), kVRegs[2].h4());
+            });
+        snprintf(name, sizeof(name), "FMLAL v4s latency     (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+#endif // __ARM_FEATURE_FP16_FML
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -767,6 +1248,17 @@ void run_fp_simd_tests(const BenchmarkParams& base_params) {
 
     printf("\n── Mixed FP port pressure ──────────────────────────────────────\n");
     run_mixed_fp_tests(base_params, loops, unroll);
+
+    printf("\n── Cross-domain latency (GPR ↔ FP) ─────────────────────────────\n");
+    run_crossdomain_tests(base_params, loops, unroll);
+
+#if defined(__ARM_FEATURE_CRYPTO) || defined(__ARM_FEATURE_CRC32)
+    printf("\n── Cryptography extensions ─────────────────────────────────────\n");
+    run_crypto_tests(base_params, loops, unroll);
+#endif
+
+    printf("\n── Advanced SIMD (dot-product / widening / FP16) ───────────────\n");
+    run_advanced_simd_tests(base_params, loops, unroll);
 }
 
 } // namespace arm64bench::gen

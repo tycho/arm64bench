@@ -43,6 +43,7 @@ add_executable(arm64bench
     src/gen_memory.cpp
     src/gen_branch.cpp
     src/gen_fp_simd.cpp
+    src/gen_lse.cpp
     src/gen_pitfalls.cpp
 )
 

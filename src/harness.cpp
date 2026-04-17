@@ -208,7 +208,7 @@ static void print_result(const char* name, const BenchmarkResult& r) {
         //   ADD latency x32 : min   0.226 ns  med   0.226 ns   0.998 clk  CoV  0.1%
         //   FDIV f32    x8  : min   4.310 ns  med   4.312 ns  19.009 clk~ CoV  0.2%
 
-        printf("%-36s: min %7.3f ns  med %7.3f ns",
+        printf("%-48s: min %7.3f ns  med %7.3f ns",
                name,
                r.min_ns_per_insn,
                r.median_ns_per_insn);
