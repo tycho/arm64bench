@@ -36,6 +36,11 @@
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
 #include <cstdio>
+#if defined(__APPLE__)
+#  include <sys/sysctl.h>
+#elif defined(_WIN32)
+#  include <windows.h>
+#endif
 
 namespace arm64bench::gen {
 
@@ -1212,6 +1217,176 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Section 10: FEAT_I8MM — integer 8-bit matrix multiply (ARMv8.6-A / ARMv9.2)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// FEAT_I8MM adds mixed-signedness dot products and matrix multiply-accumulate.
+// Available on M2+ (ARMv8.6-A mandatory), Snapdragon X Elite, Graviton3+.
+//
+// ── USDOT (unsigned × signed dot product) ────────────────────────────────
+//
+// USDOT Vd.4S, Vn.16B, Vm.16B — Vd[i] += unsigned(Vn[4i:4i+4]) · signed(Vm[4i:4i+4])
+//   The direct ARM equivalent of Intel AVX-VNNI VPDPBUSD: unsigned activations
+//   multiplied by signed weights. SDOT/UDOT require equal sign on both operands,
+//   forcing a zero-point bias adjustment for asymmetric quantization; USDOT does not.
+//
+// ── SMMLA / UMMLA / USMMLA (8-bit matrix multiply-accumulate) ─────────────
+//
+// SMMLA Vd.4S, Vn.16B, Vm.16B — 2×8 signed matrix × 8×2 signed matrix → 2×2 int32
+//   Vd.s4() holds a 2×2 int32 result matrix packed as [row0col0, row0col1, row1col0, row1col1].
+//   Each element accumulates 8 int8×int8 products — 2× the depth of SDOT.
+//   Effective MAC throughput: 32 ops per instruction vs 16 for SDOT (same register width).
+//
+// UMMLA:  both operands unsigned. USMMLA: Vn unsigned, Vm signed (the ML-critical form).
+//
+// ── Windows detection ─────────────────────────────────────────────────────
+//
+// No PF_ARM_I8MM_INSTRUCTIONS_AVAILABLE exists in the Windows SDK. The correct
+// proxy is PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE (WinSDK 10.0.26100+): SVE-I8MM
+// implies plain I8MM. Used by FFmpeg, dav1d, and others for the same purpose.
+
+#if defined(__APPLE__)
+static bool has_feat_i8mm() {
+    int val = 0; size_t len = sizeof(val);
+    return sysctlbyname("hw.optional.arm.FEAT_I8MM", &val, &len, nullptr, 0) == 0 && val != 0;
+}
+#elif defined(_WIN32)
+static bool has_feat_i8mm() {
+#  ifdef PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE
+    return IsProcessorFeaturePresent(PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE) != 0;
+#  else
+    return true;  // Snapdragon X Elite / Oryon always has FEAT_I8MM
+#  endif
+}
+#else
+static bool has_feat_i8mm() { return true; }
+#endif
+
+static void run_i8mm_tests(const BenchmarkParams& base,
+                            uint64_t loops, uint32_t unroll) {
+    if (!has_feat_i8mm()) {
+        printf("  (FEAT_I8MM not available on this CPU — skipping)\n");
+        return;
+    }
+
+    char name[80];
+
+    // ── USDOT v4s latency ─────────────────────────────────────────────────
+    // USDOT V0.4S, V1.16B, V2.16B — unsigned(V1) · signed(V2) dot product.
+    // V1 = constant unsigned bytes, V2 = constant signed bytes. V0 chains.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].b16(), Imm(0x03));
+                a.movi(kVRegs[1].b16(), Imm(0x02));
+                a.movi(kVRegs[0].s4(),  Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.usdot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
+            });
+        snprintf(name, sizeof(name), "USDOT v4s latency     (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── USDOT v4s throughput: sweep 2..6 chains ───────────────────────────
+    {
+        static const uint32_t kChains[] = { 2, 3, 4, 6 };
+        for (uint32_t nc : kChains) {
+            const uint32_t au = (unroll / nc) * nc;
+            if (!au) continue;
+            const uint32_t va = nc, vb = nc + 1;
+            auto fn = build_fp_loop(loops, au,
+                [nc, va, vb](a64::Assembler& a) {
+                    a.movi(kVRegs[vb].b16(), Imm(0x03));
+                    a.movi(kVRegs[va].b16(), Imm(0x02));
+                    for (uint32_t i = 0; i < nc; ++i)
+                        a.movi(kVRegs[i].s4(), Imm(0));
+                },
+                [nc, va, vb](a64::Assembler& a, uint32_t u) {
+                    a.usdot(kVRegs[u % nc].s4(), kVRegs[va].b16(), kVRegs[vb].b16());
+                });
+            snprintf(name, sizeof(name),
+                     "USDOT v4s tput (%u chains, %ux unroll)", nc, au);
+            run_one(name, fn, make_params(base, loops, au));
+        }
+    }
+
+    // ── SMMLA v4s latency ─────────────────────────────────────────────────
+    // SMMLA V0.4S, V1.16B, V2.16B — 2×8 signed × 8×2 signed matrix MLA.
+    // Each of the 4 int32 accumulators sums 8 int8×int8 products (vs 4 for SDOT).
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].b16(), Imm(0x02));
+                a.movi(kVRegs[1].b16(), Imm(0x03));
+                a.movi(kVRegs[0].s4(),  Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.smmla(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
+            });
+        snprintf(name, sizeof(name), "SMMLA v4s latency     (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── SMMLA v4s throughput: sweep 2..6 chains ───────────────────────────
+    {
+        static const uint32_t kChains[] = { 2, 3, 4, 6 };
+        for (uint32_t nc : kChains) {
+            const uint32_t au = (unroll / nc) * nc;
+            if (!au) continue;
+            const uint32_t va = nc, vb = nc + 1;
+            auto fn = build_fp_loop(loops, au,
+                [nc, va, vb](a64::Assembler& a) {
+                    a.movi(kVRegs[vb].b16(), Imm(0x02));
+                    a.movi(kVRegs[va].b16(), Imm(0x03));
+                    for (uint32_t i = 0; i < nc; ++i)
+                        a.movi(kVRegs[i].s4(), Imm(0));
+                },
+                [nc, va, vb](a64::Assembler& a, uint32_t u) {
+                    a.smmla(kVRegs[u % nc].s4(), kVRegs[va].b16(), kVRegs[vb].b16());
+                });
+            snprintf(name, sizeof(name),
+                     "SMMLA v4s tput (%u chains, %ux unroll)", nc, au);
+            run_one(name, fn, make_params(base, loops, au));
+        }
+    }
+
+    // ── UMMLA v4s latency ─────────────────────────────────────────────────
+    // UMMLA V0.4S, V1.16B, V2.16B — unsigned × unsigned matrix MLA.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].b16(), Imm(0x02));
+                a.movi(kVRegs[1].b16(), Imm(0x03));
+                a.movi(kVRegs[0].s4(),  Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.ummla(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
+            });
+        snprintf(name, sizeof(name), "UMMLA v4s latency     (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── USMMLA v4s latency ────────────────────────────────────────────────
+    // USMMLA V0.4S, V1.16B, V2.16B — unsigned(V1) × signed(V2) matrix MLA.
+    // Matrix-multiply form of USDOT: 2× MAC depth per instruction.
+    // The key instruction for INT8 quantized GEMM with asymmetric quantization.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[2].b16(), Imm(0x03));   // signed weights
+                a.movi(kVRegs[1].b16(), Imm(0x02));   // unsigned activations
+                a.movi(kVRegs[0].s4(),  Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.usmmla(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
+            });
+        snprintf(name, sizeof(name), "USMMLA v4s latency    (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1245,6 +1420,9 @@ void run_fp_simd_tests(const BenchmarkParams& base_params) {
 
     printf("\n── Advanced SIMD (dot-product / widening / FP16) ───────────────\n");
     run_advanced_simd_tests(base_params, loops, unroll);
+
+    printf("\n── FEAT_I8MM (int8 matrix multiply) ────────────────────────────\n");
+    run_i8mm_tests(base_params, loops, unroll);
 }
 
 } // namespace arm64bench::gen
