@@ -1387,6 +1387,119 @@ static void run_i8mm_tests(const BenchmarkParams& base,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Section 11: Population count (NEON CNT) and emulation idioms
+// ════════════════════════════════════════════════════════════════════════════
+//
+// ARM64 has no scalar POPCNT instruction. The idiomatic emulation of x86's
+// POPCNT round-trips through NEON:
+//
+//     fmov  d0, x0        ; GPR → FP (cross-domain ~5 clk on Apple M)
+//     cnt   v0.16b, v0.16b; per-byte popcount
+//     addv  b0, v0.16b    ; horizontal sum across bytes (saturates a 6-bit total)
+//     fmov  x0, d0        ; FP → GPR
+//
+// This is what x86→ARM64 emulators (Prism, Rosetta) emit for POPCNT, and
+// what hand-written portable code uses when targeting ARM64. Measuring the
+// end-to-end cost gives a realistic "POPCNT replacement" number.
+//
+// We also measure CTZ via the standard RBIT+CLZ idiom — ARM64 has no CTZ
+// instruction either, but the two-step replacement is cheap (both 1 cyc).
+//
+// All instructions in this section (CNT, ADDV, FMOV, RBIT, CLZ) are
+// baseline ARMv8.0-A. JIT-emitted; no runtime feature detection required.
+
+static void run_popcount_idiom_tests(const BenchmarkParams& base,
+                                     uint64_t loops, uint32_t unroll) {
+    char name[80];
+
+    // ── NEON CNT v16b latency ─────────────────────────────────────────────
+    // CNT V0.16B, V0.16B: per-byte popcount of v0 (16 lanes), result in v0.
+    // Chain via v0 → v0. Operates on 8-bit lanes; output ∈ [0,8] per lane.
+    // Initialised to 0x55 (popcount=4) so the chain converges to 0x03 (= 3,
+    // popcount=2) and then 0x02 (popcount=1) and stabilises at 0x01 — all
+    // valid working values that exercise the priority encoder.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[0].b16(), Imm(0x55));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.cnt(kVRegs[0].b16(), kVRegs[0].b16());
+            });
+        snprintf(name, sizeof(name), "CNT v16b latency      (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── NEON CNT v16b throughput sweep ────────────────────────────────────
+    // N independent CNT chains across v0..v(N-1).
+    {
+        static const uint32_t kCntChains[] = { 2, 3, 4, 6, 8 };
+        for (uint32_t nc : kCntChains) {
+            const uint32_t au = (unroll / nc) * nc;
+            if (!au) continue;
+            auto fn = build_fp_loop(loops, au,
+                [nc](a64::Assembler& a) {
+                    for (uint32_t i = 0; i < nc; ++i)
+                        a.movi(kVRegs[i].b16(), Imm(0x55));
+                },
+                [nc](a64::Assembler& a, uint32_t u) {
+                    a.cnt(kVRegs[u % nc].b16(), kVRegs[u % nc].b16());
+                });
+            snprintf(name, sizeof(name),
+                     "CNT v16b tput (%u chains, %ux unroll)", nc, au);
+            run_one(name, fn, make_params(base, loops, au));
+        }
+    }
+
+    // ── Scalar POPCNT emulation idiom (the x86 replacement) ───────────────
+    // Four-instruction chain: GPR → FP → CNT → ADDV → FP → GPR.
+    // Each unrolled iteration runs the full sequence; the chain runs through
+    // x0, so each iteration's FMOV(d0,x0) sees the previous iteration's
+    // popcount-sum result. Reported clk/insn = (sum of all 4 latencies) / 4.
+    //
+    // Apple M5 expectation: ~3–4 clk per insn (cross-domain FMOVs dominate;
+    // CNT and ADDV are both ~2–3 cyc each). End-to-end ~14 clk per POPCNT
+    // operation — illustrates why scalar POPCNT-heavy x86 code is so much
+    // slower under emulation than native.
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.mov(x0, Imm(0xDEADBEEFCAFEBABEULL));
+            },
+            [](a64::Assembler& a, uint32_t u) {
+                switch (u & 3) {
+                    case 0: a.fmov(d0, x0);                                 break;
+                    case 1: a.cnt (kVRegs[0].b16(), kVRegs[0].b16());       break;
+                    // ADDV Bd, Vn.16B — horizontal sum across all 16 bytes.
+                    case 2: a.addv(b0, kVRegs[0].b16());                    break;
+                    case 3: a.fmov(x0, d0);                                 break;
+                }
+            });
+        snprintf(name, sizeof(name),
+                 "POPCNT idiom (FMOV+CNT+ADDV+FMOV) (%ux)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── CTZ (count trailing zeros) emulation idiom: RBIT then CLZ ─────────
+    // ARM64 has no CTZ; the canonical replacement is RBIT (bit-reverse)
+    // followed by CLZ. Both are baseline ARMv8.0 and typically 1 clk each,
+    // so the two-instruction chain reports ~1 clk/insn (= ~2 clk per CTZ).
+    {
+        auto fn = build_fp_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.mov(x0, Imm(0xDEADBEEFCAFEBABEULL));
+            },
+            [](a64::Assembler& a, uint32_t u) {
+                if (u & 1) a.clz (x0, x0);
+                else       a.rbit(x0, x0);
+            });
+        snprintf(name, sizeof(name),
+                 "CTZ idiom (RBIT+CLZ chain) (%ux)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1423,6 +1536,9 @@ void run_fp_simd_tests(const BenchmarkParams& base_params) {
 
     printf("\n── FEAT_I8MM (int8 matrix multiply) ────────────────────────────\n");
     run_i8mm_tests(base_params, loops, unroll);
+
+    printf("\n── Population count / POPCNT idiom ─────────────────────────────\n");
+    run_popcount_idiom_tests(base_params, loops, unroll);
 }
 
 } // namespace arm64bench::gen
