@@ -1299,6 +1299,143 @@ static void run_csel_tests(const BenchmarkParams& base,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Section 10: Bitfield insert/extract (BFI, BFXIL, UBFX, SBFX)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Why these matter: BFI is the canonical instruction for x86 emulators
+// (Prism on Windows ARM64, Rosetta on Apple Silicon) when:
+//   - merging an 8-bit or 16-bit subregister write (AL, AX) into the host
+//     64-bit GPR holding the emulated x64 register;
+//   - splicing live RIP bits into a hash-table base pointer for a fast
+//     translation-cache lookup (Prism uses BFI of x9 lower-13 bits into
+//     x15 shifted left by 4 — i.e. bits [16:4] of x15).
+//
+// Pre-Cortex-X1 Snapdragon implementations had BFI latency = 2 cycles, while
+// Apple Silicon has always done BFI in 1 cycle. That difference shows up in
+// every emulator hot path. This section measures it directly.
+//
+// All instructions in this section are baseline ARMv8.0-A; no runtime
+// feature detection is required. The tests are JIT-emitted via AsmJit and
+// therefore do not depend on any compile-time __ARM_FEATURE_* macros.
+//
+// BFI / BFXIL DESTINATION DEPENDENCY
+//   Both BFI and BFXIL inherently *read* their destination register to
+//   preserve the non-inserted bits, so a chain that feeds Xd back into
+//   itself is a true latency chain — the next BFI cannot retire until
+//   the previous one's destination is available. This is the ARM64 analogue
+//   of the x86 POPCNT false-dest-dependency famous on Intel pre-Ice Lake,
+//   except here the dependency is inherent to the instruction's semantics.
+//
+//   See run_bfi_dependency_tests() in gen_pitfalls.cpp for the explicit
+//   stress-test variant that defeats any µarch attempt to break the dep.
+
+static void run_bitfield_tests_impl(const BenchmarkParams& base,
+                                    uint64_t loops, uint32_t unroll) {
+    char name[80];
+
+    // ── BFI low-bits latency (8-bit subregister-merge idiom) ──────────────
+    // BFI x0, x1, #0, #8: insert lower 8 bits of x1 into x0[7:0].
+    // Models "MOV AL, ..." style emulator merges. Chains via x0 → x0.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.bfi(x0, x1, Imm(0), Imm(8));
+        });
+        snprintf(name, sizeof(name), "BFI x64 lat (#0,#8)    (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── BFI mid-bits latency (Prism hash-table-lookup idiom) ──────────────
+    // BFI x0, x1, #4, #13: insert 13 bits of x1 into x0[16:4].
+    // This is exactly the pattern Prism uses to splice RIP bits into a
+    // pointer in a hash-table lookup (per Darek Mihocka).
+    {
+        auto cfg = default_cfg(loops, unroll);
+        auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.bfi(x0, x1, Imm(4), Imm(13));
+        });
+        snprintf(name, sizeof(name), "BFI x64 lat (#4,#13)   (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── BFXIL latency (16-bit subregister-merge idiom) ────────────────────
+    // BFXIL x0, x1, #0, #16: insert lower 16 bits of x1 into x0[15:0].
+    // Models "MOV AX, ..." style emulator merges. Like BFI, BFXIL reads Xd
+    // to preserve the non-inserted bits, so chaining x0 → x0 is a real
+    // latency chain.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.bfxil(x0, x1, Imm(0), Imm(16));
+        });
+        snprintf(name, sizeof(name), "BFXIL x64 lat (#0,#16) (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── UBFX latency (pure extract, no read-modify) ───────────────────────
+    // UBFX x0, x0, #4, #13: x0 = zero-extended bits[16:4] of x0.
+    // Unlike BFI/BFXIL, UBFX *fully* writes Xd — no read of the previous
+    // value. The chain dependency here comes from x0 being both source and
+    // destination. Latency is therefore "true" UBFX latency, but the µarch
+    // is free to break the dep on Xd as a partial-write rename — most
+    // implementations don't bother since UBFX is always a full-width write.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.ubfx(x0, x0, Imm(4), Imm(13));
+        });
+        snprintf(name, sizeof(name), "UBFX x64 lat (#4,#13)  (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── SBFX latency (signed extract) ─────────────────────────────────────
+    // Same shape as UBFX but sign-extends. On all known ARM64 cores SBFX
+    // and UBFX share the same shifter pipeline and have identical latency.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.sbfx(x0, x0, Imm(4), Imm(13));
+        });
+        snprintf(name, sizeof(name), "SBFX x64 lat (#4,#13)  (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── BFI throughput sweep ──────────────────────────────────────────────
+    // N independent BFI chains, each merging x1 into its own xN destination.
+    // x1 is read by all chains (broadcast); each chain's xN is the chained
+    // accumulator. Saturation chain count = number of execution units
+    // capable of issuing BFI per cycle.
+    {
+        static const uint32_t kBfiChains[] = { 2, 4, 6, 8 };
+        for (uint32_t nc : kBfiChains) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc + 1;             // need x0..xN-1 + scratch x_nc
+            for (uint32_t i = 0; i <= nc; ++i)
+                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
+
+            // Pick a register outside the chain set as the source (last init slot).
+            const uint32_t src_idx = nc;
+            auto fn = build_loop(cfg, [nc, src_idx](a64::Assembler& a, uint32_t u) {
+                a.bfi(xr(u % nc), xr(src_idx), Imm(4), Imm(13));
+            });
+            snprintf(name, sizeof(name),
+                     "BFI x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
+    }
+}
+
+void run_bitfield_tests(const BenchmarkParams& base_params) {
+    const uint64_t loops  = base_params.loops;
+    const uint32_t unroll = base_params.instructions_per_loop;
+    printf("\n── Bitfield insert/extract ─────────────────────────────────────\n");
+    run_bitfield_tests_impl(base_params, loops, unroll);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1332,6 +1469,8 @@ void run_integer_tests(const BenchmarkParams& base_params) {
 
     printf("\n── Conditional select ───────────────────────────────────────────\n");
     run_csel_tests(base_params, loops, unroll);
+
+    run_bitfield_tests(base_params);
 }
 
 } // namespace arm64bench::gen

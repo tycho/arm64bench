@@ -20,6 +20,17 @@ namespace arm64bench::gen {
 // classes (e.g. divide) are derived from base_params internally.
 void run_integer_tests(const BenchmarkParams& base_params);
 
+// Bitfield insert / extract instruction tests (BFI, BFXIL, UBFX, SBFX).
+// Includes Darek Mihocka's overlapping-bitfield BFI chain (rotated across
+// three registers with bit positions that overlap) — a stress designed to
+// defeat any micro-architectural attempt to break the destination dependency
+// that BFI inherently has (it must read Xd to preserve non-inserted bits).
+//
+// Latency interpretation:
+//   1 clk/insn ≈ Apple Silicon, Cortex-X1+, Snapdragon X/X2 (Oryon).
+//   2 clk/insn ≈ pre-X1 Cortex-A and pre-Oryon Snapdragon — historical.
+void run_bitfield_tests(const BenchmarkParams& base_params);
+
 // Create a JIT function that runs a chained ADD latency loop suitable for
 // use as the Tier 2 ratio normalization reference. Each iteration executes
 // (unroll) ADD instructions in a serial dependency chain (each output feeds
