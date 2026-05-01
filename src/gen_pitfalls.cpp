@@ -1138,6 +1138,143 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
 // ════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
+// Section 7: BFI destination dependency (Mihocka stress)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// BFI inherently reads its destination register to preserve the bits it does
+// not overwrite. A naive latency chain — `bfi x0, x1, #pos, #w` repeated with
+// the same destination — therefore carries a true dep through Xd. But a clever
+// micro-architecture could in principle break the dep when it can prove the
+// non-inserted bits don't matter (e.g., when the next instruction overwrites
+// the same range, or when the inserted range is full-width).
+//
+// Darek Mihocka (Prism, Microsoft) suggested a stress test that defeats any
+// such heuristic by *rotating* the chain across multiple registers with
+// *overlapping* bit positions, so the µarch can never prove a previous
+// destination is dead. This file implements three variants:
+//
+//   Variant A — independent BFI (throughput baseline):
+//     bfi x0, x10, #0, #8         ; x10 is a stable constant
+//     bfi x0, x10, #0, #8         ; same dest, no inter-instruction chain
+//     ...
+//     Reports throughput, not latency. Apple M / Cortex-X expected ≈ 0.25–
+//     0.5 clk/insn (multiple BFI-capable ALUs).
+//
+//   Variant B — overlapping rotated chain (true latency):
+//     bfi x1, x0, #1, #2          ; x1[2:1] ← x0[1:0]
+//     bfi x2, x1, #1, #2          ; x2[2:1] ← x1[1:0]   (overlaps x1 update)
+//     bfi x0, x2, #1, #2          ; x0[2:1] ← x2[1:0]   (closes the loop)
+//     ...
+//     The 2-bit insert at position 1 overlaps the source's 2-bit read at
+//     position 0 (bit 1 is both written by the previous BFI and read as
+//     part of the next BFI's source). No dep-breaking heuristic can apply.
+//     Reports true BFI latency. Apple M / Cortex-X / Snapdragon X+ ≈ 1 clk;
+//     pre-X1 Cortex-A and pre-Oryon Snapdragon ≈ 2 clk.
+//
+//   Variant C — full-width destructive write:
+//     bfi x0, x10, #0, #64
+//     This degenerates to a plain MOV (all destination bits replaced).
+//     Whether the µarch recognises this and breaks the Xd dep is the
+//     interesting question. Most don't bother (BFI with width=64 is rare),
+//     so expect ~1 clk/insn just like Variant B; if a chip *does* dep-break,
+//     it'll show ~0 clk added beyond loop overhead.
+//
+// All instructions are baseline ARMv8.0; no runtime feature detection needed.
+
+static void run_bfi_dependency_tests(const BenchmarkParams& base) {
+    printf("\n── BFI destination dependency (Mihocka stress) ─────────────────\n");
+    printf("  Variant A: throughput baseline (no Xd chain)\n");
+    printf("  Variant B: overlapping bitfield rotation across x0/x1/x2 (true latency)\n");
+    printf("  Variant C: full-width BFI (degenerates to MOV — does µarch dep-break?)\n\n");
+
+    const uint64_t loops  = 5'000'000;
+    const uint32_t unroll = 24;            // multiple of 3 for variant B rotation
+    char name[80];
+
+    auto build = [&](auto&& emit_setup, auto&& emit_body) -> JitPool::TestFn {
+        CodeHolder code;
+        g_jit_pool->init_code_holder(code);
+        a64::Assembler a(&code);
+        a.sub(sp, sp, Imm(16));
+        a.stp(x19, x30, ptr(sp));
+        a.mov(x19, Imm(loops));
+        emit_setup(a);
+        a.align(AlignMode::kCode, 64);
+        Label top = a.new_label();
+        a.bind(top);
+        for (uint32_t u = 0; u < unroll; ++u) emit_body(a, u);
+        a.sub(x19, x19, Imm(1));
+        a.cbnz(x19, top);
+        a.ldp(x19, x30, ptr(sp));
+        a.add(sp, sp, Imm(16));
+        a.ret(x30);
+        return g_jit_pool->compile(code);
+    };
+
+    // ── Variant A: independent BFI — throughput-bound ─────────────────────
+    // All instructions in the unrolled body use the same Xd (x0) and same
+    // source (x10). x0 is overwritten in the same slice each iteration, so
+    // there is no inter-instruction Xd dependency — only the implicit RMW
+    // dependency on x0 that the µarch *might* be able to break.
+    {
+        auto fn = build(
+            [](a64::Assembler& a) {
+                a.mov(x0, Imm(0xDEADBEEFCAFEBABEULL));
+                a.mov(x10, Imm(0x1234567890ABCDEFULL));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.bfi(x0, x10, Imm(0), Imm(8));
+            });
+        snprintf(name, sizeof(name), "BFI variant A (independent, x0 RMW)");
+        run_one(name, fn, make_lat_params(base, loops, unroll));
+    }
+
+    // ── Variant B: overlapping rotated chain — true latency ───────────────
+    // Rotate the chain across three registers with bit positions that
+    // genuinely overlap. The 2-bit insert at #1 means bit 1 is both written
+    // by the previous BFI's output and read as part of the next BFI's
+    // source — a real read-after-write dependency that no µarch heuristic
+    // can break.
+    {
+        auto fn = build(
+            [](a64::Assembler& a) {
+                a.mov(x0, Imm(0xAAAAAAAAAAAAAAAAULL));
+                a.mov(x1, Imm(0x5555555555555555ULL));
+                a.mov(x2, Imm(0xF0F0F0F0F0F0F0F0ULL));
+            },
+            [](a64::Assembler& a, uint32_t u) {
+                // u%3==0: bfi x1, x0
+                // u%3==1: bfi x2, x1
+                // u%3==2: bfi x0, x2
+                static const a64::Gp dst[3] = { x1, x2, x0 };
+                static const a64::Gp src[3] = { x0, x1, x2 };
+                a.bfi(dst[u % 3], src[u % 3], Imm(1), Imm(2));
+            });
+        snprintf(name, sizeof(name), "BFI variant B (overlapping rotation, true lat)");
+        run_one(name, fn, make_lat_params(base, loops, unroll));
+    }
+
+    // ── Variant C: full-width BFI (lsb=0, width=64) — equivalent to MOV ───
+    // Every bit of x0 is replaced. A µarch that recognises this could break
+    // the Xd dep entirely. Most don't bother. AsmJit may reject width=64 in
+    // BFI alias form; if so, drop down to BFM with the equivalent encoding
+    // (BFM Xd, Xn, #0, #63 = BFI Xd, Xn, #0, #64).
+    {
+        auto fn = build(
+            [](a64::Assembler& a) {
+                a.mov(x0, Imm(0xDEADBEEFCAFEBABEULL));
+                a.mov(x10, Imm(0x1234567890ABCDEFULL));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                // BFM Xd, Xn, #immr=0, #imms=63 → BFI Xd, Xn, #0, #64
+                a.bfm(x0, x10, Imm(0), Imm(63));
+            });
+        snprintf(name, sizeof(name), "BFI variant C (full-width, lsb=0/w=64)");
+        run_one(name, fn, make_lat_params(base, loops, unroll));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 
 void run_pitfall_tests(const BenchmarkParams& base_params) {
     // Allocate a shared buffer for STNP, misaligned, and CAS tests.
@@ -1158,6 +1295,7 @@ void run_pitfall_tests(const BenchmarkParams& base_params) {
     run_nontemporal_tests(base_params, buf, kBufSize);
     run_misaligned_tests(base_params, buf);
     run_cas_tests(base_params, buf);
+    run_bfi_dependency_tests(base_params);
 
     free_pages(buf, kBufSize);
 }
