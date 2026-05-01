@@ -31,6 +31,13 @@ void run_integer_tests(const BenchmarkParams& base_params);
 //   2 clk/insn ≈ pre-X1 Cortex-A and pre-Oryon Snapdragon — historical.
 void run_bitfield_tests(const BenchmarkParams& base_params);
 
+// Miscellaneous bit-op coverage gaps: CLS (count leading sign bits, the CLZ
+// counterpart), BIC/ORN/EON (logical operations with operand inversion), and
+// CCMP (conditional compare — flag-producing chain feeding CSEL-class flag
+// consumers). Counterparts to instruction families already covered piecemeal
+// in earlier sections.
+void run_misc_bitops_tests(const BenchmarkParams& base_params);
+
 // Create a JIT function that runs a chained ADD latency loop suitable for
 // use as the Tier 2 ratio normalization reference. Each iteration executes
 // (unroll) ADD instructions in a serial dependency chain (each output feeds

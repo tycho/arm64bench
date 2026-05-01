@@ -1436,6 +1436,141 @@ void run_bitfield_tests(const BenchmarkParams& base_params) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Section 11: Misc bit-op gaps (CLS, BIC, ORN, EON, CCMP)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// CLS counts leading sign bits (the CLZ counterpart for signed values).
+// BIC/ORN/EON are AND/ORR/EOR with the second operand inverted — they
+// are useful for masking and complement-arithmetic patterns and may share
+// pipelines with their plain counterparts.
+// CCMP is the flag-producing companion to CSEL: it computes a comparison
+// only if a previous condition holds, allowing branchless && / || chains.
+//
+// All baseline ARMv8.0-A; no runtime detection needed.
+
+static void run_misc_bitops_tests_impl(const BenchmarkParams& base,
+                                       uint64_t loops, uint32_t unroll) {
+    char name[80];
+
+    // ── CLS latency ───────────────────────────────────────────────────────
+    // CLS x0, x0: count leading sign bits of x0 (number of bits matching
+    // bit 63 minus 1). Chain via x0 → x0. On all known ARM64 cores CLS
+    // shares the priority encoder with CLZ and has identical latency.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        cfg.init_vals[0] = 0xFFFFFFFFFFFFFFFEULL;   // produces a useful CLS result
+        auto fn = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.cls(x0, x0);
+        });
+        snprintf(name, sizeof(name), "CLS x64 latency        (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── CLS throughput sweep ──────────────────────────────────────────────
+    {
+        static const uint32_t kClsChains[] = { 2, 4, 6, 8 };
+        for (uint32_t nc : kClsChains) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = ~static_cast<uint64_t>(i + 1);
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.cls(xr(u % nc), xr(u % nc));
+            });
+            snprintf(name, sizeof(name),
+                     "CLS x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
+    }
+
+    // ── BIC latency (x0 ← x0 AND ~x20) ────────────────────────────────────
+    {
+        auto cfg = default_cfg(loops, unroll);
+        auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.bic(x0, x0, x20);
+        });
+        snprintf(name, sizeof(name), "BIC x64 latency        (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── BIC throughput sweep ──────────────────────────────────────────────
+    {
+        static const uint32_t kBicChains[] = { 2, 4, 6, 8 };
+        for (uint32_t nc : kBicChains) {
+            const uint32_t actual_unroll =
+                (unroll >= nc) ? (unroll / nc) * nc : nc;
+            auto cfg = default_cfg(loops, actual_unroll);
+            cfg.num_init_regs = nc;
+            for (uint32_t i = 0; i < nc; ++i)
+                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
+            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+                a.bic(xr(u % nc), xr(u % nc), x20);
+            });
+            snprintf(name, sizeof(name),
+                     "BIC x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
+            run_one(name, fn, make_params(base, loops, actual_unroll));
+        }
+    }
+
+    // ── ORN latency (x0 ← x0 OR ~x20) ─────────────────────────────────────
+    {
+        auto cfg = default_cfg(loops, unroll);
+        auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.orn(x0, x0, x20);
+        });
+        snprintf(name, sizeof(name), "ORN x64 latency        (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── EON latency (x0 ← x0 XOR ~x20) ────────────────────────────────────
+    {
+        auto cfg = default_cfg(loops, unroll);
+        auto fn  = build_loop(cfg, [](a64::Assembler& a, uint32_t) {
+            a.eon(x0, x0, x20);
+        });
+        snprintf(name, sizeof(name), "EON x64 latency        (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+
+    // ── CCMP flag chain ───────────────────────────────────────────────────
+    // CCMP Xn, Xm, #nzcv, cond:
+    //   if (cond) flags = compare(Xn, Xm)
+    //   else      flags = #nzcv
+    //
+    // To form a serial flag-dependent chain we need each CCMP to depend on
+    // the flags produced by the previous one. Every CCMP after the first
+    // uses the *previous* flags as its predicate (cond=NE), and each writes
+    // a new NZCV. Since x0 == x20 is false in our setup (x0 starts at 1,
+    // x20 = 0x12345678), the comparison sets ZF=0 → NE = true → next CCMP
+    // re-takes the comparison branch. Chain stays alive forever.
+    //
+    // Reported clk/insn ≈ CMP latency (1) for the first, then CCMP latency
+    // for each subsequent. With many unrolled CCMPs the average converges
+    // on CCMP latency.
+    {
+        auto cfg = default_cfg(loops, unroll);
+        cfg.init_vals[0] = 1ULL;
+        auto fn = build_loop(cfg, [](a64::Assembler& a, uint32_t u) {
+            if (u == 0)
+                a.cmp(x0, x20);  // seed flags (NE will be true: 1 != 0x12345678)
+            else
+                a.ccmp(x0, x20, Imm(0), CondCode::kNE);
+        });
+        snprintf(name, sizeof(name), "CMP+CCMP flag chain    (%ux unroll)", unroll);
+        run_one(name, fn, make_params(base, loops, unroll));
+    }
+}
+
+void run_misc_bitops_tests(const BenchmarkParams& base_params) {
+    const uint64_t loops  = base_params.loops;
+    const uint32_t unroll = base_params.instructions_per_loop;
+    printf("\n── Misc bit-ops (CLS / BIC / ORN / EON / CCMP) ─────────────────\n");
+    run_misc_bitops_tests_impl(base_params, loops, unroll);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1471,6 +1606,7 @@ void run_integer_tests(const BenchmarkParams& base_params) {
     run_csel_tests(base_params, loops, unroll);
 
     run_bitfield_tests(base_params);
+    run_misc_bitops_tests(base_params);
 }
 
 } // namespace arm64bench::gen
