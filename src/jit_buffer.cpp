@@ -30,7 +30,7 @@ void JitPool::init_code_holder(asmjit::CodeHolder& code) {
     if (err != asmjit::kErrorOk) {
         fprintf(stderr,
                 "JitPool::init_code_holder failed: %s\n",
-                asmjit::DebugUtils::error_as_string(err));
+                asmjit::stringify_error(err));
     }
 }
 
@@ -40,7 +40,7 @@ JitPool::TestFn JitPool::compile(asmjit::CodeHolder& code) {
     if (err != asmjit::kErrorOk) {
         fprintf(stderr,
                 "JitPool::compile failed: %s\n",
-                asmjit::DebugUtils::error_as_string(err));
+                asmjit::stringify_error(err));
         return nullptr;
     }
     return fn;
@@ -53,7 +53,7 @@ void JitPool::release(TestFn fn) {
     if (err != asmjit::kErrorOk) {
         fprintf(stderr,
                 "JitPool::release failed: %s\n",
-                asmjit::DebugUtils::error_as_string(err));
+                asmjit::stringify_error(err));
     }
 }
 

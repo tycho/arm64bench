@@ -20,20 +20,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # AsmJit is used as the JIT code generation backend. We build it as a static
 # library so there are no shared library deployment concerns.
 #
-# TODO: Pin GIT_TAG to a specific commit hash for reproducible builds.
-include(FetchContent)
-FetchContent_Declare(
-    asmjit
-    GIT_REPOSITORY https://github.com/asmjit/asmjit.git
-    GIT_TAG        master
-)
+
 # Must be set before FetchContent_MakeAvailable so AsmJit's CMakeLists sees it.
 set(ASMJIT_STATIC ON CACHE BOOL "Build AsmJit as a static library" FORCE)
 
 # Suppress AsmJit's own install rules to keep our install target clean.
 set(ASMJIT_NO_INSTALL ON CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(asmjit)
+add_subdirectory(contrib/asmjit)
 
 # ── Sources ────────────────────────────────────────────────────────────────────
 add_executable(arm64bench
