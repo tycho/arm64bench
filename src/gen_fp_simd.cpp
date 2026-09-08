@@ -44,17 +44,22 @@ using namespace asmjit::a64;
 
 // ── Register tables ───────────────────────────────────────────────────────────
 
+// Index → register. v8–v15 are callee-saved (their low 64 bits must be
+// preserved by any function) and build_fp_loop saves nothing, so the tables
+// skip them: indices 0–7 map to v0–v7 and 8–16 map to v16–v24, all of which
+// are caller-saved. Chain sweeps index up to nc + 1 = 9, and index 16 is the
+// constant-source register.
 static const Vec kSRegs[17] = {
     s0,  s1,  s2,  s3,  s4,  s5,  s6,  s7,
-    s8,  s9,  s10, s11, s12, s13, s14, s15, s16,
+    s16, s17, s18, s19, s20, s21, s22, s23, s24,
 };
 static const Vec kDRegs[17] = {
     d0,  d1,  d2,  d3,  d4,  d5,  d6,  d7,
-    d8,  d9,  d10, d11, d12, d13, d14, d15, d16,
+    d16, d17, d18, d19, d20, d21, d22, d23, d24,
 };
 static const Vec kVRegs[17] = {
     v0,  v1,  v2,  v3,  v4,  v5,  v6,  v7,
-    v8,  v9,  v10, v11, v12, v13, v14, v15, v16,
+    v16, v17, v18, v19, v20, v21, v22, v23, v24,
 };
 
 static inline const Vec& sr(uint32_t i)   { return kSRegs[i]; }
@@ -62,9 +67,9 @@ static inline const Vec& dr(uint32_t i)   { return kDRegs[i]; }
 static inline Vec        vs4(uint32_t i)  { return kVRegs[i].s4(); }
 static inline Vec        vd2(uint32_t i)  { return kVRegs[i].d2(); }
 
-// Index 16 = constant source register (caller-saved, no save needed).
-static inline const Vec& s_src()    { return kSRegs[16]; }   // s16
-static inline const Vec& d_src()    { return kDRegs[16]; }   // d16
+// Index 16 = constant source register (v24; caller-saved, no save needed).
+static inline const Vec& s_src()    { return kSRegs[16]; }   // s24
+static inline const Vec& d_src()    { return kDRegs[16]; }   // d24
 static inline Vec        vs4_src()  { return kVRegs[16].s4(); }
 static inline Vec        vd2_src()  { return kVRegs[16].d2(); }
 
