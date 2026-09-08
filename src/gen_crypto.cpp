@@ -220,7 +220,7 @@ static void run_crypto_section(const BenchmarkParams& base,
 static void run_sha3_section(const BenchmarkParams& base,
                              uint64_t loops, uint32_t unroll) {
     if (!cpu_has(CpuFeature::SHA3)) {
-        skip_feature(CpuFeature::SHA3, "EOR3/BCAX/RAX1");
+        skip_feature(CpuFeature::SHA3, "EOR3/BCAX/RAX1/XAR");
         return;
     }
 
@@ -245,9 +245,8 @@ static void run_sha3_section(const BenchmarkParams& base,
               a.bcax(vr(d).b16(), vr(d).b16(), vr(c0).b16(), vr(c1).b16()); } },
         { "RAX1 v2d ", [](a64::Assembler& a, uint32_t d, uint32_t c0, uint32_t) {
               a.rax1(vr(d).d2(), vr(d).d2(), vr(c0).d2()); } },
-        // XAR is not tested: the pinned asmjit encodes it in the RAX1 opcode
-        // group (0xCE60xxxx instead of 0xCE80xxxx) and the CPU faults. Add it
-        // back once asmjit's xar() emits 0xCE813400 for xar v0.2d,v0.2d,v1.2d,#13.
+        { "XAR  v2d ", [](a64::Assembler& a, uint32_t d, uint32_t c0, uint32_t) {
+              a.xar(vr(d).d2(), vr(d).d2(), vr(c0).d2(), Imm(13)); } },
     };
 
     for (const Op& op : ops) {
@@ -318,7 +317,7 @@ void run_crypto_tests(const BenchmarkParams& base_params) {
     const uint64_t loops  = base_params.loops;
     const uint32_t unroll = base_params.instructions_per_loop;
     run_crypto_section(base_params, loops, unroll);
-    section("FEAT_SHA3 (EOR3 / BCAX / RAX1)");
+    section("FEAT_SHA3 (EOR3 / BCAX / RAX1 / XAR)");
     run_sha3_section(base_params, loops, unroll);
     section("FEAT_SHA512");
     run_sha512_section(base_params, loops, unroll);
