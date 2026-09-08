@@ -70,8 +70,7 @@ static void run_i8mm_section(const BenchmarkParams& base,
 
     // ── USDOT v4s throughput: sweep 2..6 chains ───────────────────────────
     {
-        static constexpr uint32_t kChains[] = { 2, 3, 4, 6 };
-        chain_sweep(base, loops, unroll, "USDOT v4s tput", kChains,
+        chain_sweep(base, loops, unroll, "USDOT v4s tput", { 2, 3, 4, 6 },
             [](a64::Assembler& a, uint32_t nc) {
                 a.movi(vr(nc + 1).b16(), Imm(0x03));
                 a.movi(vr(nc    ).b16(), Imm(0x02));
@@ -102,8 +101,7 @@ static void run_i8mm_section(const BenchmarkParams& base,
 
     // ── SMMLA v4s throughput: sweep 2..6 chains ───────────────────────────
     {
-        static constexpr uint32_t kChains[] = { 2, 3, 4, 6 };
-        chain_sweep(base, loops, unroll, "SMMLA v4s tput", kChains,
+        chain_sweep(base, loops, unroll, "SMMLA v4s tput", { 2, 3, 4, 6 },
             [](a64::Assembler& a, uint32_t nc) {
                 a.movi(vr(nc + 1).b16(), Imm(0x02));
                 a.movi(vr(nc    ).b16(), Imm(0x03));

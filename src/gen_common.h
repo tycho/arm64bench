@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <span>
 
 namespace arm64bench::gen {
@@ -167,6 +168,17 @@ void chain_sweep(const BenchmarkParams& base, uint64_t loops, uint32_t unroll,
                  name_prefix, nc, au);
         run_one(name, fn, params_for(base, loops, au));
     }
+}
+
+// Same, with the chain counts written inline: chain_sweep(..., {2, 4, 6}, ...).
+template<class FSetup, class FBody>
+void chain_sweep(const BenchmarkParams& base, uint64_t loops, uint32_t unroll,
+                 const char* name_prefix, std::initializer_list<uint32_t> chains,
+                 FSetup&& setup, FBody&& body, uint32_t group = 1)
+{
+    chain_sweep(base, loops, unroll, name_prefix,
+                std::span<const uint32_t>(chains.begin(), chains.size()),
+                static_cast<FSetup&&>(setup), static_cast<FBody&&>(body), group);
 }
 
 // ── Page-granular memory helpers ──────────────────────────────────────────────

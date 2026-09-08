@@ -654,8 +654,7 @@ static void run_divide_tests(const BenchmarkParams& base,
     // of the 1-chain case (1 non-pipelined divider, serialized).
     // An Apple M-series surprise: they appear to have partial pipelining.
     {
-        static const uint32_t kUdivChains[] = { 2, 4 };
-        chain_sweep(base, div_loops, div_unroll, "UDIV x64 tput", kUdivChains,
+        chain_sweep(base, div_loops, div_unroll, "UDIV x64 tput", { 2, 4 },
             [](a64::Assembler& a, uint32_t nc) {
                 a.mov(x20, Imm(49));
                 for (uint32_t i = 0; i < nc; ++i) a.mov(xr(i), Imm(7));
@@ -751,7 +750,6 @@ static void run_bit_tests(const BenchmarkParams& base,
             [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 a.clz(xr(u % nc), xr(u % nc));
             });
-
         chain_sweep(base, loops, unroll, "RBIT x64 tput", kBitChains,
             [](a64::Assembler& a, uint32_t nc) {
                 a.mov(x20, Imm(kDefaultSourceVal));
@@ -921,8 +919,7 @@ static void run_integer_gap_tests(const BenchmarkParams& base,
     // This stresses the register-file broadcast for x1 (shared constant read)
     // similar to the ADD x64 throughput sweep.
     {
-        static const uint32_t kExtrChains[] = { 4, 6, 8, 10, 12, 16 };
-        chain_sweep(base, loops, unroll, "EXTR x64 tput", kExtrChains,
+        chain_sweep(base, loops, unroll, "EXTR x64 tput", { 4, 6, 8, 10, 12, 16 },
             [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
             [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 a.extr(xr(u % nc), x1, xr(u % nc), Imm(32));
@@ -1196,8 +1193,7 @@ static void run_bitfield_tests_impl(const BenchmarkParams& base,
     // accumulator. Saturation chain count = number of execution units
     // capable of issuing BFI per cycle.
     {
-        static const uint32_t kBfiChains[] = { 2, 4, 6, 8 };
-        chain_sweep(base, loops, unroll, "BFI x64 tput", kBfiChains,
+        chain_sweep(base, loops, unroll, "BFI x64 tput", { 2, 4, 6, 8 },
             // One register past the chain set (x_nc) is the shared BFI source.
             [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc + 1); },
             [](a64::Assembler& a, uint32_t nc, uint32_t u) {
@@ -1246,8 +1242,7 @@ static void run_misc_bitops_tests_impl(const BenchmarkParams& base,
 
     // ── CLS throughput sweep ──────────────────────────────────────────────
     {
-        static const uint32_t kClsChains[] = { 2, 4, 6, 8 };
-        chain_sweep(base, loops, unroll, "CLS x64 tput", kClsChains,
+        chain_sweep(base, loops, unroll, "CLS x64 tput", { 2, 4, 6, 8 },
             // Negated seeds: CLS on a mostly-ones value returns a useful count.
             [](a64::Assembler& a, uint32_t nc) {
                 a.mov(x20, Imm(kDefaultSourceVal));
@@ -1271,8 +1266,7 @@ static void run_misc_bitops_tests_impl(const BenchmarkParams& base,
 
     // ── BIC throughput sweep ──────────────────────────────────────────────
     {
-        static const uint32_t kBicChains[] = { 2, 4, 6, 8 };
-        chain_sweep(base, loops, unroll, "BIC x64 tput", kBicChains,
+        chain_sweep(base, loops, unroll, "BIC x64 tput", { 2, 4, 6, 8 },
             [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
             [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 a.bic(xr(u % nc), xr(u % nc), x20);
