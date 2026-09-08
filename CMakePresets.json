@@ -1,6 +1,10 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "base",
@@ -11,84 +15,355 @@
     {
       "name": "debug",
       "hidden": true,
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     },
     {
       "name": "release",
       "hidden": true,
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
     },
     {
       "name": "win-msvc",
       "hidden": true,
       "inherits": "base",
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "cl" },
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "cl"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "win-clangcl",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "msys2",
       "hidden": true,
       "inherits": "base",
-      "cacheVariables": { "CMAKE_EXE_LINKER_FLAGS": "-static" }
+      "cacheVariables": {
+        "CMAKE_EXE_LINKER_FLAGS": "-static"
+      }
     },
     {
       "name": "linux-gcc",
       "hidden": true,
       "inherits": "base",
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "g++" },
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "linux-clang",
       "hidden": true,
       "inherits": "base",
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "clang++" },
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "macos",
       "hidden": true,
       "inherits": "base",
-      "cacheVariables": { "CMAKE_CXX_COMPILER": "clang++" },
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "vs",
       "hidden": true,
       "inherits": "base",
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
-    { "name": "vs2022", "hidden": true, "inherits": "vs", "generator": "Visual Studio 17 2022" },
-    { "name": "vs2026", "hidden": true, "inherits": "vs", "generator": "Visual Studio 18 2026" },
-    { "name": "arch-arm64", "hidden": true, "architecture": "ARM64" },
-    { "name": "clangcl", "hidden": true, "toolset": "ClangCL" },
-    { "name": "win-msvc-debug", "inherits": ["win-msvc", "debug"] },
-    { "name": "win-msvc-release", "inherits": ["win-msvc", "release"] },
-    { "name": "linux-gcc-debug", "inherits": ["linux-gcc", "debug"] },
-    { "name": "linux-gcc-release", "inherits": ["linux-gcc", "release"] },
-    { "name": "linux-clang-debug", "inherits": ["linux-clang", "debug"] },
-    { "name": "linux-clang-release", "inherits": ["linux-clang", "release"] },
-    { "name": "macos-debug", "inherits": ["macos", "debug"] },
-    { "name": "macos-release", "inherits": ["macos", "release"] },
+    {
+      "name": "vs2022",
+      "hidden": true,
+      "inherits": "vs",
+      "generator": "Visual Studio 17 2022"
+    },
+    {
+      "name": "vs2026",
+      "hidden": true,
+      "inherits": "vs",
+      "generator": "Visual Studio 18 2026"
+    },
+    {
+      "name": "arch-arm64",
+      "hidden": true,
+      "architecture": "ARM64"
+    },
+    {
+      "name": "clangcl",
+      "hidden": true,
+      "toolset": "ClangCL"
+    },
+    {
+      "name": "win-msvc-debug",
+      "inherits": [
+        "win-msvc",
+        "debug"
+      ]
+    },
+    {
+      "name": "win-msvc-release",
+      "inherits": [
+        "win-msvc",
+        "release"
+      ]
+    },
+    {
+      "name": "win-clangcl-debug",
+      "inherits": [
+        "win-clangcl",
+        "debug"
+      ]
+    },
+    {
+      "name": "win-clangcl-release",
+      "inherits": [
+        "win-clangcl",
+        "release"
+      ]
+    },
+    {
+      "name": "linux-gcc-debug",
+      "inherits": [
+        "linux-gcc",
+        "debug"
+      ]
+    },
+    {
+      "name": "linux-gcc-release",
+      "inherits": [
+        "linux-gcc",
+        "release"
+      ]
+    },
+    {
+      "name": "linux-clang-debug",
+      "inherits": [
+        "linux-clang",
+        "debug"
+      ]
+    },
+    {
+      "name": "linux-clang-release",
+      "inherits": [
+        "linux-clang",
+        "release"
+      ]
+    },
+    {
+      "name": "macos-debug",
+      "inherits": [
+        "macos",
+        "debug"
+      ]
+    },
+    {
+      "name": "macos-release",
+      "inherits": [
+        "macos",
+        "release"
+      ]
+    },
     {
       "name": "xcode",
       "inherits": "base",
       "generator": "Xcode",
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
-    { "name": "vs2022-arm64", "inherits": ["vs2022", "arch-arm64"] },
-    { "name": "vs2022-arm64-clangcl", "inherits": ["vs2022", "arch-arm64", "clangcl"] },
-    { "name": "vs2026-arm64", "inherits": ["vs2026", "arch-arm64"] },
-    { "name": "vs2026-arm64-clangcl", "inherits": ["vs2026", "arch-arm64", "clangcl"] }
+    {
+      "name": "vs2022-arm64",
+      "inherits": [
+        "vs2022",
+        "arch-arm64"
+      ]
+    },
+    {
+      "name": "vs2022-arm64-clangcl",
+      "inherits": [
+        "vs2022",
+        "arch-arm64",
+        "clangcl"
+      ]
+    },
+    {
+      "name": "vs2026-arm64",
+      "inherits": [
+        "vs2026",
+        "arch-arm64"
+      ]
+    },
+    {
+      "name": "vs2026-arm64-clangcl",
+      "inherits": [
+        "vs2026",
+        "arch-arm64",
+        "clangcl"
+      ]
+    }
   ],
   "buildPresets": [
-    { "name": "win-msvc-debug", "configurePreset": "win-msvc-debug" },
-    { "name": "win-msvc-release", "configurePreset": "win-msvc-release" },
-    { "name": "linux-gcc-debug", "configurePreset": "linux-gcc-debug" },
-    { "name": "linux-gcc-release", "configurePreset": "linux-gcc-release" },
-    { "name": "linux-clang-debug", "configurePreset": "linux-clang-debug" },
-    { "name": "linux-clang-release", "configurePreset": "linux-clang-release" },
-    { "name": "macos-debug", "configurePreset": "macos-debug" },
-    { "name": "macos-release", "configurePreset": "macos-release" }
+    {
+      "name": "win-msvc-debug",
+      "configurePreset": "win-msvc-debug"
+    },
+    {
+      "name": "win-msvc-release",
+      "configurePreset": "win-msvc-release"
+    },
+    {
+      "name": "win-clangcl-debug",
+      "configurePreset": "win-clangcl-debug"
+    },
+    {
+      "name": "win-clangcl-release",
+      "configurePreset": "win-clangcl-release"
+    },
+    {
+      "name": "linux-gcc-debug",
+      "configurePreset": "linux-gcc-debug"
+    },
+    {
+      "name": "linux-gcc-release",
+      "configurePreset": "linux-gcc-release"
+    },
+    {
+      "name": "linux-clang-debug",
+      "configurePreset": "linux-clang-debug"
+    },
+    {
+      "name": "linux-clang-release",
+      "configurePreset": "linux-clang-release"
+    },
+    {
+      "name": "macos-debug",
+      "configurePreset": "macos-debug"
+    },
+    {
+      "name": "macos-release",
+      "configurePreset": "macos-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "win-msvc-debug",
+      "configurePreset": "win-msvc-debug",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    },
+    {
+      "name": "win-msvc-release",
+      "configurePreset": "win-msvc-release",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    },
+    {
+      "name": "win-clangcl-debug",
+      "configurePreset": "win-clangcl-debug",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    },
+    {
+      "name": "win-clangcl-release",
+      "configurePreset": "win-clangcl-release",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    },
+    {
+      "name": "linux-gcc-debug",
+      "configurePreset": "linux-gcc-debug",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    },
+    {
+      "name": "linux-gcc-release",
+      "configurePreset": "linux-gcc-release",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    },
+    {
+      "name": "linux-clang-debug",
+      "configurePreset": "linux-clang-debug",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    },
+    {
+      "name": "linux-clang-release",
+      "configurePreset": "linux-clang-release",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    },
+    {
+      "name": "macos-debug",
+      "configurePreset": "macos-debug",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    },
+    {
+      "name": "macos-release",
+      "configurePreset": "macos-release",
+      "output": {
+        "outputOnFailure": true,
+        "verbosity": "verbose"
+      }
+    }
   ]
 }

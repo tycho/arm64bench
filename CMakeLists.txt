@@ -31,8 +31,10 @@ set(ASMJIT_NO_INSTALL ON CACHE BOOL "" FORCE)
 add_subdirectory(contrib/asmjit)
 
 # ── Sources ────────────────────────────────────────────────────────────────────
-add_executable(arm64bench
-    src/main.cpp
+# Everything except main() lives in a static library so that the benchmark
+# executable and the self-test executable share one build of the harness,
+# timer, cycle counter, JIT pool, and test generators.
+add_library(arm64bench_core STATIC
     src/timer.cpp
     src/harness.cpp
     src/cycle_counter.cpp
@@ -45,56 +47,81 @@ add_executable(arm64bench
     src/gen_lse.cpp
     src/gen_pitfalls.cpp
 )
+target_include_directories(arm64bench_core PUBLIC src)
+target_link_libraries(arm64bench_core PUBLIC asmjit::asmjit)
 
-target_include_directories(arm64bench PRIVATE src)
-target_link_libraries(arm64bench PRIVATE asmjit::asmjit)
+add_executable(arm64bench src/main.cpp)
+target_link_libraries(arm64bench PRIVATE arm64bench_core)
 
-# ── Compile options (our target only, not AsmJit) ─────────────────────────────
+# ── Compile options (our targets only, not AsmJit) ────────────────────────────
 # AsmJit itself does not use C++ exceptions or RTTI so it compiles cleanly
-# under these flags, but we only apply them to our own target to be safe.
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND MSVC)
-    # clang-cl: MSVC-compatible flag spelling
-    target_compile_options(arm64bench PRIVATE
-        /EHs-c-         # disable C++ exceptions
-        /GR-            # disable RTTI
-        $<$<CONFIG:Release>:/O2>
-        $<$<CONFIG:RelWithDebInfo>:/O2 /Z7>
-    )
-else()
-    # Clang on macOS / Linux
-    target_compile_options(arm64bench PRIVATE
-        -fno-exceptions
-        -fno-rtti
-        -Wall
-        -Wextra
-        $<$<CONFIG:Release>:-O3>
-        $<$<CONFIG:RelWithDebInfo>:-O2 -g>
-    )
-endif()
+# under these flags, but we only apply them to our own targets to be safe.
+function(arm64bench_configure_target tgt)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND MSVC)
+        # clang-cl: MSVC-compatible flag spelling
+        target_compile_options(${tgt} PRIVATE
+            /EHs-c-         # disable C++ exceptions
+            /GR-            # disable RTTI
+            $<$<CONFIG:Release>:/O2>
+            $<$<CONFIG:RelWithDebInfo>:/O2 /Z7>
+        )
+    else()
+        # Clang on macOS / Linux
+        target_compile_options(${tgt} PRIVATE
+            -fno-exceptions
+            -fno-rtti
+            -Wall
+            -Wextra
+            $<$<CONFIG:Release>:-O3>
+            $<$<CONFIG:RelWithDebInfo>:-O2 -g>
+        )
+    endif()
 
-# ── Platform-specific ──────────────────────────────────────────────────────────
-if(APPLE)
-    target_compile_definitions(arm64bench PRIVATE BENCH_PLATFORM_MACOS=1)
+    # ── Platform-specific ──────────────────────────────────────────────────
+    if(APPLE)
+        target_compile_definitions(${tgt} PRIVATE BENCH_PLATFORM_MACOS=1)
 
-    # For signed distribution builds, the executable needs the
-    # com.apple.security.cs.allow-jit entitlement for MAP_JIT.
-    # Unsigned local development builds work without it.
-    # See: https://developer.apple.com/documentation/bundleresources/entitlements
+        # For signed distribution builds, the executable needs the
+        # com.apple.security.cs.allow-jit entitlement for MAP_JIT.
+        # Unsigned local development builds work without it.
+        # See: https://developer.apple.com/documentation/bundleresources/entitlements
 
-elseif(WIN32)
-    target_compile_definitions(arm64bench PRIVATE
-        BENCH_PLATFORM_WINDOWS=1
-        NOMINMAX
-        WIN32_LEAN_AND_MEAN
-        UNICODE
-    )
-    # Link against the performance counter API (included in kernel32, but be explicit)
-    target_link_libraries(arm64bench PRIVATE kernel32)
+    elseif(WIN32)
+        target_compile_definitions(${tgt} PRIVATE
+            BENCH_PLATFORM_WINDOWS=1
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            UNICODE
+        )
+        # Link against the performance counter API (included in kernel32, but be explicit)
+        target_link_libraries(${tgt} PRIVATE kernel32)
 
-else()
-    target_compile_definitions(arm64bench PRIVATE BENCH_PLATFORM_LINUX=1)
-    # perf_event_open lives in the kernel; link pthreads for scheduling control
-    target_link_libraries(arm64bench PRIVATE pthread)
+    else()
+        target_compile_definitions(${tgt} PRIVATE BENCH_PLATFORM_LINUX=1)
+        # perf_event_open lives in the kernel; link pthreads for scheduling control
+        target_link_libraries(${tgt} PRIVATE pthread)
+    endif()
+endfunction()
+
+arm64bench_configure_target(arm64bench_core)
+arm64bench_configure_target(arm64bench)
+
+# ── Self-test and CTest registration ──────────────────────────────────────────
+# arm64bench_selftest verifies the measurement machinery itself (timer,
+# cycle counter, calibration, harness call accounting, and a few results
+# that every ARM64 core must reproduce). `arm64bench --all --smoke` executes
+# every generated test once. Both are registered with CTest.
+option(ARM64BENCH_BUILD_TESTS "Build arm64bench_selftest and register CTest tests" ON)
+if(ARM64BENCH_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(arm64bench_selftest tests/selftest.cpp)
+    target_link_libraries(arm64bench_selftest PRIVATE arm64bench_core)
+    arm64bench_configure_target(arm64bench_selftest)
+
+    add_test(NAME selftest COMMAND arm64bench_selftest)
+    add_test(NAME smoke    COMMAND arm64bench --all --smoke)
+    set_tests_properties(selftest smoke PROPERTIES TIMEOUT 600)
 endif()
 
 # ── Default build type ─────────────────────────────────────────────────────────
