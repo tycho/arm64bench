@@ -30,7 +30,7 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 ## Run
 
 ```bash
-./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp | --frontend]
+./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp | --frontend | --icache]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
              [--smoke] [--filter <substr>]
 ```
@@ -74,6 +74,7 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_sve.h/.cpp` | SVE/SVE2 tests: native with FEAT_SVE, else streaming mode via SME (Apple M4/M5) |
 | `src/gen_mlp.h/.cpp` | Memory-level parallelism: K interleaved pointer chases per cache level (outstanding-miss capacity) |
 | `src/gen_frontend.h/.cpp` | Decode width (NOP), MOV elimination, zero idioms, macro-op fusion pairs, branch throughput, ISB |
+| `src/gen_icache.h/.cpp` | I-cache size sweep (straight-line NOP bodies), BTB chain (dense), iTLB chain (one branch per 16 KB page) |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
 | `.github/workflows/ci.yml` | GitHub Actions: build + selftest + smoke on macOS/Linux/Windows arm64 runners |
 
@@ -162,7 +163,8 @@ section; use the shared pieces:
 
 - `build_loop(loops, unroll, setup, body[, scratch_bytes])` emits a fixed 48-byte frame saving
   x19–x22 and x30, `mov x19, #loops`, `setup(a)` once, a 64-byte-aligned loop top, `body(a, u)`
-  for `u` in `[0, unroll)`, then `SUB x19, x19, #1` + `CBNZ` (no flag writes) and the epilogue.
+  for `u` in `[0, unroll)`, then `SUB x19, x19, #1` + `CBNZ` (no flag writes) and the epilogue. Bodies over 1 MB (the I-cache sweeps)
+  get `CBZ done; B top` instead, since CBNZ only reaches ±1 MB.
   x20–x22 are free for the generator's constants/base addresses; x30 is saved so bodies may BL.
   `scratch_bytes > 0` reserves a 16-byte-aligned scratch area at `sp` (do `mov x9, sp` in setup).
 - `chain_sweep(base, loops, unroll, "INSN tput", {2, 3, 4, 6, 8}, setup(a, nc), body(a, nc, u))`
@@ -450,6 +452,7 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 | **JSCVT** | `gen_fp_simd.cpp §7` | SCVTF/FJCVTZS round trip 6.0 clk = same as SCVTF/FCVTZS (5.9); JavaScript ToInt32 semantics are free |
 | **Memory-level parallelism** | `gen_mlp.cpp` | Effective MLP (1-chain latency / saturated per-load time): 2 MB ≈ 6.7, 16 MB ≈ 11, DRAM ≈ 18 misses in flight (13 GB/s random lines, floor leaves at 22–24 chains); L1 dependent loads issue at 1/clk |
 | **Front-end / rename** | `gen_frontend.cpp` | 10 NOPs/clk at every body size; GPR MOV eliminated only when consumed by an ALU op (pure MOV chain 0.9 clk); FMOV d,d and ORR v,v 2 clk (executed); **no zero idioms** (EOR/SUB/AND-xzr, vector EOR/SUB all stay dependent); ADRP+ADD pairs = ADRP alone; MOVZ 8.8/clk without an ALU; 2 taken B/clk; ISB 34 clk |
+| **I-cache / BTB / iTLB** | `gen_icache.cpp` | L1I 192 KB (10 NOP/clk to 192 KB, 3.2/clk from L2, ~2/clk at 16 MB); BTB: zero-bubble taken branches to 48–64 sites, 2–3 clk to ~384, 4.2 clk beyond; L1 iTLB ≥ 192 × 16 KB pages, L2 TLB +9 clk from 256 to ≥ 2048 pages |
 | **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W 57 clk/store (!); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
 
 ## Planned Test Coverage
