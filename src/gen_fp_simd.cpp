@@ -165,7 +165,7 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
     {
         auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
-                a.fmov(sr(0), 0.0);  // constant zero accumulator
+                a.movi(vs4(0), Imm(0));  // constant zero accumulator (FMOV cannot encode 0.0)
                 a.fmov(sr(1), 1.5);  // multiplicand (chains)
                 a.fmov(sr(2), 2.0);  // multiplier   (stable)
             },
