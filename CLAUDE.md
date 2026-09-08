@@ -130,7 +130,11 @@ has I8MM, BF16, LRCPC2, DotProd, so paths Apple Silicon never takes get exercise
 
 **What CI cannot verify:** numbers. All three runners are VMs with the PMU hidden (kpc fails even
 under `sudo`, PMCCNTR_EL0 traps), so everything falls to Tier 2 ratio normalization on a shared
-host. Never gate on a measured value. The selftest's PMU section reports SKIP there.
+host. Never gate on a measured value. The selftest's PMU section reports SKIP there, and CI runs
+the selftest with `ARM64BENCH_SELFTEST_LENIENT=1`, which turns measurement-quality checks (ADD ≈
+1 clk, sleep upper bounds, calibration range, ...) into WARN lines while correctness checks still
+fail the job. The macOS runner has measured five 10 ms sleeps at 46–50 ms; under that load the
+5 ms reference probes are preempted more than the 2 ms test and a chained ADD reads 0.67 clk~.
 
 **Running the jobs locally** (`act` is installed via Homebrew, Docker Desktop provides arm64
 containers):
@@ -244,6 +248,11 @@ re-taken up to a retry limit.
 **Limitation**: does not catch instruction-induced throttling (the test instructions change the
 clock speed; both reference probes see the un-throttled rate). For instruction classes known to
 risk this (SVE2 wide ops), results should be labelled as potentially reflecting throttled execution.
+
+**Second limitation**: the harness keeps the *minimum* per-sample ratio, so on a host where the
+longer reference probes are preempted more often than the shorter test, every ratio is biased
+low (seen on the macOS CI runner: 0.67 clk~ for a chained ADD). A stable machine does not show
+this; on a noisy one, prefer `sudo` (PMU) or treat `clk~` as approximate.
 
 **Tier 3 — Wall-clock × calibrated frequency (current baseline)**
 
