@@ -57,6 +57,7 @@ add_library(arm64bench_core STATIC
     src/gen_sve.cpp
     src/gen_mlp.cpp
     src/gen_frontend.cpp
+    src/gen_icache.cpp
 )
 target_include_directories(arm64bench_core PUBLIC src)
 target_link_libraries(arm64bench_core PUBLIC asmjit::asmjit)

@@ -74,7 +74,7 @@ void skip_feature(CpuFeature f, const char* what);
 //     .align 64
 //   top:
 //     body(a, u)        for u in [0, unroll)
-//     sub  x19, x19, #1 ; cbnz x19, top
+//     sub  x19, x19, #1 ; cbnz x19, top      (cbz done ; b top for bodies > 1 MB)
 //     [add sp, sp, #scratch] ; restore ; ret
 //
 // setup(a64::Assembler&)            runs once before the loop.
@@ -118,12 +118,21 @@ JitPool::TestFn build_loop_with_teardown(uint64_t loops, uint32_t unroll,
     a.align(AlignMode::kCode, 64);
     Label top = a.new_label();
     a.bind(top);
+    const size_t top_offset = a.offset();
 
     for (uint32_t u = 0; u < unroll; ++u)
         body(a, u);
 
     a.sub(x19, x19, Imm(1));    // SUB, not SUBS: leaves NZCV alone
-    a.cbnz(x19, top);
+    if (a.offset() - top_offset < (1u << 20) - 64) {
+        a.cbnz(x19, top);       // CBNZ reaches ±1 MB
+    } else {
+        // Bodies past CBNZ's reach (the I-cache sweeps): B reaches ±128 MB.
+        Label done = a.new_label();
+        a.cbz(x19, done);
+        a.b(top);
+        a.bind(done);
+    }
 
     teardown(a);
 
