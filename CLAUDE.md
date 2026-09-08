@@ -38,8 +38,10 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 Default (no flags): runs integer and memory tests.
 
 - `--smoke`: execute every generated test function once with loop counts divided by 1000, print
-  `ok` per test, record no measurements. Exit code is non-zero if no test ran. This is what CI
-  runs; a SIGILL from a bad encoding leaves the failing test name as the last line of output.
+  `ok` per test, record no measurements. Exit code is non-zero if no test ran or if AsmJit
+  rejected any instruction (a rejected instruction is silently absent from the JIT'd code).
+  This is what CI runs; a SIGILL from a bad encoding leaves the failing test name as the last
+  line of output.
 - `--filter <substr>`: only run tests whose name contains the substring (use it to re-run a single
   test that crashed under `--smoke`).
 
@@ -387,6 +389,9 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 - `a.fmov(sN, 0.0)` is NOT encodable (FMOV immediate has no zero); use `movi(vs4(N), Imm(0))`.
   AsmJit rejects it, and before the JIT pool had an error handler the instruction vanished silently.
 - NEON XAR was mis-encoded in upstream asmjit since 2022 (RAX1's opcode bits); fixed in the fork.
+- `stlxr wS, xT, [xN]` (64-bit data) was rejected by upstream asmjit (classified under an encoder
+  that requires equal-width status and data registers); fixed in the fork. `--smoke` now fails
+  if AsmJit rejected any instruction, so a dropped instruction can no longer pass CI.
   SHA3: `eor3/bcax(vd, vn, vm, va)` all `.b16()`, `rax1(vd.d2(), vn.d2(), vm.d2())`,
   `xar(vd.d2(), vn.d2(), vm.d2(), Imm(rot))`; SHA512: `sha512h(vd.q(), vn.q(), vm.d2())`,
   `sha512su0(vd.d2(), vn.d2())`; BF16: `bfdot/bfmmla/bfmlalb(vd.s4(), vn.h8(), vm.h8())`,
@@ -414,7 +419,7 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 | **TLB hierarchy** | `gen_memory.cpp` | L1 DTLB ~32 entries, L2 TLB ~256–512 entries; L1 hit=3 clk, L2 hit=11 clk |
 | **LDP/STP copy** | `gen_memory.cpp` | L1=133 GB/s, L2=58 GB/s, L3/SLC=40–48 GB/s |
 | **LDNP bandwidth** | `gen_memory.cpp` | Identical to LDP (Apple Silicon ignores non-temporal hint) |
-| **LSE atomics** | `gen_lse.cpp` | LDADDAL=7 clk, SWPAL=2.5 clk, LDAXR+STLXR=11 clk |
+| **LSE atomics** | `gen_lse.cpp` | LDADDAL=7 clk, SWPAL=2.5 clk, LDAXR+STLXR=16 clk (earlier "11 clk" was LDAXR alone: asmjit had silently dropped the STLXR) |
 | **Scalar FP** | `gen_fp_simd.cpp §1–2` | FMUL f32/f64=3 clk, FDIV f32=7 clk, FSQRT f32=9 clk |
 | **NEON FP** | `gen_fp_simd.cpp §3–4` | FMLA v4f32=3 clk; throughput saturates at 4 chains (~4 FP units) |
 | **Cross-domain** | `gen_fp_simd.cpp §7` | FMOV GPR↔FP=5 clk, SCVTF/FCVTZS=6 clk |
