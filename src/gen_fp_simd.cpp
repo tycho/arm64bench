@@ -724,6 +724,115 @@ static void run_crossdomain_tests(const BenchmarkParams& base,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Section 8: FP width conversions — FCVTL / FCVTN / FCVT
+// ════════════════════════════════════════════════════════════════════════════
+//
+// FCVTL widens the low half of a vector (4×f16 → 4×f32, or 2×f32 → 2×f64);
+// FCVTN narrows into the low half and zeroes the high half. FCVTL2/FCVTN2
+// use the high half instead, and FCVTN2 merges into its destination, so a
+// chain of FCVTN2 on one register is serialized by that merge even when
+// the source is constant. FCVT is the scalar form (s ↔ d).
+//
+// Round trips alternate the two directions through one register, so
+// clk/insn is the average of the widening and narrowing latencies. A value
+// of 1.0 survives every conversion exactly.
+
+static void run_conversion_tests(const BenchmarkParams& base,
+                                 uint64_t loops, uint32_t unroll) {
+    char name[80];
+    const uint32_t u2 = (unroll >= 2) ? (unroll / 2) * 2 : 2;
+
+    // ── FCVTL / FCVTN f16 ↔ f32 round trip ───────────────────────────────
+    {
+        auto fn = build_loop(loops, u2,
+            [](a64::Assembler& a) { a.movi(kVRegs[0].h4(), Imm(0x3C), Imm(8)); },   // fp16(1.0) ×4
+            [](a64::Assembler& a, uint32_t u) {
+                if (u & 1) a.fcvtn(kVRegs[0].h4(), kVRegs[0].s4());
+                else       a.fcvtl(kVRegs[0].s4(), kVRegs[0].h4());
+            });
+        snprintf(name, sizeof(name), "FCVTL/FCVTN f16↔f32 round-trip (%ux)", u2);
+        run_one(name, fn, params_for(base, loops, u2));
+    }
+
+    // ── FCVTL2 / FCVTN2 f16 ↔ f32 round trip (high halves) ───────────────
+    {
+        auto fn = build_loop(loops, u2,
+            [](a64::Assembler& a) { a.movi(kVRegs[0].h8(), Imm(0x3C), Imm(8)); },
+            [](a64::Assembler& a, uint32_t u) {
+                if (u & 1) a.fcvtn2(kVRegs[0].h8(), kVRegs[0].s4());
+                else       a.fcvtl2(kVRegs[0].s4(), kVRegs[0].h8());
+            });
+        snprintf(name, sizeof(name), "FCVTL2/FCVTN2 f16↔f32 round-trip (%ux)", u2);
+        run_one(name, fn, params_for(base, loops, u2));
+    }
+
+    // ── FCVTL / FCVTN f32 ↔ f64 round trip ───────────────────────────────
+    {
+        auto fn = build_loop(loops, u2,
+            [](a64::Assembler& a) { a.movi(kVRegs[0].s4(), Imm(0x3F), Imm(24)); }, // f32(1.0) ×4
+            [](a64::Assembler& a, uint32_t u) {
+                if (u & 1) a.fcvtn(kVRegs[0].s2(), kVRegs[0].d2());
+                else       a.fcvtl(kVRegs[0].d2(), kVRegs[0].s2());
+            });
+        snprintf(name, sizeof(name), "FCVTL/FCVTN f32↔f64 round-trip (%ux)", u2);
+        run_one(name, fn, params_for(base, loops, u2));
+    }
+
+    // ── FCVT scalar s ↔ d round trip ─────────────────────────────────────
+    {
+        auto fn = build_loop(loops, u2,
+            [](a64::Assembler& a) { a.fmov(sr(0), 1.0); },
+            [](a64::Assembler& a, uint32_t u) {
+                if (u & 1) a.fcvt(sr(0), dr(0));
+                else       a.fcvt(dr(0), sr(0));
+            });
+        snprintf(name, sizeof(name), "FCVT s↔d round-trip           (%ux)", u2);
+        run_one(name, fn, params_for(base, loops, u2));
+    }
+
+    // ── FCVTN2 merge chain ───────────────────────────────────────────────
+    // Constant source; the only dependency is the destination's low half,
+    // which FCVTN2 must preserve. Latency here is the merge cost.
+    {
+        auto fn = build_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.movi(kVRegs[0].h8(), Imm(0x3C), Imm(8));
+                a.movi(kVRegs[1].s4(), Imm(0x3F), Imm(24));
+            },
+            [](a64::Assembler& a, uint32_t) {
+                a.fcvtn2(kVRegs[0].h8(), kVRegs[1].s4());
+            });
+        snprintf(name, sizeof(name), "FCVTN2 dest-merge chain (%ux unroll)", unroll);
+        run_one(name, fn, params_for(base, loops, unroll));
+    }
+
+    // ── Throughput: independent conversions from one constant source ─────
+    // FCVTL and FCVTN write their whole destination, so cycling the
+    // destination over nc registers gives nc independent streams.
+    chain_sweep(base, loops, unroll, "FCVTL v4s (f16→f32) tput", { 2, 3, 4, 6 },
+        [](a64::Assembler& a, uint32_t nc) {
+            a.movi(kVRegs[nc].h4(), Imm(0x3C), Imm(8));
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.fcvtl(kVRegs[u % nc].s4(), kVRegs[nc].h4());
+        });
+    chain_sweep(base, loops, unroll, "FCVTN v4h (f32→f16) tput", { 2, 3, 4, 6 },
+        [](a64::Assembler& a, uint32_t nc) {
+            a.movi(kVRegs[nc].s4(), Imm(0x3F), Imm(24));
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.fcvtn(kVRegs[u % nc].h4(), kVRegs[nc].s4());
+        });
+    chain_sweep(base, loops, unroll, "FCVTL v2d (f32→f64) tput", { 2, 3, 4, 6 },
+        [](a64::Assembler& a, uint32_t nc) {
+            a.movi(kVRegs[nc].s4(), Imm(0x3F), Imm(24));
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.fcvtl(kVRegs[u % nc].d2(), kVRegs[nc].s2());
+        });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Section 9: Advanced SIMD — dot product, widening multiply, and FP16
 // ════════════════════════════════════════════════════════════════════════════
 //
@@ -1024,6 +1133,9 @@ void run_fp_simd_tests(const BenchmarkParams& base_params) {
 
     section("Cross-domain latency (GPR ↔ FP)");
     run_crossdomain_tests(base_params, loops, unroll);
+
+    section("FP width conversions (FCVTL / FCVTN / FCVT)");
+    run_conversion_tests(base_params, loops, unroll);
 
     section("Cryptography extensions");
     run_crypto_tests(base_params);

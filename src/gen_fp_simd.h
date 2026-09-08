@@ -23,6 +23,10 @@
 //   Mixed port pressure:
 //     FADD + FMUL interleaved — tests whether multiply and add share ports.
 //     NEON fadd + scalar fadd — tests scalar vs vector dispatch separation.
+//
+//   FP width conversions:
+//     FCVTL / FCVTN (f16↔f32, f32↔f64) and scalar FCVT round-trip latency,
+//     FCVTN2 destination-merge latency, and conversion throughput.
 
 #include "harness.h"
 
