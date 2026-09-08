@@ -335,7 +335,6 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
 
         JitPool::TestFn fn = build_latency_chase(
             reinterpret_cast<uintptr_t>(head), loops);
-        if (!fn) continue;
 
         const BenchmarkParams p = params_for(base, loops, 1);
 
@@ -346,8 +345,7 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
         snprintf(name, sizeof(name), "load latency %s", size_str);
 
         // Not run_one(): the boundary annotation below needs the result.
-        const BenchmarkResult r = benchmark(fn, name, p);
-        g_jit_pool->release(fn);
+        const BenchmarkResult r = run_one(name, fn, p);
 
         // ── Boundary annotation ───────────────────────────────────────────
         // Compare this result against the previous buffer size. Only annotate

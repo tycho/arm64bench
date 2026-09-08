@@ -498,7 +498,6 @@ static void run_rsb_tests(const BenchmarkParams& base) {
         const uint64_t loops = rsb_loops_for_depth(depth);
 
         JitPool::TestFn fn = build_rsb_chain(depth, loops);
-        if (!fn) continue;
 
         // N BL+RET pairs per outer iteration.
         const BenchmarkParams p = params_for(base, loops, depth);
@@ -506,8 +505,7 @@ static void run_rsb_tests(const BenchmarkParams& base) {
         char name[48];
         snprintf(name, sizeof(name), "RSB depth %2u", depth);
 
-        const BenchmarkResult r = benchmark(fn, name, p);
-        g_jit_pool->release(fn);
+        const BenchmarkResult r = run_one(name, fn, p);
 
         // Annotate when per-pair latency jumps — indicates RSB capacity exceeded.
         // A jump of ≥20% vs previous depth is considered significant.
@@ -566,15 +564,13 @@ static void run_indirect_pred_tests(const BenchmarkParams& base) {
 
         JitPool::TestFn fn = build_indirect_pred_loop(
             reinterpret_cast<uintptr_t>(table), loops);
-        if (!fn) continue;
 
         const BenchmarkParams p = params_for(base, loops, 1);
 
         char name[56];
         snprintf(name, sizeof(name), "BLR cycling %4u targets", n);
 
-        const BenchmarkResult r = benchmark(fn, name, p);
-        g_jit_pool->release(fn);
+        const BenchmarkResult r = run_one(name, fn, p);
 
         if (prev_clk > 0.0 && r.min_clocks_per_insn > prev_clk * 1.15) {
             printf("  ↑ misprediction onset between %u and %u targets"
@@ -619,7 +615,6 @@ static void run_ind_capacity_tests(const BenchmarkParams& base) {
         const uint64_t loops = ind_capacity_loops_for_n(n);
 
         JitPool::TestFn fn = build_ind_capacity_loop(trampoline_addr, n, loops);
-        if (!fn) continue;
 
         // N BLR instructions per loop iteration.
         const BenchmarkParams p = params_for(base, loops, n);
@@ -627,8 +622,7 @@ static void run_ind_capacity_tests(const BenchmarkParams& base) {
         char name[56];
         snprintf(name, sizeof(name), "BLR %2u sites → 1 target", n);
 
-        const BenchmarkResult r = benchmark(fn, name, p);
-        g_jit_pool->release(fn);
+        const BenchmarkResult r = run_one(name, fn, p);
 
         // Flag when per-BLR latency rises ≥15% vs previous site count.
         if (prev_clk > 0.0 && r.min_clocks_per_insn > prev_clk * 1.15) {
@@ -785,15 +779,13 @@ static void run_ind_unique_target_tests(const BenchmarkParams& base) {
 
         JitPool::TestFn fn = build_ind_unique_target_loop(
             trampoline_addrs, n, loops);
-        if (!fn) return 0.0;
 
         const BenchmarkParams p = params_for(base, loops, n);
 
         char name[64];
         snprintf(name, sizeof(name), fmt, n, n);
 
-        const BenchmarkResult r = benchmark(fn, name, p);
-        g_jit_pool->release(fn);
+        const BenchmarkResult r = run_one(name, fn, p);
         return r.min_clocks_per_insn;
     };
 

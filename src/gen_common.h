@@ -48,9 +48,11 @@ const asmjit::a64::Gp& wr(uint32_t i);
 BenchmarkParams params_for(const BenchmarkParams& base, uint64_t loops,
                            uint32_t insns_per_loop, uint32_t bytes_per_insn = 0);
 
-// benchmark() then release. A null fn (compile failure) prints a skip line
-// so the gap in the output is explained rather than silent.
-void run_one(const char* name, JitPool::TestFn fn, const BenchmarkParams& p);
+// benchmark() then release; returns the result. A null fn (compile failure)
+// prints a skip line so the gap in the output is explained rather than
+// silent, and returns a zeroed result (which every consumer already treats
+// as "did not run", the same as a filtered-out or smoke-mode test).
+BenchmarkResult run_one(const char* name, JitPool::TestFn fn, const BenchmarkParams& p);
 
 // Prints "\n── <title> ───…──\n" padded to a fixed width.
 void section(const char* title);

@@ -52,14 +52,15 @@ BenchmarkParams params_for(const BenchmarkParams& base, uint64_t loops,
     return p;
 }
 
-void run_one(const char* name, JitPool::TestFn fn, const BenchmarkParams& p) {
+BenchmarkResult run_one(const char* name, JitPool::TestFn fn, const BenchmarkParams& p) {
     if (!fn) {
         printf("%-48s: skipped (JIT compile failed)\n", name);
         fflush(stdout);
-        return;
+        return BenchmarkResult{};
     }
-    benchmark(fn, name, p);
+    const BenchmarkResult r = benchmark(fn, name, p);
     g_jit_pool->release(fn);
+    return r;
 }
 
 void section(const char* title) {
