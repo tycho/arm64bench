@@ -30,7 +30,7 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 ## Run
 
 ```bash
-./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo]
+./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
              [--smoke] [--filter <substr>]
 ```
@@ -68,6 +68,7 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_lse.h/.cpp` | LSE atomics latency/throughput tests |
 | `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding) |
 | `src/gen_ooo.h/.cpp` | Out-of-order window sizing: ROB, int/FP register files, load/store queues (two-miss probe) |
+| `src/gen_sve.h/.cpp` | SVE/SVE2 tests: native with FEAT_SVE, else streaming mode via SME (Apple M4/M5) |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
 | `.github/workflows/ci.yml` | GitHub Actions: build + selftest + smoke on macOS/Linux/Windows arm64 runners |
 
@@ -331,12 +332,41 @@ dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) i
 - **Masked pointers** (`link ^ 0xA5A5…`, unmasked with EOR) defeat any data-dependent prefetcher;
   M5 showed no plain-vs-masked difference (DIT made none either), but the sweeps use masked rings.
 
+### Streaming SVE via SME (gen_sve.cpp)
+
+Apple M4/M5 have no FEAT_SVE but do have FEAT_SME, whose streaming mode executes the SVE
+instruction set (minus a few instructions) on the SME unit at the streaming vector length
+(512 bits on M5). `--sve` uses that when native SVE is absent: each JIT'd function does
+`SMSTART SM` in setup and `SMSTOP SM` in teardown. Two traps:
+
+- **SMSTART/SMSTOP zero every vector register, including callee-saved d8–d15.** A JIT'd function
+  that enters streaming mode must save d8–d15 before SMSTART and restore them after SMSTOP, or the
+  C++ caller's state is silently destroyed. The symptom here was surreal: clang kept an AsmJit
+  operand signature in d8 across calls, so after the first streaming-mode call every later
+  `Imm(...)` became a "none" operand and every mov-immediate was silently dropped from the JIT'd
+  code — a loop with no counter and no base address. `gen_sve.cpp::emit_sm_enter/leave` do the
+  save/restore; the JIT pool now installs an AsmJit error handler so a dropped instruction is at
+  least printed.
+- **NEON is mostly illegal in streaming mode.** Nothing between SMSTART and SMSTOP may use v-register
+  instructions; the harness reference function runs outside the JIT'd function and is fine.
+
+M5 streaming-mode results (VL 512): ADD z.s 3.1 clk / 1 per clk; FADD/FMUL/FMLA/SDOT z.s 8.3 clk
+latency, one per ~4.2 clk regardless of chain count (≈4 f32 FMLA lanes/clk, about a quarter of the
+NEON pipes); LD1W/LDR z ≈1 clk per 64 B (265 GB/s); ST1W 57 clk per store (4.9 GB/s) and STR z
+bimodal 28–57 clk — streaming-mode stores are pathologically slow and deserve a closer look;
+WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not SME-unit clocks.
+
 ### AsmJit API notes
 
 - `Gp` not `GpX` for general-purpose register arguments in helper functions
 - `a.embed(&word, 4)` to hand-encode instructions not exposed in AsmJit's C++ API
   (used for LDAPR, LDAPUR, STLUR in `gen_pitfalls.cpp`)
 - `a.ldr(xzr, ptr(xN))` encodes (LDR to XZR: load and discard, no register written)
+- SVE (fork): `z0.s()`/`.b()/.h()/.d()` element views; `p0.m()`/`p0.z()` governing predicates,
+  `p0.s()` for PTRUE/WHILELT; `fmla(z0.s(), p0.m(), z1.s(), z2.s())`; `dup(z0.s(), w9)` broadcast
+  from GPR, `dup(z0.s(), z0.s(0))` lane broadcast; `faddv(s0, p0, z0.s())`; `ld1w(z0.s(), p0.z(),
+  ptr_vl(x20, k))` / `st1w(z0.s(), p0, ptr_vl(...))` / `ldr(z0, ptr_vl(...))`; `whilelt(p1.s(), w2, w3)`;
+  `rdvl(x0, 1)`; `smstart_sm()`/`smstop_sm()`. Every encoding checked so far matched the ARM ARM.
 - `MSR DIT, #imm` = `0xD503405F | (imm << 8)` if ever needed (FEAT_DIT; no effect seen on M5)
 - AESE/AESMC: `.b16()` element type
 - PMULL poly64: `.q()` result, `.d()` inputs
@@ -369,6 +399,7 @@ dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) i
 | **LRCPC (LDAPR/LDAPUR)** | `gen_pitfalls.cpp §6` | LDAPR≈LDAR≈LDR=3 clk; store forwarding unchanged (~4.9 clk all variants) |
 | **BFI dest-dep stress** | `gen_pitfalls.cpp §7` | All three Mihocka variants (independent / overlapping rotation / full-width) report ~1 clk on M5 — no dep-breaking shortcut |
 | **OOO window** | `gen_ooo.cpp` | Two-miss probe: int PRF ≈ 386–418, FP PRF ≈ 834–898, load queue ≈ 482–515, store queue ≈ 138–146; NOP fill shows no limit to 2048 (NOPs are not allocated, or ROB > 2050). Sharp 1×→2× steps. ~2.5 min run |
+| **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W 57 clk/store (!); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
 
 ## Planned Test Coverage
 
@@ -378,7 +409,7 @@ dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) i
 | **Prefetcher** | Stride sweep, descending scan, PRFM effectiveness | How far ahead does the hardware prefetcher reach? |
 | **OOO window, more fillers** | Branch-order buffer, flag PRF, ROB via non-NOP filler | `gen_ooo.cpp` has the machinery; needs a filler with no PRF/queue footprint that Apple does not eliminate |
 | **FEAT_LRCPC3** | LDIAPP / STILP pair instructions | Not present on any current Apple Silicon (M1–M5); available check via `hw.optional.arm.FEAT_LRCPC3` |
-| **SVE2** | Wide vector ops (if present) | Not on Apple Silicon; check at runtime on Linux/Windows (Snapdragon X has SVE2). Results may require PMU (Tier 1) to be trustworthy — instruction-induced throttling risk |
+| **SVE2, more** | Gather/scatter, MOVPRFX fusion, BFMMLA z, predicate-heavy loops, streaming-mode store pathology | Native on CI (N2, 128-bit); streaming on M4/M5. Wide native SVE may need PMU (Tier 1) to be trustworthy — instruction-induced throttling risk |
 | **SDOT/SMMLA cross-platform** | Compare MAC throughput on Snapdragon X | Does Oryon have dedicated SMMLA hardware, or also micro-op fusion like M5? |
 | **FCVTL/FCVTN** | FP16↔FP32 conversion throughput | Widening/narrowing pipeline characterization |
 
@@ -390,5 +421,7 @@ dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) i
 | FEAT_LRCPC | `hw.optional.arm.FEAT_LRCPC` | assume true (Oryon) |
 | FEAT_LRCPC2 | `hw.optional.arm.FEAT_LRCPC2` | assume true (Oryon) |
 | FEAT_LRCPC3 | `hw.optional.arm.FEAT_LRCPC3` | unknown |
+| FEAT_SVE / SVE2 | `hw.optional.arm.FEAT_SVE` (absent on Apple) | `PF_ARM_SVE_INSTRUCTIONS_AVAILABLE` (46) / `PF_ARM_SVE2_…` (47) |
+| FEAT_SME | `hw.optional.arm.FEAT_SME` (M4+) | no PF_ flag; assumed absent |
 | AES/Crypto | universal on all targets | assume true |
 | FEAT_DOTPROD | universal on all targets | assume true |
