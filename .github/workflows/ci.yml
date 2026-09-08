@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64 (Apple Silicon, clang)
+            os: macos-15
+            preset: macos-release
+          - name: Linux arm64 (Neoverse N2, clang)
+            os: ubuntu-24.04-arm
+            preset: linux-clang-release
+          - name: Windows arm64 (Neoverse N2, clang-cl)
+            os: windows-11-arm
+            preset: win-clangcl-release
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── Toolchain ──────────────────────────────────────────────────────
+      - name: Install ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Install ninja + clang (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang
+
+      # clang-cl needs the MSVC headers/libraries and the Windows SDK in the
+      # environment (INCLUDE / LIB / PATH). vcvars sets all of that up.
+      - name: MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          cmake --version | head -1
+          ninja --version
+          if [ "$RUNNER_OS" = "Windows" ]; then clang-cl --version | head -1; else clang++ --version | head -1; fi
+          uname -m || true
+
+      # ── Build ──────────────────────────────────────────────────────────
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      # ── Test ───────────────────────────────────────────────────────────
+      # Selftest verifies the timer, cycle counter (SKIP when the VM hides
+      # the PMU), calibration, and harness call accounting. Smoke executes
+      # every generated test once so any encoding that faults on this core
+      # fails the job with the test name as the last line of output.
+      - name: Selftest
+        run: ctest --preset ${{ matrix.preset }} -R '^selftest$'
+
+      - name: Smoke (all categories)
+        run: ctest --preset ${{ matrix.preset }} -R '^smoke$'
+
+      - name: CPU features seen by the smoke run
+        if: always()
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            macOS) sysctl -a | grep -E 'hw.optional.arm.FEAT_(I8MM|LRCPC|LRCPC2|LRCPC3|SVE|BF16|DotProd)' || true ;;
+            Linux) grep -m1 -E '^Features' /proc/cpuinfo || true ;;
+          esac
+
+  # Full measured run, on demand only. Results on shared VMs are noisy and
+  # the PMU is not exposed, so this is for curiosity (e.g. Neoverse N2 vs
+  # Apple M-series), never for gating.
+  measure:
+    name: Measure ${{ matrix.os }} (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            preset: macos-release
+          - os: ubuntu-24.04-arm
+            preset: linux-clang-release
+          - os: windows-11-arm
+            preset: win-clangcl-release
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Install ninja + clang (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang
+      - name: MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Run all benchmarks (CSV)
+        shell: bash
+        run: |
+          exe=$(find build -name 'arm64bench' -o -name 'arm64bench.exe' | head -1)
+          "$exe" --all --csv | tee arm64bench-${{ matrix.os }}.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arm64bench-${{ matrix.os }}
+          path: arm64bench-${{ matrix.os }}.csv
