@@ -4,15 +4,12 @@
 // ── Register conventions ─────────────────────────────────────────────────────
 //
 // ARM64 ABI for vector/FP registers:
-//   v0–v7:   caller-saved  (we use as test chain registers)
-//   v8–v15:  callee-saved  (not touched — we stay in v0–v7 and v16)
-//   v16–v31: caller-saved  (we use v16 as the constant source)
+//   v0–v7:   caller-saved  (test chain registers)
+//   v8–v15:  callee-saved  (never used — the register tables below skip them)
+//   v16–v31: caller-saved  (extra chains and the constant source)
 //
-// Our JIT functions save only x19 (loop counter) and x30 (LR).
-// Vector registers v0–v7 and v16 are caller-saved; no prologue save needed.
-//
-// Prologue:  sub sp, sp, #16  /  stp x19, x30, [sp]
-// Epilogue:  ldp x19, x30, [sp]  /  add sp, sp, #16  /  ret x30
+// build_loop() saves only the GPRs it promises (x19–x22, x30). Every vector
+// register this file touches is caller-saved, so none needs a prologue save.
 //
 // ── FMADD accumulator-chain test ─────────────────────────────────────────────
 //
@@ -31,12 +28,11 @@
 // to keep each sample at ~100ms.
 
 #include "gen_fp_simd.h"
-#include "jit_buffer.h"
-#include "harness.h"
-#include "cpu_features.h"
+#include "gen_common.h"
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
 #include <cstdio>
+
 namespace arm64bench::gen {
 
 using namespace asmjit;
@@ -45,10 +41,10 @@ using namespace asmjit::a64;
 // ── Register tables ───────────────────────────────────────────────────────────
 
 // Index → register. v8–v15 are callee-saved (their low 64 bits must be
-// preserved by any function) and build_fp_loop saves nothing, so the tables
-// skip them: indices 0–7 map to v0–v7 and 8–16 map to v16–v24, all of which
-// are caller-saved. Chain sweeps index up to nc + 1 = 9, and index 16 is the
-// constant-source register.
+// preserved by any function) and build_loop saves no vector registers, so the
+// tables skip them: indices 0–7 map to v0–v7 and 8–16 map to v16–v24, all of
+// which are caller-saved. Chain sweeps index up to nc + 1 = 9, and index 16 is
+// the constant-source register.
 static const Vec kSRegs[17] = {
     s0,  s1,  s2,  s3,  s4,  s5,  s6,  s7,
     s16, s17, s18, s19, s20, s21, s22, s23, s24,
@@ -78,65 +74,6 @@ static inline Vec        vd2_src()  { return kVRegs[16].d2(); }
 static uint64_t slow_fp_loops() { return scale_loops(4'000'000); }
 static constexpr uint32_t kSlowFpUnroll = 8;
 
-static BenchmarkParams make_params(const BenchmarkParams& base,
-                                   uint64_t loops, uint32_t unroll) {
-    BenchmarkParams p       = base;
-    p.loops                 = loops;
-    p.instructions_per_loop = unroll;
-    p.bytes_per_insn        = 0;
-    return p;
-}
-
-// ── Core loop builder ─────────────────────────────────────────────────────────
-//
-// emit_setup(a)     — called once after prologue; initialises all registers.
-// emit_body(a, u)   — called `unroll` times; emits the instruction under test.
-
-template<typename FSetup, typename FBody>
-static JitPool::TestFn build_fp_loop(uint64_t loops, uint32_t unroll,
-                                     FSetup&& emit_setup,
-                                     FBody&&  emit_body) {
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    a.sub(sp, sp, Imm(16));
-    a.stp(x19, x30, ptr(sp));
-    a.mov(x19, Imm(loops));
-
-    emit_setup(a);
-
-    a.align(AlignMode::kCode, 64);
-    Label loop_top = a.new_label();
-    a.bind(loop_top);
-
-    for (uint32_t u = 0; u < unroll; ++u)
-        emit_body(a, u);
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, loop_top);
-
-    a.ldp(x19, x30, ptr(sp));
-    a.add(sp, sp, Imm(16));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
-}
-
-// ── Benchmark runner helper ───────────────────────────────────────────────────
-
-static void run_one(const char* name, JitPool::TestFn fn,
-                    const BenchmarkParams& params) {
-    if (!fn) return;
-    benchmark(fn, name, params);
-    g_jit_pool->release(fn);
-}
-
-static void skip_feature(CpuFeature f, const char* what) {
-    printf("  (%s not available on this CPU — skipping %s)\n",
-           cpu_feature_name(f), what);
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // Section 1: Scalar f32 (single-precision)
 // ════════════════════════════════════════════════════════════════════════════
@@ -154,7 +91,7 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
 
     // ── FADD f32 latency ──────────────────────────────────────────────────
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(s_src(), 1.0);
                 a.fmov(sr(0),   1.0);
@@ -163,33 +100,23 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
                 a.fadd(sr(0), sr(0), s_src());
             });
         snprintf(name, sizeof(name), "FADD f32 latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── FADD f32 throughput: sweep 2..8 chains ────────────────────────────
-    {
-        static const uint32_t kChains[] = { 2, 3, 4, 6, 8 };
-        for (uint32_t nc : kChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-            auto fn = build_fp_loop(loops, au,
-                [nc](a64::Assembler& a) {
-                    a.fmov(s_src(), 1.0);
-                    for (uint32_t i = 0; i < nc; ++i) a.fmov(sr(i), 1.0);
-                },
-                [nc](a64::Assembler& a, uint32_t u) {
-                    a.fadd(sr(u % nc), sr(u % nc), s_src());
-                });
-            snprintf(name, sizeof(name),
-                     "FADD f32 tput  (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
-    }
+    chain_sweep(base, loops, unroll, "FADD f32 tput", kDefaultChains,
+        [](a64::Assembler& a, uint32_t nc) {
+            a.fmov(s_src(), 1.0);
+            for (uint32_t i = 0; i < nc; ++i) a.fmov(sr(i), 1.0);
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.fadd(sr(u % nc), sr(u % nc), s_src());
+        });
 
     // ── FMUL f32 latency ──────────────────────────────────────────────────
     // Use 1.5 as constant to avoid exact 1.0 folding optimizations.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(s_src(), 1.5);
                 a.fmov(sr(0),   1.0);
@@ -198,28 +125,18 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
                 a.fmul(sr(0), sr(0), s_src());
             });
         snprintf(name, sizeof(name), "FMUL f32 latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── FMUL f32 throughput: sweep 2..8 chains ────────────────────────────
-    {
-        static const uint32_t kChains[] = { 2, 3, 4, 6, 8 };
-        for (uint32_t nc : kChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-            auto fn = build_fp_loop(loops, au,
-                [nc](a64::Assembler& a) {
-                    a.fmov(s_src(), 1.5);
-                    for (uint32_t i = 0; i < nc; ++i) a.fmov(sr(i), 1.0);
-                },
-                [nc](a64::Assembler& a, uint32_t u) {
-                    a.fmul(sr(u % nc), sr(u % nc), s_src());
-                });
-            snprintf(name, sizeof(name),
-                     "FMUL f32 tput  (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
-    }
+    chain_sweep(base, loops, unroll, "FMUL f32 tput", kDefaultChains,
+        [](a64::Assembler& a, uint32_t nc) {
+            a.fmov(s_src(), 1.5);
+            for (uint32_t i = 0; i < nc; ++i) a.fmov(sr(i), 1.0);
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.fmul(sr(u % nc), sr(u % nc), s_src());
+        });
 
     // ── FMADD f32 accumulator-chain latency ───────────────────────────────
     // s0 = s1*s2 + s0, with s1=1.5, s2=2.0 constant.
@@ -227,7 +144,7 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
     // If FMADD has a short accumulator path: ~1–2 cycles (like integer MADD).
     // If true FMA unit (no shortcut):        ~4 cycles.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(sr(0), 1.0);  // accumulator (chains)
                 a.fmov(sr(1), 1.5);  // multiplicand (stable)
@@ -237,14 +154,14 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
                 a.fmadd(sr(0), sr(1), sr(2), sr(0));  // s0 = s1*s2 + s0
             });
         snprintf(name, sizeof(name), "FMADD f32 acc-chain   (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── FMADD f32 multiply-chain latency ──────────────────────────────────
     // s1 = s1*s2 + 0, with s2=1.5 stable, s0=0 constant.
     // Critical path: through s1. Expected: full FMADD latency (~4 cycles).
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(sr(0), 0.0);  // constant zero accumulator
                 a.fmov(sr(1), 1.5);  // multiplicand (chains)
@@ -254,14 +171,14 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
                 a.fmadd(sr(1), sr(1), sr(2), sr(0));  // s1 = s1*s2 + 0
             });
         snprintf(name, sizeof(name), "FMADD f32 mul-chain   (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── FDIV f32 latency ──────────────────────────────────────────────────
     // Oscillating chain: s0 = 2.0/s0 alternates between 1.0 and 2.0.
     // 2.0 and 1.0 are both exactly representable and directly encodable via FMOV.
     {
-        auto fn = build_fp_loop(slow_fp_loops(), kSlowFpUnroll,
+        auto fn = build_loop(slow_fp_loops(), kSlowFpUnroll,
             [](a64::Assembler& a) {
                 a.fmov(s_src(), 2.0);
                 a.fmov(sr(0),   2.0);
@@ -271,19 +188,19 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "FDIV f32 latency      (%ux unroll)", kSlowFpUnroll);
-        run_one(name, fn, make_params(base, slow_fp_loops(), kSlowFpUnroll));
+        run_one(name, fn, params_for(base, slow_fp_loops(), kSlowFpUnroll));
     }
 
     // ── FSQRT f32 latency ─────────────────────────────────────────────────
     // sqrt(2) ≈ 1.414, sqrt(1.414) ≈ 1.189, converges slowly toward 1.0.
     // Genuine dependency chain throughout.
     {
-        auto fn = build_fp_loop(slow_fp_loops(), kSlowFpUnroll,
+        auto fn = build_loop(slow_fp_loops(), kSlowFpUnroll,
             [](a64::Assembler& a) { a.fmov(sr(0), 2.0); },
             [](a64::Assembler& a, uint32_t) { a.fsqrt(sr(0), sr(0)); });
         snprintf(name, sizeof(name),
                  "FSQRT f32 latency     (%ux unroll)", kSlowFpUnroll);
-        run_one(name, fn, make_params(base, slow_fp_loops(), kSlowFpUnroll));
+        run_one(name, fn, params_for(base, slow_fp_loops(), kSlowFpUnroll));
     }
 }
 
@@ -301,7 +218,7 @@ static void run_scalar_f64_tests(const BenchmarkParams& base,
 
     // FADD f64 latency
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(d_src(), 1.0);
                 a.fmov(dr(0),   1.0);
@@ -310,32 +227,22 @@ static void run_scalar_f64_tests(const BenchmarkParams& base,
                 a.fadd(dr(0), dr(0), d_src());
             });
         snprintf(name, sizeof(name), "FADD f64 latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // FADD f64 throughput: 2..8 chains
-    {
-        static const uint32_t kChains[] = { 2, 3, 4, 6, 8 };
-        for (uint32_t nc : kChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-            auto fn = build_fp_loop(loops, au,
-                [nc](a64::Assembler& a) {
-                    a.fmov(d_src(), 1.0);
-                    for (uint32_t i = 0; i < nc; ++i) a.fmov(dr(i), 1.0);
-                },
-                [nc](a64::Assembler& a, uint32_t u) {
-                    a.fadd(dr(u % nc), dr(u % nc), d_src());
-                });
-            snprintf(name, sizeof(name),
-                     "FADD f64 tput  (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
-    }
+    chain_sweep(base, loops, unroll, "FADD f64 tput", kDefaultChains,
+        [](a64::Assembler& a, uint32_t nc) {
+            a.fmov(d_src(), 1.0);
+            for (uint32_t i = 0; i < nc; ++i) a.fmov(dr(i), 1.0);
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.fadd(dr(u % nc), dr(u % nc), d_src());
+        });
 
     // FMUL f64 latency
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(d_src(), 1.5);
                 a.fmov(dr(0),   1.0);
@@ -344,12 +251,12 @@ static void run_scalar_f64_tests(const BenchmarkParams& base,
                 a.fmul(dr(0), dr(0), d_src());
             });
         snprintf(name, sizeof(name), "FMUL f64 latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // FDIV f64 latency
     {
-        auto fn = build_fp_loop(slow_fp_loops(), kSlowFpUnroll,
+        auto fn = build_loop(slow_fp_loops(), kSlowFpUnroll,
             [](a64::Assembler& a) {
                 a.fmov(d_src(), 2.0);
                 a.fmov(dr(0),   2.0);
@@ -359,7 +266,7 @@ static void run_scalar_f64_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "FDIV f64 latency      (%ux unroll)", kSlowFpUnroll);
-        run_one(name, fn, make_params(base, slow_fp_loops(), kSlowFpUnroll));
+        run_one(name, fn, params_for(base, slow_fp_loops(), kSlowFpUnroll));
     }
 }
 
@@ -387,7 +294,7 @@ static void run_neon_f32_tests(const BenchmarkParams& base,
     // Initialize v16.s4 as constant {1.0, 1.0, 1.0, 1.0} via scalar FMOV
     // then DUP to broadcast. v0.s4 is the chained accumulator.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(s_src(), 1.0);
                 a.dup(vs4_src(), s16.s(0));   // v16.s4 = {1,1,1,1}
@@ -398,36 +305,26 @@ static void run_neon_f32_tests(const BenchmarkParams& base,
                 a.fadd(vs4(0), vs4(0), vs4_src());
             });
         snprintf(name, sizeof(name), "FADD v4f32 latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── FADD 4×f32 throughput: sweep 2..8 chains ─────────────────────────
-    {
-        static const uint32_t kChains[] = { 2, 3, 4, 6, 8 };
-        for (uint32_t nc : kChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-            auto fn = build_fp_loop(loops, au,
-                [nc](a64::Assembler& a) {
-                    a.fmov(s_src(), 1.0);
-                    a.dup(vs4_src(), s16.s(0));
-                    for (uint32_t i = 0; i < nc; ++i) {
-                        a.fmov(sr(i), 1.0);
-                        a.dup(vs4(i), kSRegs[i].s(0));
-                    }
-                },
-                [nc](a64::Assembler& a, uint32_t u) {
-                    a.fadd(vs4(u % nc), vs4(u % nc), vs4_src());
-                });
-            snprintf(name, sizeof(name),
-                     "FADD v4f32 tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
-    }
+    chain_sweep(base, loops, unroll, "FADD v4f32 tput", kDefaultChains,
+        [](a64::Assembler& a, uint32_t nc) {
+            a.fmov(s_src(), 1.0);
+            a.dup(vs4_src(), s16.s(0));
+            for (uint32_t i = 0; i < nc; ++i) {
+                a.fmov(sr(i), 1.0);
+                a.dup(vs4(i), kSRegs[i].s(0));
+            }
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.fadd(vs4(u % nc), vs4(u % nc), vs4_src());
+        });
 
     // ── FMUL 4×f32 latency ────────────────────────────────────────────────
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(s_src(), 1.5);
                 a.dup(vs4_src(), s16.s(0));
@@ -438,14 +335,14 @@ static void run_neon_f32_tests(const BenchmarkParams& base,
                 a.fmul(vs4(0), vs4(0), vs4_src());
             });
         snprintf(name, sizeof(name), "FMUL v4f32 latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── FMLA 4×f32 accumulator-chain latency ─────────────────────────────
     // v0 = v0 + v1×v2, with v1={1.5} and v2={2.0} stable constants.
     // Tests whether FMLA has a short accumulator forwarding path.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(sr(0), 1.0); a.dup(vs4(0), s0.s(0));  // acc
                 a.fmov(sr(1), 1.5); a.dup(vs4(1), s1.s(0));  // mul A
@@ -455,7 +352,7 @@ static void run_neon_f32_tests(const BenchmarkParams& base,
                 a.fmla(vs4(0), vs4(1), vs4(2));   // v0.4s += v1.4s × v2.4s
             });
         snprintf(name, sizeof(name), "FMLA v4f32 acc-chain   (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── FMLA 4×f32 throughput: sweep 2..6 chains ─────────────────────────
@@ -475,31 +372,21 @@ static void run_neon_f32_tests(const BenchmarkParams& base,
     // well beyond our register budget. The 6-chain result gives the best
     // achievable throughput within this constraint.
     {
-        static const uint32_t kChains[] = { 2, 3, 4, 6 };
-        for (uint32_t nc : kChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-
-            // Multiplier registers sit just above the accumulator range.
-            const uint32_t vm_a = nc;
-            const uint32_t vm_b = nc + 1;
-
-            auto fn = build_fp_loop(loops, au,
-                [nc, vm_a, vm_b](a64::Assembler& a) {
-                    a.fmov(sr(vm_a), 1.5); a.dup(vs4(vm_a), kSRegs[vm_a].s(0));
-                    a.fmov(sr(vm_b), 2.0); a.dup(vs4(vm_b), kSRegs[vm_b].s(0));
-                    for (uint32_t i = 0; i < nc; ++i) {
-                        a.fmov(sr(i), 1.0);
-                        a.dup(vs4(i), kSRegs[i].s(0));
-                    }
-                },
-                [nc, vm_a, vm_b](a64::Assembler& a, uint32_t u) {
-                    a.fmla(vs4(u % nc), vs4(vm_a), vs4(vm_b));
-                });
-            snprintf(name, sizeof(name),
-                     "FMLA v4f32 tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
+        static constexpr uint32_t kChains[] = { 2, 3, 4, 6 };
+        chain_sweep(base, loops, unroll, "FMLA v4f32 tput", kChains,
+            [](a64::Assembler& a, uint32_t nc) {
+                // Multiplier registers sit just above the accumulator range.
+                const uint32_t vm_a = nc, vm_b = nc + 1;
+                a.fmov(sr(vm_a), 1.5); a.dup(vs4(vm_a), kSRegs[vm_a].s(0));
+                a.fmov(sr(vm_b), 2.0); a.dup(vs4(vm_b), kSRegs[vm_b].s(0));
+                for (uint32_t i = 0; i < nc; ++i) {
+                    a.fmov(sr(i), 1.0);
+                    a.dup(vs4(i), kSRegs[i].s(0));
+                }
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                a.fmla(vs4(u % nc), vs4(nc), vs4(nc + 1));
+            });
     }
 }
 
@@ -516,7 +403,7 @@ static void run_neon_f64_tests(const BenchmarkParams& base,
 
     // FADD 2×f64 latency
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(d_src(), 1.0);
                 a.dup(vd2_src(), d16.d(0));
@@ -527,35 +414,29 @@ static void run_neon_f64_tests(const BenchmarkParams& base,
                 a.fadd(vd2(0), vd2(0), vd2_src());
             });
         snprintf(name, sizeof(name), "FADD v2f64 latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // FADD 2×f64 throughput: 4 chains
     {
-        const uint32_t nc = 4;
-        const uint32_t au = (unroll / nc) * nc;
-        if (au) {
-            auto fn = build_fp_loop(loops, au,
-                [](a64::Assembler& a) {
-                    a.fmov(d_src(), 1.0);
-                    a.dup(vd2_src(), d16.d(0));
-                    for (uint32_t i = 0; i < nc; ++i) {
-                        a.fmov(dr(i), 1.0);
-                        a.dup(vd2(i), kDRegs[i].d(0));
-                    }
-                },
-                [](a64::Assembler& a, uint32_t u) {
-                    a.fadd(vd2(u % nc), vd2(u % nc), vd2_src());
-                });
-            snprintf(name, sizeof(name),
-                     "FADD v2f64 tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
+        static constexpr uint32_t kChains[] = { 4 };
+        chain_sweep(base, loops, unroll, "FADD v2f64 tput", kChains,
+            [](a64::Assembler& a, uint32_t nc) {
+                a.fmov(d_src(), 1.0);
+                a.dup(vd2_src(), d16.d(0));
+                for (uint32_t i = 0; i < nc; ++i) {
+                    a.fmov(dr(i), 1.0);
+                    a.dup(vd2(i), kDRegs[i].d(0));
+                }
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                a.fadd(vd2(u % nc), vd2(u % nc), vd2_src());
+            });
     }
 
     // FMLA 2×f64 latency
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.fmov(dr(0), 1.0); a.dup(vd2(0), d0.d(0));
                 a.fmov(dr(1), 1.5); a.dup(vd2(1), d1.d(0));
@@ -565,30 +446,24 @@ static void run_neon_f64_tests(const BenchmarkParams& base,
                 a.fmla(vd2(0), vd2(1), vd2(2));
             });
         snprintf(name, sizeof(name), "FMLA v2f64 acc-chain   (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // FMLA 2×f64 throughput: 4 chains
     {
-        const uint32_t nc = 4;
-        const uint32_t au = (unroll / nc) * nc;
-        if (au) {
-            auto fn = build_fp_loop(loops, au,
-                [](a64::Assembler& a) {
-                    a.fmov(dr(nc),     1.5); a.dup(vd2(nc),     kDRegs[nc].d(0));
-                    a.fmov(dr(nc + 1), 2.0); a.dup(vd2(nc + 1), kDRegs[nc+1].d(0));
-                    for (uint32_t i = 0; i < nc; ++i) {
-                        a.fmov(dr(i), 1.0);
-                        a.dup(vd2(i), kDRegs[i].d(0));
-                    }
-                },
-                [](a64::Assembler& a, uint32_t u) {
-                    a.fmla(vd2(u % nc), vd2(nc), vd2(nc + 1));
-                });
-            snprintf(name, sizeof(name),
-                     "FMLA v2f64 tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
+        static constexpr uint32_t kChains[] = { 4 };
+        chain_sweep(base, loops, unroll, "FMLA v2f64 tput", kChains,
+            [](a64::Assembler& a, uint32_t nc) {
+                a.fmov(dr(nc),     1.5); a.dup(vd2(nc),     kDRegs[nc].d(0));
+                a.fmov(dr(nc + 1), 2.0); a.dup(vd2(nc + 1), kDRegs[nc+1].d(0));
+                for (uint32_t i = 0; i < nc; ++i) {
+                    a.fmov(dr(i), 1.0);
+                    a.dup(vd2(i), kDRegs[i].d(0));
+                }
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                a.fmla(vd2(u % nc), vd2(nc), vd2(nc + 1));
+            });
     }
 }
 
@@ -610,7 +485,7 @@ static void run_neon_int_tests(const BenchmarkParams& base,
 
     // ADD 4×i32 latency
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(vs4_src(), Imm(1));
                 a.movi(vs4(0),    Imm(1));
@@ -619,33 +494,23 @@ static void run_neon_int_tests(const BenchmarkParams& base,
                 a.add(vs4(0), vs4(0), vs4_src());
             });
         snprintf(name, sizeof(name), "ADD  v4i32 latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ADD 4×i32 throughput: 2..8 chains
-    {
-        static const uint32_t kChains[] = { 2, 3, 4, 6, 8 };
-        for (uint32_t nc : kChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-            auto fn = build_fp_loop(loops, au,
-                [nc](a64::Assembler& a) {
-                    a.movi(vs4_src(), Imm(1));
-                    for (uint32_t i = 0; i < nc; ++i)
-                        a.movi(vs4(i), Imm(static_cast<uint64_t>(i + 1)));
-                },
-                [nc](a64::Assembler& a, uint32_t u) {
-                    a.add(vs4(u % nc), vs4(u % nc), vs4_src());
-                });
-            snprintf(name, sizeof(name),
-                     "ADD  v4i32 tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
-    }
+    chain_sweep(base, loops, unroll, "ADD  v4i32 tput", kDefaultChains,
+        [](a64::Assembler& a, uint32_t nc) {
+            a.movi(vs4_src(), Imm(1));
+            for (uint32_t i = 0; i < nc; ++i)
+                a.movi(vs4(i), Imm(static_cast<uint64_t>(i + 1)));
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.add(vs4(u % nc), vs4(u % nc), vs4_src());
+        });
 
     // MLA 4×i32 latency (accumulator chain: v0 += v1×v2)
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(vs4(0), Imm(1));  // acc
                 a.movi(vs4(1), Imm(3));  // mul A
@@ -655,27 +520,21 @@ static void run_neon_int_tests(const BenchmarkParams& base,
                 a.mla(vs4(0), vs4(1), vs4(2));
             });
         snprintf(name, sizeof(name), "MLA  v4i32 acc-chain   (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // MLA 4×i32 throughput: 4 chains
     {
-        const uint32_t nc = 4;
-        const uint32_t au = (unroll / nc) * nc;
-        if (au) {
-            auto fn = build_fp_loop(loops, au,
-                [](a64::Assembler& a) {
-                    a.movi(vs4(nc),     Imm(3));
-                    a.movi(vs4(nc + 1), Imm(7));
-                    for (uint32_t i = 0; i < nc; ++i) a.movi(vs4(i), Imm(1));
-                },
-                [](a64::Assembler& a, uint32_t u) {
-                    a.mla(vs4(u % nc), vs4(nc), vs4(nc + 1));
-                });
-            snprintf(name, sizeof(name),
-                     "MLA  v4i32 tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
+        static constexpr uint32_t kChains[] = { 4 };
+        chain_sweep(base, loops, unroll, "MLA  v4i32 tput", kChains,
+            [](a64::Assembler& a, uint32_t nc) {
+                a.movi(vs4(nc),     Imm(3));
+                a.movi(vs4(nc + 1), Imm(7));
+                for (uint32_t i = 0; i < nc; ++i) a.movi(vs4(i), Imm(1));
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                a.mla(vs4(u % nc), vs4(nc), vs4(nc + 1));
+            });
     }
 }
 
@@ -694,7 +553,7 @@ static void run_mixed_fp_tests(const BenchmarkParams& base,
     // ── Scalar FADD + vector FADD interleaved (4 scalar + 2 vector chains) ─
     if (unroll >= 6) {
         const uint32_t au = (unroll / 6) * 6;
-        auto fn = build_fp_loop(loops, au,
+        auto fn = build_loop(loops, au,
             [](a64::Assembler& a) {
                 a.fmov(s_src(), 1.0);
                 a.dup(vs4_src(), s16.s(0));
@@ -715,7 +574,7 @@ static void run_mixed_fp_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "FADD scalar+vec mix  (4s+2v, %ux unroll)", au);
-        run_one(name, fn, make_params(base, loops, au));
+        run_one(name, fn, params_for(base, loops, au));
     }
 
     // ── Scalar FMUL + NEON FMLA interleaved (3 FMUL + 3 FMLA chains) ──────
@@ -725,7 +584,7 @@ static void run_mixed_fp_tests(const BenchmarkParams& base,
         const uint32_t au = (unroll / 6) * 6;
         // Layout: s0..s2 = scalar FMUL chains, v3..v5 = NEON FMLA chains
         //         s16 = scalar mult constant, v6 = vector mult A, v7 = mult B
-        auto fn = build_fp_loop(loops, au,
+        auto fn = build_loop(loops, au,
             [](a64::Assembler& a) {
                 a.fmov(s_src(), 1.5);
                 for (uint32_t i = 0; i < 3; ++i) a.fmov(sr(i), 1.0);
@@ -748,7 +607,7 @@ static void run_mixed_fp_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "FMUL+FMLA mix        (3s+3v, %ux unroll)", au);
-        run_one(name, fn, make_params(base, loops, au));
+        run_one(name, fn, params_for(base, loops, au));
     }
 }
 
@@ -808,7 +667,7 @@ static void run_crossdomain_tests(const BenchmarkParams& base,
     // Chain: X0 → (FMOV D0,X0) → D0 → (FMOV X0,D0) → X0 → ...
     // clk/insn = avg(latency_GPR→FP, latency_FP→GPR).
     {
-        auto fn = build_fp_loop(loops, u2,
+        auto fn = build_loop(loops, u2,
             [](a64::Assembler& a) {
                 // Seed: a 64-bit pattern that reads back as 1.0 in double.
                 a.mov(x0, Imm(0x3FF0000000000000LL));
@@ -820,7 +679,7 @@ static void run_crossdomain_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "FMOV GPR↔FP round-trip (%ux)", u2);
-        run_one(name, fn, make_params(base, loops, u2));
+        run_one(name, fn, params_for(base, loops, u2));
     }
 
     // ── SCVTF / FCVTZS round-trip: integer → double → integer ────────────
@@ -828,7 +687,7 @@ static void run_crossdomain_tests(const BenchmarkParams& base,
     // Initial value X0 = 1 is stable: 1 → 1.0 → 1 → 1.0 → ...
     // clk/insn = avg(latency_SCVTF, latency_FCVTZS).
     {
-        auto fn = build_fp_loop(loops, u2,
+        auto fn = build_loop(loops, u2,
             [](a64::Assembler& a) {
                 a.mov(x0, Imm(1));
                 a.scvtf(d0, x0);   // seed d0 = 1.0
@@ -839,7 +698,7 @@ static void run_crossdomain_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "SCVTF/FCVTZS d64 round-trip (%ux)", u2);
-        run_one(name, fn, make_params(base, loops, u2));
+        run_one(name, fn, params_for(base, loops, u2));
     }
 }
 
@@ -884,7 +743,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
     // AESE V0.16B, V1.16B: V0 ← SubBytes(ShiftRows(V0)) XOR V1
     // V1 = constant round key. Chain through V0.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[1].b16(), Imm(0x5A));  // constant round key
                 a.movi(kVRegs[0].b16(), Imm(0x01));  // data
@@ -893,19 +752,19 @@ static void run_crypto_tests(const BenchmarkParams& base,
                 a.aese(kVRegs[0].b16(), kVRegs[1].b16());
             });
         snprintf(name, sizeof(name), "AESE latency          (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── AESMC latency ─────────────────────────────────────────────────────
     // AESMC V0.16B, V0.16B: V0 ← MixColumns(V0)
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) { a.movi(kVRegs[0].b16(), Imm(0x01)); },
             [](a64::Assembler& a, uint32_t) {
                 a.aesmc(kVRegs[0].b16(), kVRegs[0].b16());
             });
         snprintf(name, sizeof(name), "AESMC latency         (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── AESE+AESMC pair latency ───────────────────────────────────────────
@@ -914,7 +773,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
     // Emits unroll/2 pairs = unroll instructions.
     {
         const uint32_t u2 = (unroll / 2) * 2;
-        auto fn = build_fp_loop(loops, u2,
+        auto fn = build_loop(loops, u2,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[1].b16(), Imm(0x5A));  // round key
                 a.movi(kVRegs[0].b16(), Imm(0x01));  // data
@@ -924,7 +783,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
                 else       a.aese (kVRegs[0].b16(), kVRegs[1].b16());
             });
         snprintf(name, sizeof(name), "AESE+AESMC latency    (%ux unroll)", u2);
-        run_one(name, fn, make_params(base, loops, u2));
+        run_one(name, fn, params_for(base, loops, u2));
     }
 
     // ── AESE+AESMC throughput ─────────────────────────────────────────────
@@ -936,7 +795,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
         for (uint32_t nc : kChains) {
             const uint32_t key_reg = nc;
             const uint32_t u2 = nc * 2;  // 2 instructions per stream
-            auto fn = build_fp_loop(loops, u2,
+            auto fn = build_loop(loops, u2,
                 [nc, key_reg](a64::Assembler& a) {
                     a.movi(kVRegs[key_reg].b16(), Imm(0x5A));
                     for (uint32_t i = 0; i < nc; ++i)
@@ -948,7 +807,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
                     else       a.aese (kVRegs[chain].b16(), kVRegs[key_reg].b16());
                 });
             snprintf(name, sizeof(name), "AESE+AESMC tput (%u streams, %ux)", nc, u2);
-            run_one(name, fn, make_params(base, loops, u2));
+            run_one(name, fn, params_for(base, loops, u2));
         }
     }
 
@@ -957,7 +816,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
     // Chain: V0.1D (lower 64 bits of V0) → V0.1Q (full 128-bit result).
     // V1 = constant multiplier (analogous to GCM authentication key H).
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[1].b16(), Imm(0x03));   // constant multiplier
                 a.movi(kVRegs[0].b16(), Imm(0xAA));   // data
@@ -966,13 +825,13 @@ static void run_crypto_tests(const BenchmarkParams& base,
                 a.pmull(kVRegs[0].q(), kVRegs[0].d(), kVRegs[1].d());
             });
         snprintf(name, sizeof(name), "PMULL poly64 latency  (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── SHA256SU0 latency ─────────────────────────────────────────────────
     // SHA256SU0 V0.4S, V1.4S — message schedule step 0. Chains through V0.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[1].s4(), Imm(0x5A));
                 a.movi(kVRegs[0].s4(), Imm(0x01));
@@ -981,7 +840,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
                 a.sha256su0(kVRegs[0].s4(), kVRegs[1].s4());
             });
         snprintf(name, sizeof(name), "SHA256SU0 latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── SHA256H latency ───────────────────────────────────────────────────
@@ -989,7 +848,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
     // Q1 (second state half) and V2 (message words) held constant.
     // Chain through Q0 (first state half: a, b, c, d).
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[2].s4(),  Imm(0x5A));   // message words W[t..t+3]
                 a.movi(kVRegs[1].b16(), Imm(0x03));   // second state half (constant)
@@ -999,45 +858,45 @@ static void run_crypto_tests(const BenchmarkParams& base,
                 a.sha256h(kVRegs[0].q(), kVRegs[1].q(), kVRegs[2].s4());
             });
         snprintf(name, sizeof(name), "SHA256H latency       (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CRC32B latency ────────────────────────────────────────────────────
     // CRC32B W0, W0, W1 — CRC-32 of byte W1[7:0], accumulated in W0.
     // W0 chains (CRC state). W1 = constant data byte.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.mov(x1, Imm(0xAB));
                 a.mov(x0, Imm(0xFFFFFFFF));
             },
             [](a64::Assembler& a, uint32_t) { a.crc32b(w0, w0, w1); });
         snprintf(name, sizeof(name), "CRC32B latency        (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CRC32W latency ────────────────────────────────────────────────────
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.mov(x1, Imm(0xABCD1234));
                 a.mov(x0, Imm(0xFFFFFFFF));
             },
             [](a64::Assembler& a, uint32_t) { a.crc32w(w0, w0, w1); });
         snprintf(name, sizeof(name), "CRC32W latency        (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CRC32X latency ────────────────────────────────────────────────────
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.mov(x1, Imm(0xABCD123456789ABCULL));
                 a.mov(x0, Imm(0xFFFFFFFF));
             },
             [](a64::Assembler& a, uint32_t) { a.crc32x(w0, w0, x1); });
         snprintf(name, sizeof(name), "CRC32X latency        (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
@@ -1088,7 +947,7 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
         // SDOT V0.4S, V1.16B, V2.16B — V0 is the accumulator (chains).
         // V1 and V2 are constant signed-byte data.
         {
-            auto fn = build_fp_loop(loops, unroll,
+            auto fn = build_loop(loops, unroll,
                 [](a64::Assembler& a) {
                     a.movi(kVRegs[2].b16(), Imm(0x02));
                     a.movi(kVRegs[1].b16(), Imm(0x03));
@@ -1098,35 +957,27 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
                     a.sdot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
                 });
             snprintf(name, sizeof(name), "SDOT v4s latency      (%ux unroll)", unroll);
-            run_one(name, fn, make_params(base, loops, unroll));
+            run_one(name, fn, params_for(base, loops, unroll));
         }
 
         // ── SDOT v4s throughput: sweep 2..6 chains ────────────────────────────
         {
-            static const uint32_t kChains[] = { 2, 3, 4, 6 };
-            for (uint32_t nc : kChains) {
-                const uint32_t au = (unroll / nc) * nc;
-                if (!au) continue;
-                const uint32_t va = nc, vb = nc + 1;
-                auto fn = build_fp_loop(loops, au,
-                    [nc, va, vb](a64::Assembler& a) {
-                        a.movi(kVRegs[vb].b16(), Imm(0x02));
-                        a.movi(kVRegs[va].b16(), Imm(0x03));
-                        for (uint32_t i = 0; i < nc; ++i)
-                            a.movi(kVRegs[i].s4(), Imm(0));
-                    },
-                    [nc, va, vb](a64::Assembler& a, uint32_t u) {
-                        a.sdot(kVRegs[u % nc].s4(), kVRegs[va].b16(), kVRegs[vb].b16());
-                    });
-                snprintf(name, sizeof(name),
-                         "SDOT v4s tput (%u chains, %ux unroll)", nc, au);
-                run_one(name, fn, make_params(base, loops, au));
-            }
+            static constexpr uint32_t kChains[] = { 2, 3, 4, 6 };
+            chain_sweep(base, loops, unroll, "SDOT v4s tput", kChains,
+                [](a64::Assembler& a, uint32_t nc) {
+                    a.movi(kVRegs[nc + 1].b16(), Imm(0x02));
+                    a.movi(kVRegs[nc    ].b16(), Imm(0x03));
+                    for (uint32_t i = 0; i < nc; ++i)
+                        a.movi(kVRegs[i].s4(), Imm(0));
+                },
+                [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                    a.sdot(kVRegs[u % nc].s4(), kVRegs[nc].b16(), kVRegs[nc + 1].b16());
+                });
         }
 
         // ── UDOT v4s latency (unsigned) ───────────────────────────────────────
         {
-            auto fn = build_fp_loop(loops, unroll,
+            auto fn = build_loop(loops, unroll,
                 [](a64::Assembler& a) {
                     a.movi(kVRegs[2].b16(), Imm(0x02));
                     a.movi(kVRegs[1].b16(), Imm(0x03));
@@ -1136,7 +987,7 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
                     a.udot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
                 });
             snprintf(name, sizeof(name), "UDOT v4s latency      (%ux unroll)", unroll);
-            run_one(name, fn, make_params(base, loops, unroll));
+            run_one(name, fn, params_for(base, loops, unroll));
         }
 
     } else {
@@ -1146,7 +997,7 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
     // ── SMLAL v4s latency (int16×int16 → int32 widening accumulate) ───────
     // SMLAL V0.4S, V1.4H, V2.4H — V0 chains; V1, V2 constant (16-bit int)
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[2].h4(), Imm(0x03));
                 a.movi(kVRegs[1].h4(), Imm(0x07));
@@ -1156,7 +1007,7 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
                 a.smlal(kVRegs[0].s4(), kVRegs[1].h4(), kVRegs[2].h4());
             });
         snprintf(name, sizeof(name), "SMLAL v4s latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     if (cpu_has(CpuFeature::FP16)) {
@@ -1165,7 +1016,7 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
         // FMLA V0.8H, V1.8H, V2.8H — fp16 FMA (8 lanes). V0 accumulator chains.
         // Init all regs via MOVI with 0x3C, LSL #8 → 0x3C00 = fp16(1.0).
         {
-            auto fn = build_fp_loop(loops, unroll,
+            auto fn = build_loop(loops, unroll,
                 [](a64::Assembler& a) {
                     a.movi(kVRegs[2].h8(), Imm(0x3C), Imm(8));  // fp16(1.0) in all lanes
                     a.movi(kVRegs[1].h8(), Imm(0x3C), Imm(8));
@@ -1175,28 +1026,22 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
                     a.fmla(kVRegs[0].h8(), kVRegs[1].h8(), kVRegs[2].h8());
                 });
             snprintf(name, sizeof(name), "FMLA v8f16 acc-chain  (%ux unroll)", unroll);
-            run_one(name, fn, make_params(base, loops, unroll));
+            run_one(name, fn, params_for(base, loops, unroll));
         }
 
         // ── FMLA 8×f16 throughput: 4 chains ──────────────────────────────────
         {
-            const uint32_t nc = 4;
-            const uint32_t au = (unroll / nc) * nc;
-            if (au) {
-                auto fn = build_fp_loop(loops, au,
-                    [](a64::Assembler& a) {
-                        a.movi(kVRegs[nc    ].h8(), Imm(0x3C), Imm(8));
-                        a.movi(kVRegs[nc + 1].h8(), Imm(0x3C), Imm(8));
-                        for (uint32_t i = 0; i < nc; ++i)
-                            a.movi(kVRegs[i].h8(), Imm(0x3C), Imm(8));
-                    },
-                    [](a64::Assembler& a, uint32_t u) {
-                        a.fmla(kVRegs[u % nc].h8(), kVRegs[nc].h8(), kVRegs[nc + 1].h8());
-                    });
-                snprintf(name, sizeof(name),
-                         "FMLA v8f16 tput (%u chains, %ux unroll)", nc, au);
-                run_one(name, fn, make_params(base, loops, au));
-            }
+            static constexpr uint32_t kChains[] = { 4 };
+            chain_sweep(base, loops, unroll, "FMLA v8f16 tput", kChains,
+                [](a64::Assembler& a, uint32_t nc) {
+                    a.movi(kVRegs[nc    ].h8(), Imm(0x3C), Imm(8));
+                    a.movi(kVRegs[nc + 1].h8(), Imm(0x3C), Imm(8));
+                    for (uint32_t i = 0; i < nc; ++i)
+                        a.movi(kVRegs[i].h8(), Imm(0x3C), Imm(8));
+                },
+                [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                    a.fmla(kVRegs[u % nc].h8(), kVRegs[nc].h8(), kVRegs[nc + 1].h8());
+                });
         }
 
     } else {
@@ -1209,7 +1054,7 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
         // FMLAL V0.4S, V1.4H, V2.4H — V0.4S is the f32 accumulator (chains).
         // V1 and V2 are fp16 inputs. Useful for mixed-precision ML inference.
         {
-            auto fn = build_fp_loop(loops, unroll,
+            auto fn = build_loop(loops, unroll,
                 [](a64::Assembler& a) {
                     a.movi(kVRegs[2].h4(), Imm(0x3C), Imm(8));  // fp16(1.0) in 4 lanes
                     a.movi(kVRegs[1].h4(), Imm(0x3C), Imm(8));
@@ -1219,7 +1064,7 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
                     a.fmlal(kVRegs[0].s4(), kVRegs[1].h4(), kVRegs[2].h4());
                 });
             snprintf(name, sizeof(name), "FMLAL v4s latency     (%ux unroll)", unroll);
-            run_one(name, fn, make_params(base, loops, unroll));
+            run_one(name, fn, params_for(base, loops, unroll));
         }
 
     } else {
@@ -1270,7 +1115,7 @@ static void run_i8mm_tests(const BenchmarkParams& base,
     // USDOT V0.4S, V1.16B, V2.16B — unsigned(V1) · signed(V2) dot product.
     // V1 = constant unsigned bytes, V2 = constant signed bytes. V0 chains.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[2].b16(), Imm(0x03));
                 a.movi(kVRegs[1].b16(), Imm(0x02));
@@ -1280,37 +1125,29 @@ static void run_i8mm_tests(const BenchmarkParams& base,
                 a.usdot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
             });
         snprintf(name, sizeof(name), "USDOT v4s latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── USDOT v4s throughput: sweep 2..6 chains ───────────────────────────
     {
-        static const uint32_t kChains[] = { 2, 3, 4, 6 };
-        for (uint32_t nc : kChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-            const uint32_t va = nc, vb = nc + 1;
-            auto fn = build_fp_loop(loops, au,
-                [nc, va, vb](a64::Assembler& a) {
-                    a.movi(kVRegs[vb].b16(), Imm(0x03));
-                    a.movi(kVRegs[va].b16(), Imm(0x02));
-                    for (uint32_t i = 0; i < nc; ++i)
-                        a.movi(kVRegs[i].s4(), Imm(0));
-                },
-                [nc, va, vb](a64::Assembler& a, uint32_t u) {
-                    a.usdot(kVRegs[u % nc].s4(), kVRegs[va].b16(), kVRegs[vb].b16());
-                });
-            snprintf(name, sizeof(name),
-                     "USDOT v4s tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
+        static constexpr uint32_t kChains[] = { 2, 3, 4, 6 };
+        chain_sweep(base, loops, unroll, "USDOT v4s tput", kChains,
+            [](a64::Assembler& a, uint32_t nc) {
+                a.movi(kVRegs[nc + 1].b16(), Imm(0x03));
+                a.movi(kVRegs[nc    ].b16(), Imm(0x02));
+                for (uint32_t i = 0; i < nc; ++i)
+                    a.movi(kVRegs[i].s4(), Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                a.usdot(kVRegs[u % nc].s4(), kVRegs[nc].b16(), kVRegs[nc + 1].b16());
+            });
     }
 
     // ── SMMLA v4s latency ─────────────────────────────────────────────────
     // SMMLA V0.4S, V1.16B, V2.16B — 2×8 signed × 8×2 signed matrix MLA.
     // Each of the 4 int32 accumulators sums 8 int8×int8 products (vs 4 for SDOT).
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[2].b16(), Imm(0x02));
                 a.movi(kVRegs[1].b16(), Imm(0x03));
@@ -1320,36 +1157,28 @@ static void run_i8mm_tests(const BenchmarkParams& base,
                 a.smmla(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
             });
         snprintf(name, sizeof(name), "SMMLA v4s latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── SMMLA v4s throughput: sweep 2..6 chains ───────────────────────────
     {
-        static const uint32_t kChains[] = { 2, 3, 4, 6 };
-        for (uint32_t nc : kChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-            const uint32_t va = nc, vb = nc + 1;
-            auto fn = build_fp_loop(loops, au,
-                [nc, va, vb](a64::Assembler& a) {
-                    a.movi(kVRegs[vb].b16(), Imm(0x02));
-                    a.movi(kVRegs[va].b16(), Imm(0x03));
-                    for (uint32_t i = 0; i < nc; ++i)
-                        a.movi(kVRegs[i].s4(), Imm(0));
-                },
-                [nc, va, vb](a64::Assembler& a, uint32_t u) {
-                    a.smmla(kVRegs[u % nc].s4(), kVRegs[va].b16(), kVRegs[vb].b16());
-                });
-            snprintf(name, sizeof(name),
-                     "SMMLA v4s tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
+        static constexpr uint32_t kChains[] = { 2, 3, 4, 6 };
+        chain_sweep(base, loops, unroll, "SMMLA v4s tput", kChains,
+            [](a64::Assembler& a, uint32_t nc) {
+                a.movi(kVRegs[nc + 1].b16(), Imm(0x02));
+                a.movi(kVRegs[nc    ].b16(), Imm(0x03));
+                for (uint32_t i = 0; i < nc; ++i)
+                    a.movi(kVRegs[i].s4(), Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                a.smmla(kVRegs[u % nc].s4(), kVRegs[nc].b16(), kVRegs[nc + 1].b16());
+            });
     }
 
     // ── UMMLA v4s latency ─────────────────────────────────────────────────
     // UMMLA V0.4S, V1.16B, V2.16B — unsigned × unsigned matrix MLA.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[2].b16(), Imm(0x02));
                 a.movi(kVRegs[1].b16(), Imm(0x03));
@@ -1359,7 +1188,7 @@ static void run_i8mm_tests(const BenchmarkParams& base,
                 a.ummla(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
             });
         snprintf(name, sizeof(name), "UMMLA v4s latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── USMMLA v4s latency ────────────────────────────────────────────────
@@ -1367,7 +1196,7 @@ static void run_i8mm_tests(const BenchmarkParams& base,
     // Matrix-multiply form of USDOT: 2× MAC depth per instruction.
     // The key instruction for INT8 quantized GEMM with asymmetric quantization.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[2].b16(), Imm(0x03));   // signed weights
                 a.movi(kVRegs[1].b16(), Imm(0x02));   // unsigned activations
@@ -1377,7 +1206,7 @@ static void run_i8mm_tests(const BenchmarkParams& base,
                 a.usmmla(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
             });
         snprintf(name, sizeof(name), "USMMLA v4s latency    (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
@@ -1414,7 +1243,7 @@ static void run_popcount_idiom_tests(const BenchmarkParams& base,
     // popcount=2) and then 0x02 (popcount=1) and stabilises at 0x01 — all
     // valid working values that exercise the priority encoder.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.movi(kVRegs[0].b16(), Imm(0x55));
             },
@@ -1422,29 +1251,19 @@ static void run_popcount_idiom_tests(const BenchmarkParams& base,
                 a.cnt(kVRegs[0].b16(), kVRegs[0].b16());
             });
         snprintf(name, sizeof(name), "CNT v16b latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── NEON CNT v16b throughput sweep ────────────────────────────────────
     // N independent CNT chains across v0..v(N-1).
-    {
-        static const uint32_t kCntChains[] = { 2, 3, 4, 6, 8 };
-        for (uint32_t nc : kCntChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-            auto fn = build_fp_loop(loops, au,
-                [nc](a64::Assembler& a) {
-                    for (uint32_t i = 0; i < nc; ++i)
-                        a.movi(kVRegs[i].b16(), Imm(0x55));
-                },
-                [nc](a64::Assembler& a, uint32_t u) {
-                    a.cnt(kVRegs[u % nc].b16(), kVRegs[u % nc].b16());
-                });
-            snprintf(name, sizeof(name),
-                     "CNT v16b tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
-        }
-    }
+    chain_sweep(base, loops, unroll, "CNT v16b tput", kDefaultChains,
+        [](a64::Assembler& a, uint32_t nc) {
+            for (uint32_t i = 0; i < nc; ++i)
+                a.movi(kVRegs[i].b16(), Imm(0x55));
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.cnt(kVRegs[u % nc].b16(), kVRegs[u % nc].b16());
+        });
 
     // ── Scalar POPCNT emulation idiom (the x86 replacement) ───────────────
     // Four-instruction chain: GPR → FP → CNT → ADDV → FP → GPR.
@@ -1457,7 +1276,7 @@ static void run_popcount_idiom_tests(const BenchmarkParams& base,
     // operation — illustrates why scalar POPCNT-heavy x86 code is so much
     // slower under emulation than native.
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.mov(x0, Imm(0xDEADBEEFCAFEBABEULL));
             },
@@ -1472,7 +1291,7 @@ static void run_popcount_idiom_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "POPCNT idiom (FMOV+CNT+ADDV+FMOV) (%ux)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CTZ (count trailing zeros) emulation idiom: RBIT then CLZ ─────────
@@ -1480,7 +1299,7 @@ static void run_popcount_idiom_tests(const BenchmarkParams& base,
     // followed by CLZ. Both are baseline ARMv8.0 and typically 1 clk each,
     // so the two-instruction chain reports ~1 clk/insn (= ~2 clk per CTZ).
     {
-        auto fn = build_fp_loop(loops, unroll,
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.mov(x0, Imm(0xDEADBEEFCAFEBABEULL));
             },
@@ -1490,7 +1309,7 @@ static void run_popcount_idiom_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "CTZ idiom (RBIT+CLZ chain) (%ux)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
@@ -1502,37 +1321,37 @@ void run_fp_simd_tests(const BenchmarkParams& base_params) {
     const uint64_t loops  = base_params.loops;
     const uint32_t unroll = base_params.instructions_per_loop;
 
-    printf("\n── Scalar f32 ──────────────────────────────────────────────────\n");
+    section("Scalar f32");
     run_scalar_f32_tests(base_params, loops, unroll);
 
-    printf("\n── Scalar f64 ──────────────────────────────────────────────────\n");
+    section("Scalar f64");
     run_scalar_f64_tests(base_params, loops, unroll);
 
-    printf("\n── NEON 4×f32 ──────────────────────────────────────────────────\n");
+    section("NEON 4×f32");
     run_neon_f32_tests(base_params, loops, unroll);
 
-    printf("\n── NEON 2×f64 ──────────────────────────────────────────────────\n");
+    section("NEON 2×f64");
     run_neon_f64_tests(base_params, loops, unroll);
 
-    printf("\n── NEON integer 4×i32 ──────────────────────────────────────────\n");
+    section("NEON integer 4×i32");
     run_neon_int_tests(base_params, loops, unroll);
 
-    printf("\n── Mixed FP port pressure ──────────────────────────────────────\n");
+    section("Mixed FP port pressure");
     run_mixed_fp_tests(base_params, loops, unroll);
 
-    printf("\n── Cross-domain latency (GPR ↔ FP) ─────────────────────────────\n");
+    section("Cross-domain latency (GPR ↔ FP)");
     run_crossdomain_tests(base_params, loops, unroll);
 
-    printf("\n── Cryptography extensions ─────────────────────────────────────\n");
+    section("Cryptography extensions");
     run_crypto_tests(base_params, loops, unroll);
 
-    printf("\n── Advanced SIMD (dot-product / widening / FP16) ───────────────\n");
+    section("Advanced SIMD (dot-product / widening / FP16)");
     run_advanced_simd_tests(base_params, loops, unroll);
 
-    printf("\n── FEAT_I8MM (int8 matrix multiply) ────────────────────────────\n");
+    section("FEAT_I8MM (int8 matrix multiply)");
     run_i8mm_tests(base_params, loops, unroll);
 
-    printf("\n── Population count / POPCNT idiom ─────────────────────────────\n");
+    section("Population count / POPCNT idiom");
     run_popcount_idiom_tests(base_params, loops, unroll);
 }
 
