@@ -56,11 +56,15 @@ Default (no flags): runs integer and memory tests.
 | `src/harness.h/.cpp` | Benchmark runner and statistical analysis |
 | `src/cycle_counter.h/.cpp` | PMU cycle counter abstraction (macOS kpc, Windows PMCCNTR_EL0) |
 | `src/jit_buffer.h/.cpp` | JIT memory pool with W^X handling |
+| `src/cpu_features.h/.cpp` | Runtime feature detection (`cpu_has(CpuFeature::X)`) for macOS/Linux/Windows |
+| `src/gen_common.h/.cpp` | Shared generator scaffolding: `build_loop`, `chain_sweep`, `run_one`, `params_for`, `section`, page/pointer-ring helpers |
 | `src/calibrate.cpp` | CPU frequency estimation |
 | `src/gen_integer.h/.cpp` | Integer ALU latency/throughput tests |
 | `src/gen_memory.h/.cpp` | Cache/memory hierarchy tests |
 | `src/gen_branch.h/.cpp` | Branch prediction tests |
-| `src/gen_fp_simd.h/.cpp` | FP, NEON SIMD, crypto, and advanced SIMD tests |
+| `src/gen_fp_simd.h/.cpp` | FP, NEON SIMD, cross-domain, DotProd/FP16, POPCNT-idiom tests |
+| `src/gen_crypto.h/.cpp` | AES/SHA-256/PMULL/CRC32 tests (run by `--simd`) |
+| `src/gen_i8mm.h/.cpp` | FEAT_I8MM USDOT/SMMLA/UMMLA/USMMLA tests (run by `--simd`) |
 | `src/gen_lse.h/.cpp` | LSE atomics latency/throughput tests |
 | `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding) |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
@@ -86,7 +90,10 @@ All test code is JIT-emitted via AsmJit. The host compiler only sees C++ method 
 - **Windows**: `IsProcessorFeaturePresent(PF_ARM_*)` — limited coverage; see notes per-feature
 - **Linux**: `getauxval(AT_HWCAP)` / `AT_HWCAP2`
 
-Feature detection functions follow the pattern in `gen_pitfalls.cpp::has_feat_lrcpc()`.
+All of this lives behind `cpu_has(CpuFeature::X)` in `cpu_features.h`; add a row to the table
+in `cpu_features.cpp` for a new feature rather than writing another `#ifdef` ladder. The Linux
+CI leg once silently built 425 of 434 tests because three sections were gated on
+`__ARM_FEATURE_*` macros the default `-march` did not define.
 
 ## Commit Discipline
 
@@ -139,11 +146,34 @@ Windows 11 ARM64 VM (Parallels/UTM) and point `runs-on` at it temporarily.
 
 ## JIT Loop Structure
 
-All test generators follow this pattern:
-- Save callee-saved registers; load loop counter and constant source into x20
-- `SUB x19, x19, #1` + `CBNZ` for loop control (avoids writing condition flags)
-- Align loop to cache line
-- Unroll factor varies: higher for fast instructions (ADD), lower for slow (SDIV)
+All test generators build on `gen_common.h`. Do not hand-roll a prologue/epilogue in a new
+section; use the shared pieces:
+
+- `build_loop(loops, unroll, setup, body[, scratch_bytes])` emits a fixed 48-byte frame saving
+  x19–x22 and x30, `mov x19, #loops`, `setup(a)` once, a 64-byte-aligned loop top, `body(a, u)`
+  for `u` in `[0, unroll)`, then `SUB x19, x19, #1` + `CBNZ` (no flag writes) and the epilogue.
+  x20–x22 are free for the generator's constants/base addresses; x30 is saved so bodies may BL.
+  `scratch_bytes > 0` reserves a 16-byte-aligned scratch area at `sp` (do `mov x9, sp` in setup).
+- `chain_sweep(base, loops, unroll, "INSN tput", {2, 3, 4, 6, 8}, setup(a, nc), body(a, nc, u))`
+  runs a one-instruction body over `nc` independent chains for each `nc`, rounding the unroll with
+  `chain_unroll()` (a multiple of `nc`, never zero) and naming results `"<prefix> (N chains, Mx unroll)"`.
+  Bodies that emit more than one instruction per `u`, or fixed heterogeneous patterns, stay on
+  `build_loop`.
+- `run_one(name, fn, params_for(base, loops, insns_per_loop[, bytes_per_insn]))` benchmarks,
+  releases the JIT function, and returns the `BenchmarkResult` (zeroed on a compile failure,
+  a filtered-out test, or smoke mode — consumers treat zero as "did not run").
+- `section("Title")` prints the fixed-width header; `skip_feature(CpuFeature::X, "what")`
+  prints the standard skip line.
+- Registers: `xr(i)`/`wr(i)` for x0–x15, `vr(i)` for v0–v7 then v16–v24 (v8–v15 are callee-saved
+  and never used). `gen_fp_simd.cpp` keeps its own S/D scalar tables with the same mapping.
+- Memory: `alloc_pages`/`free_pages`/`commit_pages`, and `build_pointer_ring(buf, size, stride[,
+  offset])` for random cyclic chains (fixed seed; links written with `memcpy` so misaligned nodes
+  are not UB).
+- Every nominal loop count must go through `scale_loops()` (or derive from `base.loops`, which
+  main() already scales) so `--smoke` stays fast.
+- Unroll factor varies: higher for fast instructions (ADD), lower for slow (SDIV).
+- The only hand-rolled loop left is `build_rsb_chain` in `gen_branch.cpp`, which emits its
+  callee functions after the outer function's RET.
 
 ## Measurement Strategy
 
