@@ -13,6 +13,8 @@
 //                   smoke mode and the name filter, and reports a chained
 //                   ADD at ~1 clk with a sane min/median relationship
 //   JIT pool      — compile/release churn does not fail
+//   CPU features  — every feature the generators can gate on is reported,
+//                   so a CI log shows what the runner actually has
 //
 // Checks that need a resource the host does not grant (a PMU on a VM, say)
 // are reported as SKIP, not FAIL. The process exit code is the number of
@@ -23,6 +25,7 @@
 #include "harness.h"
 #include "timer.h"
 #include "cycle_counter.h"
+#include "cpu_features.h"
 #include "jit_buffer.h"
 #include "gen_integer.h"
 
@@ -516,6 +519,38 @@ static void test_harness_measurements() {
     g_jit_pool->release(ref.fn);
 }
 
+static void test_cpu_features() {
+    section("CPU features (runtime detection)");
+
+    static constexpr uint32_t kCount = static_cast<uint32_t>(CpuFeature::Count_);
+    char line[512];
+    size_t n = 0;
+    bool stable = true;
+    for (uint32_t i = 0; i < kCount; ++i) {
+        const CpuFeature f = static_cast<CpuFeature>(i);
+        const bool a = cpu_has(f);
+        const bool b = cpu_has(f);
+        if (a != b) stable = false;
+        n += static_cast<size_t>(snprintf(line + n, sizeof(line) - n, "%s%s=%d",
+                                          i ? " " : "", cpu_feature_name(f), a ? 1 : 0));
+        if (n >= sizeof(line)) break;
+    }
+    note("%s", line);
+    CHECK(stable, "cpu_has() is stable across repeated queries");
+
+    // Architectural implications that hold on every real core.
+    if (cpu_has(CpuFeature::LRCPC2))
+        CHECK(cpu_has(CpuFeature::LRCPC), "FEAT_LRCPC2 implies FEAT_LRCPC");
+    if (cpu_has(CpuFeature::I8MM))
+        CHECK(cpu_has(CpuFeature::DotProd), "FEAT_I8MM implies FEAT_DotProd");
+    if (cpu_has(CpuFeature::FHM))
+        CHECK(cpu_has(CpuFeature::FP16), "FEAT_FHM implies FEAT_FP16");
+    // Every target arm64bench supports is ARMv8.1+ with the crypto extension.
+    CHECK(cpu_has(CpuFeature::LSE), "FEAT_LSE present (ARMv8.1 baseline)");
+    CHECK(cpu_has(CpuFeature::AES) && cpu_has(CpuFeature::SHA256) && cpu_has(CpuFeature::CRC32),
+          "AES, SHA256 and CRC32 present");
+}
+
 static void test_jit_pool_churn() {
     section("JIT pool: compile/release churn");
 
@@ -562,6 +597,7 @@ int main(int argc, char** argv) {
     test_harness_call_accounting();
     test_harness_measurements();
     test_jit_pool_churn();
+    test_cpu_features();
 
     g_jit_pool = nullptr;
 
