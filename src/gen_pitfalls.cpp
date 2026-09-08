@@ -37,69 +37,15 @@
 // whether a code pattern is safe to use in a hot path.
 
 #include "gen_pitfalls.h"
-#include "jit_buffer.h"
-#include "harness.h"
-#include "cpu_features.h"
+#include "gen_common.h"
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
 #include <cstdio>
-#include <cstdlib>   // malloc, free
-
-#if defined(_WIN32)
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#else
-#  include <sys/mman.h>
-#endif
 
 namespace arm64bench::gen {
 
 using namespace asmjit;
 using namespace asmjit::a64;
-
-// ── Platform memory helpers ───────────────────────────────────────────────────
-
-static void* alloc_pages(size_t size) {
-#if defined(_WIN32)
-    return VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-#else
-    void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    return (p == MAP_FAILED) ? nullptr : p;
-#endif
-}
-
-static void free_pages(void* p, size_t size) {
-    if (!p) return;
-#if defined(_WIN32)
-    (void)size; VirtualFree(p, 0, MEM_RELEASE);
-#else
-    munmap(p, size);
-#endif
-}
-
-// ── Benchmark helpers ─────────────────────────────────────────────────────────
-
-static void run_one(const char* name, JitPool::TestFn fn,
-                    const BenchmarkParams& p) {
-    if (!fn) return;
-    benchmark(fn, name, p);
-    g_jit_pool->release(fn);
-}
-
-static BenchmarkParams make_lat_params(const BenchmarkParams& base,
-                                       uint64_t loops, uint32_t unroll = 8) {
-    BenchmarkParams p       = base;
-    p.loops                 = loops;
-    p.instructions_per_loop = unroll;
-    p.bytes_per_insn        = 0;
-    return p;
-}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Section 1: Store-to-load forwarding
@@ -135,19 +81,10 @@ static BenchmarkParams make_lat_params(const BenchmarkParams& base,
 //   feeding the next store (via x0). This creates a serial chain where
 //   each store-load pair must complete before the next can start.
 //
-//   Using [sp-8] as the store/load address — this is "red zone" territory
-//   on ARM64 (unlike x86-64, ARM64 ABI doesn't define a red zone, but we
-//   can safely use addresses below sp as a temporary scratch slot since no
-//   signal handlers or interrupts will disturb user-level code in practice).
-//   We don't need to allocate stack space for a scratch slot.
-//
-//   RATIONALE FOR BELOW-SP: The store/load slot must be at a known fixed
-//   address that is a valid data address. We use ptr(sp, -8) to avoid
-//   allocating additional stack space in the prologue while keeping the
-//   address data-cache-resident. This is benign for benchmarking purposes
-//   even though it's technically below the stack pointer — interrupts may
-//   briefly corrupt it, but the STORE immediately before each LOAD means
-//   the value is always freshly written before it's read.
+//   The store/load slot is the 16-byte scratch area that build_loop carves
+//   below the register save frame (scratch_bytes = 16, `mov x9, sp` in the
+//   setup). A fixed, cache-resident, correctly owned data address — no
+//   below-sp trickery needed.
 
 // Forward declaration.
 static void run_store_forwarding_tests(const BenchmarkParams& base);
@@ -159,9 +96,8 @@ static void run_lrcpc_tests(const BenchmarkParams& base);
 
 // ── STL forwarding loop builder ───────────────────────────────────────────────
 //
-// Each outer iteration:
-//   [setup]: x0 = current value, x9 = scratch address (below sp)
-//   store:   STR/STRW/STRH/STRB x0|w0, [x9, #store_offset]
+// Each unrolled body:
+//   store:   STR/STRW/STRH/STRB x0|w0, [x9, #0]
 //   load:    LDR/LDRW/LDRH/LDRB x0|w0, [x9, #load_offset]
 //   (x0 feeds the next iteration's store — genuine dependency chain)
 //
@@ -178,67 +114,42 @@ enum class Width { B1 = 1, B2 = 2, B4 = 4, B8 = 8 };
 static JitPool::TestFn build_stl_forward(uint64_t loops, uint32_t unroll,
                                          Width store_w, Width load_w,
                                          int32_t load_offset) {
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    // Prologue: save x19 (loop counter), x30 (LR).
-    // x9 = scratch address slot just below sp, established once.
-    a.sub(sp, sp, Imm(16));
-    a.stp(x19, x30, ptr(sp));
-
-    a.mov(x19, Imm(loops));
-    a.mov(x0,  Imm(0x0102030405060708ULL));  // non-trivial initial value
-    // x9 points to a 16-byte slot at [sp-16]. We sub sp a second time to
-    // give ourselves a clean 16-byte slot, keeping sp 16-byte aligned.
-    a.sub(sp, sp, Imm(16));
-    a.mov(x9, sp);   // x9 = scratch buffer address
-
-    a.align(AlignMode::kCode, 64);
-    Label loop_top = a.new_label();
-    a.bind(loop_top);
-
-    for (uint32_t u = 0; u < unroll; ++u) {
-        // Store x0/w0 at [x9].
-        switch (store_w) {
-            case Width::B8: a.str (x0,  ptr(x9)); break;
-            case Width::B4: a.str (w0,  ptr(x9)); break;
-            case Width::B2: a.strh(w0,  ptr(x9)); break;
-            case Width::B1: a.strb(w0,  ptr(x9)); break;
-        }
-        // Load from [x9 + load_offset] into x0/w0.
-        // The load width determines how many bytes of the stored value are read.
-        if (load_offset == 0) {
-            switch (load_w) {
-                case Width::B8: a.ldr  (x0, ptr(x9)); break;
-                case Width::B4: a.ldr  (w0, ptr(x9)); break;
-                case Width::B2: a.ldrh (w0, ptr(x9)); break;
-                case Width::B1: a.ldrb (w0, ptr(x9)); break;
+    return build_loop(loops, unroll,
+        [](a64::Assembler& a) {
+            a.mov(x0, Imm(0x0102030405060708ULL));  // non-trivial initial value
+            a.mov(x9, sp);                          // x9 = scratch slot address
+        },
+        [store_w, load_w, load_offset](a64::Assembler& a, uint32_t) {
+            // Store x0/w0 at [x9].
+            switch (store_w) {
+                case Width::B8: a.str (x0,  ptr(x9)); break;
+                case Width::B4: a.str (w0,  ptr(x9)); break;
+                case Width::B2: a.strh(w0,  ptr(x9)); break;
+                case Width::B1: a.strb(w0,  ptr(x9)); break;
             }
-        } else {
-            switch (load_w) {
-                case Width::B8: a.ldr  (x0, ptr(x9, load_offset)); break;
-                case Width::B4: a.ldr  (w0, ptr(x9, load_offset)); break;
-                case Width::B2: a.ldrh (w0, ptr(x9, load_offset)); break;
-                case Width::B1: a.ldrb (w0, ptr(x9, load_offset)); break;
+            // Load from [x9 + load_offset] into x0/w0.
+            // The load width determines how many bytes of the stored value are read.
+            if (load_offset == 0) {
+                switch (load_w) {
+                    case Width::B8: a.ldr  (x0, ptr(x9)); break;
+                    case Width::B4: a.ldr  (w0, ptr(x9)); break;
+                    case Width::B2: a.ldrh (w0, ptr(x9)); break;
+                    case Width::B1: a.ldrb (w0, ptr(x9)); break;
+                }
+            } else {
+                switch (load_w) {
+                    case Width::B8: a.ldr  (x0, ptr(x9, load_offset)); break;
+                    case Width::B4: a.ldr  (w0, ptr(x9, load_offset)); break;
+                    case Width::B2: a.ldrh (w0, ptr(x9, load_offset)); break;
+                    case Width::B1: a.ldrb (w0, ptr(x9, load_offset)); break;
+                }
             }
-        }
-    }
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, loop_top);
-
-    // Restore extra frame.
-    a.add(sp, sp, Imm(16));
-    a.ldp(x19, x30, ptr(sp));
-    a.add(sp, sp, Imm(16));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
+        },
+        /*scratch_bytes=*/16);
 }
 
 static void run_store_forwarding_tests(const BenchmarkParams& base) {
-    printf("\n── Store-to-load forwarding ────────────────────────────────────\n");
+    section("Store-to-load forwarding");
     printf("  clk/insn = latency of one STORE+LOAD pair (unroll=8).\n"
            "  M1 penalty for mismatch: ~+8–12 clk vs matched case.\n\n");
 
@@ -298,7 +209,7 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
         auto fn = build_stl_forward(loops, unroll, c.store_w, c.load_w,
                                     c.load_offset);
         snprintf(name, sizeof(name), "%-46s", c.label);
-        run_one(name, fn, make_lat_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
@@ -341,21 +252,17 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
 //   multiple iterations concurrently.
 
 static void run_barrier_tests(const BenchmarkParams& base) {
-    printf("\n── Memory ordering barriers ────────────────────────────────────\n");
+    section("Memory ordering barriers");
     printf("  clk/insn = cycles per barrier instruction (unroll=8).\n\n");
 
     const uint64_t loops  = scale_loops(3'000'000);
     const uint32_t unroll = 8;
     char name[80];
 
-    auto make_p = [&](uint64_t l, uint32_t u) {
-        return make_lat_params(base, l, u);
-    };
-
     // ── Shuffled L1 pointer ring ───────────────────────────────────────────
-    // Build a 64-node ring (512 bytes, fits in L1) with a Fisher-Yates shuffle
-    // so that every load returns a *different* address. Placed on the stack so
-    // it stays alive for the entire run_barrier_tests call.
+    // A 64-node ring (512 bytes, fits in L1) linked in shuffled order so that
+    // every load returns a *different* address. Placed on the stack so it
+    // stays alive for the entire run_barrier_tests call.
     //
     // WHY NOT a self-referential chain ([x9] = x9)?
     //   On Apple M5 (and possibly earlier), a chain where every load always
@@ -366,73 +273,31 @@ static void run_barrier_tests(const BenchmarkParams& base) {
     //   speculative value use regardless of chain shape.
     constexpr uint32_t kRingN = 64;
     alignas(64) uintptr_t ring_buf[kRingN];
-    {
-        uint32_t perm[kRingN];
-        for (uint32_t i = 0; i < kRingN; ++i) perm[i] = i;
-        uint64_t rng = 0xDEADBEEF12345678ULL;
-        auto xs = [&]() -> uint64_t {
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng;
-        };
-        for (uint32_t i = kRingN - 1; i > 0; --i) {
-            uint32_t j = xs() % (i + 1);
-            uint32_t t = perm[i]; perm[i] = perm[j]; perm[j] = t;
-        }
-        for (uint32_t i = 0; i < kRingN; ++i)
-            ring_buf[perm[i]] = reinterpret_cast<uintptr_t>(
-                                    &ring_buf[perm[(i + 1) % kRingN]]);
-    }
-    const uintptr_t ring_head = reinterpret_cast<uintptr_t>(&ring_buf[0]);
+    void* const ring_start = build_pointer_ring(ring_buf, sizeof(ring_buf),
+                                                sizeof(uintptr_t));
+    if (!ring_start) return;
+    const uint64_t ring_head = reinterpret_cast<uint64_t>(ring_start);
 
     // ── LDR baseline (plain load, no ordering) ────────────────────────────
     // Pointer-chase through the shuffled L1 ring. This is the true L1 load
     // latency reference; a barrier adds overhead on top of this.
     {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.mov(x0, Imm(static_cast<uint64_t>(ring_head)));
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u)
-                a.ldr(x0, ptr(x0));
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+        auto fn = build_loop(loops, unroll,
+            [ring_head](a64::Assembler& a)  { a.mov(x0, Imm(ring_head)); },
+            [](a64::Assembler& a, uint32_t) { a.ldr(x0, ptr(x0)); });
         snprintf(name, sizeof(name), "LDR x64 (L1 chain, baseline)");
-        run_one(name, fn, make_p(loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── LDAR: load-acquire ────────────────────────────────────────────────
     // Same ring, LDAR instead of LDR. LDAR prevents reordering of later
     // accesses before this load and inhibits load value speculation.
     {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.mov(x0, Imm(static_cast<uint64_t>(ring_head)));
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u)
-                a.ldar(x0, ptr(x0));
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+        auto fn = build_loop(loops, unroll,
+            [ring_head](a64::Assembler& a)  { a.mov(x0, Imm(ring_head)); },
+            [](a64::Assembler& a, uint32_t) { a.ldar(x0, ptr(x0)); });
         snprintf(name, sizeof(name), "LDAR x64 (load-acquire)");
-        run_one(name, fn, make_p(loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── DMB ISH ───────────────────────────────────────────────────────────
@@ -441,48 +306,18 @@ static void run_barrier_tests(const BenchmarkParams& base) {
     // In practice a DMB always occurs between memory accesses, so this is
     // a lower bound on the cost it adds to lock/unlock operations.
     {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u)
-                a.dmb(Imm(Predicate::DB::kISH));
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+        auto fn = build_loop(loops, unroll, no_setup,
+            [](a64::Assembler& a, uint32_t) { a.dmb(Imm(Predicate::DB::kISH)); });
         snprintf(name, sizeof(name), "DMB ISH");
-        run_one(name, fn, make_p(loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── DSB ISH ───────────────────────────────────────────────────────────
     {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u)
-                a.dsb(Imm(Predicate::DB::kISH));
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+        auto fn = build_loop(loops, unroll, no_setup,
+            [](a64::Assembler& a, uint32_t) { a.dsb(Imm(Predicate::DB::kISH)); });
         snprintf(name, sizeof(name), "DSB ISH");
-        run_one(name, fn, make_p(loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── ISB (Instruction Synchronization Barrier) ─────────────────────────
@@ -491,25 +326,10 @@ static void run_barrier_tests(const BenchmarkParams& base) {
     // (e.g. after writing JIT code into executable memory).
     // We expect this to be substantially more expensive than DMB/DSB.
     {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u)
-                a.isb(Imm(0xF));  // 0xF = SY option
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+        auto fn = build_loop(loops, unroll, no_setup,
+            [](a64::Assembler& a, uint32_t) { a.isb(Imm(0xF)); });  // 0xF = SY option
         snprintf(name, sizeof(name), "ISB SY");
-        run_one(name, fn, make_p(loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── LDR + DMB ISH (acquire pattern) vs LDAR ───────────────────────────
@@ -520,28 +340,14 @@ static void run_barrier_tests(const BenchmarkParams& base) {
     // Uses the same shuffled L1 ring as the LDR baseline.
     {
         const uint32_t pair_unroll = 4;  // 4 pairs = 8 instructions
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.mov(x0, Imm(static_cast<uint64_t>(ring_head)));
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < pair_unroll; ++u) {
+        auto fn = build_loop(loops, pair_unroll,
+            [ring_head](a64::Assembler& a) { a.mov(x0, Imm(ring_head)); },
+            [](a64::Assembler& a, uint32_t) {
                 a.ldr(x0, ptr(x0));
                 a.dmb(Imm(Predicate::DB::kISH));
-            }
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+            });
         snprintf(name, sizeof(name), "LDR + DMB ISH (manual acquire, 4 pairs)");
-        run_one(name, fn, make_p(loops, pair_unroll * 2));
+        run_one(name, fn, params_for(base, loops, pair_unroll * 2));
     }
 }
 
@@ -578,56 +384,46 @@ static constexpr uint32_t kNTLines   = static_cast<uint32_t>(kNTStep / kNTCacheL
 static JitPool::TestFn build_stnp_bw(uintptr_t buf_base, size_t buf_size,
                                       uint64_t num_passes, bool non_temporal) {
     const uint64_t inner_iters = buf_size / kNTStep;
-    CodeHolder code; g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
 
-    a.sub(sp, sp, Imm(32));
-    a.stp(x19, x20, ptr(sp));
-    a.str(x21, ptr(sp, 16));
+    // Outer loop = one pass over the buffer (build_loop, unroll 1); the body
+    // emits the inner loop that walks the buffer kNTStep bytes at a time.
+    //   x20 = buffer base, x10 = store value, x0 = cursor, x21 = inner counter
+    return build_loop(num_passes, 1,
+        [buf_base](a64::Assembler& a) {
+            a.mov(x20, Imm(static_cast<uint64_t>(buf_base)));
+            a.mov(x10, x20);  // store value (non-trivial = buf_base)
+        },
+        [inner_iters, non_temporal](a64::Assembler& a, uint32_t) {
+            a.mov(x0,  x20);
+            a.mov(x21, Imm(inner_iters));
 
-    a.mov(x19, Imm(num_passes));
-    a.mov(x20, Imm(static_cast<uint64_t>(buf_base)));
-    a.mov(x10, x20);  // store value (non-trivial = buf_base)
+            Label inner = a.new_label();
+            a.bind(inner);
 
-    a.align(AlignMode::kCode, 64);
-    Label outer = a.new_label(), inner = a.new_label();
-    a.bind(outer);
-    a.mov(x0,  x20);
-    a.mov(x21, Imm(inner_iters));
-    a.bind(inner);
+            for (uint32_t line = 0; line < kNTLines; ++line) {
+                const int32_t off = static_cast<int32_t>(line * kNTCacheLine);
+                if (non_temporal) {
+                    a.stnp(x10, x10, ptr(x0, off + 0));
+                    a.stnp(x10, x10, ptr(x0, off + 16));
+                    a.stnp(x10, x10, ptr(x0, off + 32));
+                    a.stnp(x10, x10, ptr(x0, off + 48));
+                } else {
+                    a.stp(x10, x10, ptr(x0, off + 0));
+                    a.stp(x10, x10, ptr(x0, off + 16));
+                    a.stp(x10, x10, ptr(x0, off + 32));
+                    a.stp(x10, x10, ptr(x0, off + 48));
+                }
+            }
 
-    for (uint32_t line = 0; line < kNTLines; ++line) {
-        const int32_t off = static_cast<int32_t>(line * kNTCacheLine);
-        if (non_temporal) {
-            a.stnp(x10, x10, ptr(x0, off + 0));
-            a.stnp(x10, x10, ptr(x0, off + 16));
-            a.stnp(x10, x10, ptr(x0, off + 32));
-            a.stnp(x10, x10, ptr(x0, off + 48));
-        } else {
-            a.stp(x10, x10, ptr(x0, off + 0));
-            a.stp(x10, x10, ptr(x0, off + 16));
-            a.stp(x10, x10, ptr(x0, off + 32));
-            a.stp(x10, x10, ptr(x0, off + 48));
-        }
-    }
-
-    a.add(x0, x0, Imm(static_cast<uint64_t>(kNTStep)));
-    a.sub(x21, x21, Imm(1));
-    a.cbnz(x21, inner);
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, outer);
-
-    a.ldp(x19, x20, ptr(sp));
-    a.ldr(x21, ptr(sp, 16));
-    a.add(sp, sp, Imm(32));
-    a.ret(x30);
-    return g_jit_pool->compile(code);
+            a.add(x0, x0, Imm(static_cast<uint64_t>(kNTStep)));
+            a.sub(x21, x21, Imm(1));
+            a.cbnz(x21, inner);
+        });
 }
 
 static void run_nontemporal_tests(const BenchmarkParams& base,
                                   void* buf, size_t bufsz) {
-    printf("\n── Non-temporal stores (STNP vs STP) ──────────────────────────\n");
+    section("Non-temporal stores (STNP vs STP)");
     printf("  Bandwidth in GB/s. STNP hint bypasses write-allocate RFO.\n"
            "  If STNP ≈ STP: hint not honoured (treated as normal store).\n"
            "  If STNP > STP: hint works; less DRAM traffic from RFO bypass.\n\n");
@@ -647,10 +443,9 @@ static void run_nontemporal_tests(const BenchmarkParams& base,
         const uint64_t p_clamped = scale_loops(
             (passes < 4) ? 4 : (passes > 2'000'000 ? 2'000'000 : passes));
 
-        BenchmarkParams p       = base;
-        p.loops                 = p_clamped;
-        p.instructions_per_loop = static_cast<uint32_t>(lines);
-        p.bytes_per_insn        = static_cast<uint32_t>(kNTCacheLine);
+        const BenchmarkParams p = params_for(base, p_clamped,
+                                             static_cast<uint32_t>(lines),
+                                             static_cast<uint32_t>(kNTCacheLine));
 
         char name[64];
 
@@ -688,7 +483,7 @@ static void run_nontemporal_tests(const BenchmarkParams& base,
 // making the measurement representative.
 
 static void run_misaligned_tests(const BenchmarkParams& base, void* buf) {
-    printf("\n── Misaligned load latency ─────────────────────────────────────\n");
+    section("Misaligned load latency");
     printf("  Pointer-chase through a buffer; each pointer is misaligned\n"
            "  by the given byte offset from 8-byte alignment.\n\n");
 
@@ -699,62 +494,28 @@ static void run_misaligned_tests(const BenchmarkParams& base, void* buf) {
     const int32_t offsets[] = { 0, 1, 4, 7, 56, 60, 63 };
 
     for (int32_t off : offsets) {
-        // Build a pointer chain in the buffer with each node at
-        // (naturally_aligned_addr + off). The chain must stay within buf.
-        // Use a simple stride of 256 bytes between nodes.
-        const size_t stride    = 256;
-        const size_t buf_size  = 2ULL * 1024 * 1024;  // 2MB — fits in L2
-        const size_t n_nodes   = buf_size / stride;
+        // Shuffled chain of nodes at (naturally_aligned_addr + off), one node
+        // every 256 bytes over a 2MB window (fits in L2). build_pointer_ring
+        // writes the links with memcpy — at a nonzero offset the link slot is
+        // deliberately unaligned, and a direct pointer store there is UB.
+        const size_t stride   = 256;
+        const size_t buf_size = 2ULL * 1024 * 1024;  // 2MB — fits in L2
 
-        uint8_t* base_ptr = static_cast<uint8_t*>(buf);
+        void* const head = build_pointer_ring(buf, buf_size, stride,
+                                              static_cast<size_t>(off));
+        if (!head) continue;
+        const uint64_t head_addr = reinterpret_cast<uint64_t>(head);
 
-        // Build permuted chain with Fisher-Yates (fixed seed).
-        uint32_t* perm = static_cast<uint32_t*>(malloc(n_nodes * sizeof(uint32_t)));
-        if (!perm) continue;
-        for (uint32_t i = 0; i < n_nodes; ++i) perm[i] = i;
-        uint64_t rng = 0xDEADBEEF12345678ULL;
-        auto xorshift = [&]() -> uint64_t {
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng;
-        };
-        for (size_t i = n_nodes - 1; i > 0; --i) {
-            size_t j = xorshift() % (i + 1);
-            uint32_t t = perm[i]; perm[i] = perm[j]; perm[j] = t;
-        }
-
-        // Write chain links: at each slot, store the address of the next slot.
-        // Each "slot" is at (perm[i] * stride + off) bytes from base.
-        for (size_t i = 0; i < n_nodes; ++i) {
-            void** slot = reinterpret_cast<void**>(
-                base_ptr + static_cast<size_t>(perm[i]) * stride + off);
-            *slot = base_ptr + static_cast<size_t>(perm[(i + 1) % n_nodes]) * stride + off;
-        }
-        uintptr_t head = reinterpret_cast<uintptr_t>(
-            base_ptr + static_cast<size_t>(perm[0]) * stride + off);
-        free(perm);
-
-        // Build the pointer-chase JIT loop.
-        CodeHolder code; g_jit_pool->init_code_holder(code);
-        a64::Assembler a(&code);
-        a.sub(sp, sp, Imm(16));
-        a.stp(x19, x30, ptr(sp));
-        a.mov(x19, Imm(loops));
-        a.mov(x0, Imm(static_cast<uint64_t>(head)));
-        a.align(AlignMode::kCode, 64);
-        Label top = a.new_label(); a.bind(top);
-        a.ldr(x0, ptr(x0));
-        a.sub(x19, x19, Imm(1));
-        a.cbnz(x19, top);
-        a.ldp(x19, x30, ptr(sp));
-        a.add(sp, sp, Imm(16));
-        a.ret(x30);
-        auto fn = g_jit_pool->compile(code);
+        auto fn = build_loop(loops, 1,
+            [head_addr](a64::Assembler& a)  { a.mov(x0, Imm(head_addr)); },
+            [](a64::Assembler& a, uint32_t) { a.ldr(x0, ptr(x0)); });
 
         const char* boundary = (off == 0)    ? "(aligned)"        :
                                (off < 8)     ? "(within 8B word)" :
                                (off <= 55)   ? "(within cache line)" :
                                (off <= 63)   ? "(crosses cache line)" : "";
         snprintf(name, sizeof(name), "LDR misalign +%2d bytes %s", off, boundary);
-        run_one(name, fn, make_lat_params(base, loops, 1));
+        run_one(name, fn, params_for(base, loops, 1));
     }
 }
 
@@ -781,7 +542,7 @@ static void run_misaligned_tests(const BenchmarkParams& base, void* buf) {
 // the maximum lock/unlock frequency when the lock is uncontended.
 
 static void run_cas_tests(const BenchmarkParams& base, void* buf) {
-    printf("\n── CAS (Compare-and-Swap) latency ──────────────────────────────\n");
+    section("CAS (Compare-and-Swap) latency");
     printf("  Single-threaded CAS on an L1-resident cache line.\n"
            "  clk/insn = total CAS round-trip latency (load+compare+store).\n\n");
 
@@ -803,58 +564,34 @@ static void run_cas_tests(const BenchmarkParams& base, void* buf) {
     // [x9]=0. The memory ordering of each CAS's store must complete before
     // the next CAS can confirm [x9]==0, serializing all iterations.
     {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.mov(x9, Imm(static_cast<uint64_t>(cas_addr)));
-            a.mov(x2, Imm(0));
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u) {
+        auto fn = build_loop(loops, unroll,
+            [cas_addr](a64::Assembler& a) {
+                a.mov(x9, Imm(static_cast<uint64_t>(cas_addr)));
+                a.mov(x2, Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t) {
                 a.mov(x1, Imm(0));
                 a.cas(x1, x2, ptr(x9));
-            }
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+            });
         snprintf(name, sizeof(name), "CAS   x64 relaxed (always succeeds)");
-        run_one(name, fn, make_lat_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CASAL (acquire+release) ───────────────────────────────────────────
     // Full sequential-consistency CAS. This is what a correct spinlock
     // acquire needs. Its latency is the minimum uncontended lock cycle time.
     {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.mov(x9, Imm(static_cast<uint64_t>(cas_addr)));
-            a.mov(x2, Imm(0));
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u) {
+        auto fn = build_loop(loops, unroll,
+            [cas_addr](a64::Assembler& a) {
+                a.mov(x9, Imm(static_cast<uint64_t>(cas_addr)));
+                a.mov(x2, Imm(0));
+            },
+            [](a64::Assembler& a, uint32_t) {
                 a.mov(x1, Imm(0));
                 a.casal(x1, x2, ptr(x9));
-            }
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+            });
         snprintf(name, sizeof(name), "CASAL x64 acq+rel (spinlock acquire)");
-        run_one(name, fn, make_lat_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── LDAXR + STLXR (LL/SC, acquire+release) ───────────────────────────
@@ -871,32 +608,20 @@ static void run_cas_tests(const BenchmarkParams& base, void* buf) {
     // loop. The benchmark is for *latency*, not for correctness of the
     // store; the LDAXR ordering cost is what we're measuring.
     {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.mov(x9, Imm(static_cast<uint64_t>(cas_addr)));
-            a.mov(x0, Imm(0));   // new value = 0
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u) {
+        auto fn = build_loop(loops, unroll,
+            [cas_addr](a64::Assembler& a) {
+                a.mov(x9, Imm(static_cast<uint64_t>(cas_addr)));
+                a.mov(x0, Imm(0));   // new value = 0
+            },
+            [](a64::Assembler& a, uint32_t) {
                 a.ldaxr(x1, ptr(x9));      // load-acquire-exclusive: x1 = [x9]
                 a.stlxr(w2, x0, ptr(x9)); // store-release-exclusive: [x9] = 0
                 // w2 = 0 on success, 1 on failure. We don't check or retry.
                 // The LDAXR→STLXR window contains zero other instructions,
                 // minimising the chance of preemption breaking the reservation.
-            }
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+            });
         snprintf(name, sizeof(name), "LDAXR+STLXR (LL/SC, no-retry)");
-        run_one(name, fn, make_lat_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
@@ -978,11 +703,12 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
     const bool lrcpc2 = cpu_has(CpuFeature::LRCPC2);
 
     if (!lrcpc && !lrcpc2) {
-        printf("\n── LRCPC tests skipped (FEAT_LRCPC not detected) ────────────────\n");
+        section("LRCPC load-acquire (FEAT_LRCPC / FEAT_LRCPC2)");
+        skip_feature(CpuFeature::LRCPC, "LDAPR/LDAPUR tests");
         return;
     }
 
-    printf("\n── LRCPC load-acquire (FEAT_LRCPC / FEAT_LRCPC2) ───────────────\n");
+    section("LRCPC load-acquire (FEAT_LRCPC / FEAT_LRCPC2)");
     printf("  LDAPR (FEAT_LRCPC): one-way acquire barrier (weaker than LDAR).\n"
            "  On CPUs where LDAR > LDR: correct LDAPR ≈ LDR, buggy ≈ LDAR.\n"
            "  On Apple M-series: LDAR = LDR (no store to drain in pointer chain),\n"
@@ -992,35 +718,26 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
     const uint64_t loops  = scale_loops(3'000'000);
     const uint32_t unroll = 8;
     char name[80];
-    auto make_p = [&](uint64_t l, uint32_t u) { return make_lat_params(base, l, u); };
 
     // ── LDAPR pointer chain (FEAT_LRCPC) ─────────────────────────────────
     // Pointer chase using LDAPR instead of LDR/LDAR.
     // Compare to: "LDR x64 (L1 chain, baseline)" and "LDAR x64 (load-acquire)"
     // from the barrier section above.
+    //
+    // A self-referential slot ([x9] = x9) is safe here: LDAPR's ordering
+    // semantics require the load to actually complete before the result is
+    // consumable, so the load value predictor cannot short-circuit it.
     if (lrcpc) {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(32));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.add(x9, sp, Imm(16));
-            a.str(x9, ptr(x9));
-            emit_ldapr_x(a, x0, x9);  // prime
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u)
-                emit_ldapr_x(a, x0, x0);
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(32));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+        auto fn = build_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.mov(x9, sp);
+                a.str(x9, ptr(x9));
+                emit_ldapr_x(a, x0, x9);  // prime
+            },
+            [](a64::Assembler& a, uint32_t) { emit_ldapr_x(a, x0, x0); },
+            /*scratch_bytes=*/16);
         snprintf(name, sizeof(name), "LDAPR  x64 (FEAT_LRCPC,  L1 chain)");
-        run_one(name, fn, make_p(loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── LDAPUR pointer chain (FEAT_LRCPC2) ───────────────────────────────
@@ -1028,33 +745,21 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
     // On correct hardware: identical latency to LDAPR.
     // If LDAPUR ≠ LDAPR: the two forms are on different pipelines.
     if (lrcpc2) {
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(32));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.add(x9, sp, Imm(16));
-            a.str(x9, ptr(x9));
-            emit_ldapur_x(a, x0, x9, 0);  // prime
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u)
-                emit_ldapur_x(a, x0, x0, 0);
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(32));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+        auto fn = build_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.mov(x9, sp);
+                a.str(x9, ptr(x9));
+                emit_ldapur_x(a, x0, x9, 0);  // prime
+            },
+            [](a64::Assembler& a, uint32_t) { emit_ldapur_x(a, x0, x0, 0); },
+            /*scratch_bytes=*/16);
         snprintf(name, sizeof(name), "LDAPUR x64 (FEAT_LRCPC2, L1 chain)");
-        run_one(name, fn, make_p(loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── Store-to-load forwarding with LRCPC instructions ─────────────────
     // Same scratch-slot methodology as run_store_forwarding_tests.
-    // x9 = pointer to 16-byte stack slot; x0 is the value being forwarded.
+    // x9 = pointer to the 16-byte scratch slot; x0 is the value being forwarded.
 
     printf("\n  LRCPC store-to-load forwarding (compare to STR→LDR baseline above):\n\n");
 
@@ -1081,18 +786,12 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
         if ((use_stlur || use_ldapur) && !lrcpc2) continue;
         if (!use_stlur && !use_ldapur && !lrcpc)  continue;
 
-        auto fn = [&] {
-            CodeHolder code; g_jit_pool->init_code_holder(code);
-            a64::Assembler a(&code);
-            a.sub(sp, sp, Imm(16));
-            a.stp(x19, x30, ptr(sp));
-            a.mov(x19, Imm(loops));
-            a.mov(x0,  Imm(0x0102030405060708ULL));
-            a.sub(sp, sp, Imm(16));
-            a.mov(x9, sp);
-            a.align(AlignMode::kCode, 64);
-            Label top = a.new_label(); a.bind(top);
-            for (uint32_t u = 0; u < unroll; ++u) {
+        auto fn = build_loop(loops, unroll,
+            [](a64::Assembler& a) {
+                a.mov(x0, Imm(0x0102030405060708ULL));
+                a.mov(x9, sp);
+            },
+            [use_stlr, use_stlur, use_ldapur](a64::Assembler& a, uint32_t) {
                 // Store.
                 if (use_stlur)     emit_stlur_x(a, x0, x9, 0);
                 else if (use_stlr) a.stlr(x0, ptr(x9));
@@ -1100,22 +799,13 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
                 // Load.
                 if (use_ldapur) emit_ldapur_x(a, x0, x9, 0);
                 else            emit_ldapr_x (a, x0, x9);
-            }
-            a.sub(x19, x19, Imm(1));
-            a.cbnz(x19, top);
-            a.add(sp, sp, Imm(16));
-            a.ldp(x19, x30, ptr(sp));
-            a.add(sp, sp, Imm(16));
-            a.ret(x30);
-            return g_jit_pool->compile(code);
-        }();
+            },
+            /*scratch_bytes=*/16);
         snprintf(name, sizeof(name), "%-46s", c.label);
-        run_one(name, fn, make_p(loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 // Section 7: BFI destination dependency (Mihocka stress)
 // ════════════════════════════════════════════════════════════════════════════
@@ -1161,7 +851,7 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
 // All instructions are baseline ARMv8.0; no runtime feature detection needed.
 
 static void run_bfi_dependency_tests(const BenchmarkParams& base) {
-    printf("\n── BFI destination dependency (Mihocka stress) ─────────────────\n");
+    section("BFI destination dependency (Mihocka stress)");
     printf("  Variant A: throughput baseline (no Xd chain)\n");
     printf("  Variant B: overlapping bitfield rotation across x0/x1/x2 (true latency)\n");
     printf("  Variant C: full-width BFI (degenerates to MOV — does µarch dep-break?)\n\n");
@@ -1170,33 +860,13 @@ static void run_bfi_dependency_tests(const BenchmarkParams& base) {
     const uint32_t unroll = 24;            // multiple of 3 for variant B rotation
     char name[80];
 
-    auto build = [&](auto&& emit_setup, auto&& emit_body) -> JitPool::TestFn {
-        CodeHolder code;
-        g_jit_pool->init_code_holder(code);
-        a64::Assembler a(&code);
-        a.sub(sp, sp, Imm(16));
-        a.stp(x19, x30, ptr(sp));
-        a.mov(x19, Imm(loops));
-        emit_setup(a);
-        a.align(AlignMode::kCode, 64);
-        Label top = a.new_label();
-        a.bind(top);
-        for (uint32_t u = 0; u < unroll; ++u) emit_body(a, u);
-        a.sub(x19, x19, Imm(1));
-        a.cbnz(x19, top);
-        a.ldp(x19, x30, ptr(sp));
-        a.add(sp, sp, Imm(16));
-        a.ret(x30);
-        return g_jit_pool->compile(code);
-    };
-
     // ── Variant A: independent BFI — throughput-bound ─────────────────────
     // All instructions in the unrolled body use the same Xd (x0) and same
     // source (x10). x0 is overwritten in the same slice each iteration, so
     // there is no inter-instruction Xd dependency — only the implicit RMW
     // dependency on x0 that the µarch *might* be able to break.
     {
-        auto fn = build(
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.mov(x0, Imm(0xDEADBEEFCAFEBABEULL));
                 a.mov(x10, Imm(0x1234567890ABCDEFULL));
@@ -1205,7 +875,7 @@ static void run_bfi_dependency_tests(const BenchmarkParams& base) {
                 a.bfi(x0, x10, Imm(0), Imm(8));
             });
         snprintf(name, sizeof(name), "BFI variant A (independent, x0 RMW)");
-        run_one(name, fn, make_lat_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── Variant B: overlapping rotated chain — true latency ───────────────
@@ -1215,7 +885,7 @@ static void run_bfi_dependency_tests(const BenchmarkParams& base) {
     // source — a real read-after-write dependency that no µarch heuristic
     // can break.
     {
-        auto fn = build(
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.mov(x0, Imm(0xAAAAAAAAAAAAAAAAULL));
                 a.mov(x1, Imm(0x5555555555555555ULL));
@@ -1230,7 +900,7 @@ static void run_bfi_dependency_tests(const BenchmarkParams& base) {
                 a.bfi(dst[u % 3], src[u % 3], Imm(1), Imm(2));
             });
         snprintf(name, sizeof(name), "BFI variant B (overlapping rotation, true lat)");
-        run_one(name, fn, make_lat_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── Variant C: full-width BFI (lsb=0, width=64) — equivalent to MOV ───
@@ -1239,7 +909,7 @@ static void run_bfi_dependency_tests(const BenchmarkParams& base) {
     // BFI alias form; if so, drop down to BFM with the equivalent encoding
     // (BFM Xd, Xn, #0, #63 = BFI Xd, Xn, #0, #64).
     {
-        auto fn = build(
+        auto fn = build_loop(loops, unroll,
             [](a64::Assembler& a) {
                 a.mov(x0, Imm(0xDEADBEEFCAFEBABEULL));
                 a.mov(x10, Imm(0x1234567890ABCDEFULL));
@@ -1249,10 +919,12 @@ static void run_bfi_dependency_tests(const BenchmarkParams& base) {
                 a.bfm(x0, x10, Imm(0), Imm(63));
             });
         snprintf(name, sizeof(name), "BFI variant C (full-width, lsb=0/w=64)");
-        run_one(name, fn, make_lat_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
 void run_pitfall_tests(const BenchmarkParams& base_params) {
@@ -1264,9 +936,7 @@ void run_pitfall_tests(const BenchmarkParams& base_params) {
         fprintf(stderr, "run_pitfall_tests: failed to allocate buffer\n");
         return;
     }
-    // Touch all pages to commit them.
-    { uint8_t* p = static_cast<uint8_t*>(buf);
-      for (size_t off = 0; off < kBufSize; off += 4096) p[off] = 0; }
+    commit_pages(buf, kBufSize);
 
     run_store_forwarding_tests(base_params);
     run_barrier_tests(base_params);
