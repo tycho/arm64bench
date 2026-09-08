@@ -39,6 +39,7 @@
 #include "gen_pitfalls.h"
 #include "jit_buffer.h"
 #include "harness.h"
+#include "cpu_features.h"
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
 #include <cstdio>
@@ -54,9 +55,6 @@
 #  include <windows.h>
 #else
 #  include <sys/mman.h>
-#endif
-#if defined(__APPLE__)
-#  include <sys/sysctl.h>
 #endif
 
 namespace arm64bench::gen {
@@ -974,30 +972,10 @@ static void emit_stlur_x(a64::Assembler& a, const Gp& Rs, const Gp& Rn, int32_t 
     a.embed(&w, 4);
 }
 
-// ── Runtime feature detection ─────────────────────────────────────────────
-
-#if defined(__APPLE__)
-static bool has_feat_lrcpc() {
-    int val = 0; size_t len = sizeof(val);
-    return sysctlbyname("hw.optional.arm.FEAT_LRCPC",
-                        &val, &len, nullptr, 0) == 0 && val != 0;
-}
-static bool has_feat_lrcpc2() {
-    int val = 0; size_t len = sizeof(val);
-    return sysctlbyname("hw.optional.arm.FEAT_LRCPC2",
-                        &val, &len, nullptr, 0) == 0 && val != 0;
-}
-#else
-// Qualcomm Snapdragon X1 (Oryon) supports both FEAT_LRCPC and FEAT_LRCPC2.
-// If running on hardware that lacks these features, the JIT'd code will
-// raise EXCEPTION_ILLEGAL_INSTRUCTION / SIGILL on first execution.
-static bool has_feat_lrcpc()  { return true; }
-static bool has_feat_lrcpc2() { return true; }
-#endif
 
 static void run_lrcpc_tests(const BenchmarkParams& base) {
-    const bool lrcpc  = has_feat_lrcpc();
-    const bool lrcpc2 = has_feat_lrcpc2();
+    const bool lrcpc  = cpu_has(CpuFeature::LRCPC);
+    const bool lrcpc2 = cpu_has(CpuFeature::LRCPC2);
 
     if (!lrcpc && !lrcpc2) {
         printf("\n── LRCPC tests skipped (FEAT_LRCPC not detected) ────────────────\n");

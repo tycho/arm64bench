@@ -38,6 +38,7 @@ add_library(arm64bench_core STATIC
     src/timer.cpp
     src/harness.cpp
     src/cycle_counter.cpp
+    src/cpu_features.cpp
     src/jit_buffer.cpp
     src/calibrate.cpp
     src/gen_integer.cpp

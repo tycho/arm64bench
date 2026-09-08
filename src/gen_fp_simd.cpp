@@ -33,15 +33,10 @@
 #include "gen_fp_simd.h"
 #include "jit_buffer.h"
 #include "harness.h"
+#include "cpu_features.h"
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
 #include <cstdio>
-#if defined(__APPLE__)
-#  include <sys/sysctl.h>
-#elif defined(_WIN32)
-#  include <windows.h>
-#endif
-
 namespace arm64bench::gen {
 
 using namespace asmjit;
@@ -130,6 +125,11 @@ static void run_one(const char* name, JitPool::TestFn fn,
     if (!fn) return;
     benchmark(fn, name, params);
     g_jit_pool->release(fn);
+}
+
+static void skip_feature(CpuFeature f, const char* what) {
+    printf("  (%s not available on this CPU — skipping %s)\n",
+           cpu_feature_name(f), what);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1061,7 +1061,7 @@ static void run_crypto_tests(const BenchmarkParams& base,
 // ── FMLA 8×f16 (FP16 FMA) ────────────────────────────────────────────────
 //
 // FMLA Vd.8H, Vn.8H, Vm.8H — fp16 fused multiply-accumulate (8 lanes).
-// Requires __ARM_FEATURE_FP16_VECTOR_ARITHMETIC.
+// Requires FEAT_FP16 (checked at runtime).
 //
 // Apple M-series supports fp16 natively in the FP pipeline. If f16 and f32
 // FMA share the same units (same latency / same saturation count), then
@@ -1077,64 +1077,66 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
                                      uint64_t loops, uint32_t unroll) {
     char name[80];
 
-#if defined(__ARM_FEATURE_DOTPROD)
+    if (cpu_has(CpuFeature::DotProd)) {
 
-    // ── SDOT v4s latency ──────────────────────────────────────────────────
-    // SDOT V0.4S, V1.16B, V2.16B — V0 is the accumulator (chains).
-    // V1 and V2 are constant signed-byte data.
-    {
-        auto fn = build_fp_loop(loops, unroll,
-            [](a64::Assembler& a) {
-                a.movi(kVRegs[2].b16(), Imm(0x02));
-                a.movi(kVRegs[1].b16(), Imm(0x03));
-                a.movi(kVRegs[0].s4(),  Imm(0));
-            },
-            [](a64::Assembler& a, uint32_t) {
-                a.sdot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
-            });
-        snprintf(name, sizeof(name), "SDOT v4s latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
-    }
-
-    // ── SDOT v4s throughput: sweep 2..6 chains ────────────────────────────
-    {
-        static const uint32_t kChains[] = { 2, 3, 4, 6 };
-        for (uint32_t nc : kChains) {
-            const uint32_t au = (unroll / nc) * nc;
-            if (!au) continue;
-            const uint32_t va = nc, vb = nc + 1;
-            auto fn = build_fp_loop(loops, au,
-                [nc, va, vb](a64::Assembler& a) {
-                    a.movi(kVRegs[vb].b16(), Imm(0x02));
-                    a.movi(kVRegs[va].b16(), Imm(0x03));
-                    for (uint32_t i = 0; i < nc; ++i)
-                        a.movi(kVRegs[i].s4(), Imm(0));
+        // ── SDOT v4s latency ──────────────────────────────────────────────────
+        // SDOT V0.4S, V1.16B, V2.16B — V0 is the accumulator (chains).
+        // V1 and V2 are constant signed-byte data.
+        {
+            auto fn = build_fp_loop(loops, unroll,
+                [](a64::Assembler& a) {
+                    a.movi(kVRegs[2].b16(), Imm(0x02));
+                    a.movi(kVRegs[1].b16(), Imm(0x03));
+                    a.movi(kVRegs[0].s4(),  Imm(0));
                 },
-                [nc, va, vb](a64::Assembler& a, uint32_t u) {
-                    a.sdot(kVRegs[u % nc].s4(), kVRegs[va].b16(), kVRegs[vb].b16());
+                [](a64::Assembler& a, uint32_t) {
+                    a.sdot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
                 });
-            snprintf(name, sizeof(name),
-                     "SDOT v4s tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
+            snprintf(name, sizeof(name), "SDOT v4s latency      (%ux unroll)", unroll);
+            run_one(name, fn, make_params(base, loops, unroll));
         }
-    }
 
-    // ── UDOT v4s latency (unsigned) ───────────────────────────────────────
-    {
-        auto fn = build_fp_loop(loops, unroll,
-            [](a64::Assembler& a) {
-                a.movi(kVRegs[2].b16(), Imm(0x02));
-                a.movi(kVRegs[1].b16(), Imm(0x03));
-                a.movi(kVRegs[0].s4(),  Imm(0));
-            },
-            [](a64::Assembler& a, uint32_t) {
-                a.udot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
-            });
-        snprintf(name, sizeof(name), "UDOT v4s latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
-    }
+        // ── SDOT v4s throughput: sweep 2..6 chains ────────────────────────────
+        {
+            static const uint32_t kChains[] = { 2, 3, 4, 6 };
+            for (uint32_t nc : kChains) {
+                const uint32_t au = (unroll / nc) * nc;
+                if (!au) continue;
+                const uint32_t va = nc, vb = nc + 1;
+                auto fn = build_fp_loop(loops, au,
+                    [nc, va, vb](a64::Assembler& a) {
+                        a.movi(kVRegs[vb].b16(), Imm(0x02));
+                        a.movi(kVRegs[va].b16(), Imm(0x03));
+                        for (uint32_t i = 0; i < nc; ++i)
+                            a.movi(kVRegs[i].s4(), Imm(0));
+                    },
+                    [nc, va, vb](a64::Assembler& a, uint32_t u) {
+                        a.sdot(kVRegs[u % nc].s4(), kVRegs[va].b16(), kVRegs[vb].b16());
+                    });
+                snprintf(name, sizeof(name),
+                         "SDOT v4s tput (%u chains, %ux unroll)", nc, au);
+                run_one(name, fn, make_params(base, loops, au));
+            }
+        }
 
-#endif // __ARM_FEATURE_DOTPROD
+        // ── UDOT v4s latency (unsigned) ───────────────────────────────────────
+        {
+            auto fn = build_fp_loop(loops, unroll,
+                [](a64::Assembler& a) {
+                    a.movi(kVRegs[2].b16(), Imm(0x02));
+                    a.movi(kVRegs[1].b16(), Imm(0x03));
+                    a.movi(kVRegs[0].s4(),  Imm(0));
+                },
+                [](a64::Assembler& a, uint32_t) {
+                    a.udot(kVRegs[0].s4(), kVRegs[1].b16(), kVRegs[2].b16());
+                });
+            snprintf(name, sizeof(name), "UDOT v4s latency      (%ux unroll)", unroll);
+            run_one(name, fn, make_params(base, loops, unroll));
+        }
+
+    } else {
+        skip_feature(CpuFeature::DotProd, "SDOT/UDOT");
+    }
 
     // ── SMLAL v4s latency (int16×int16 → int32 widening accumulate) ───────
     // SMLAL V0.4S, V1.4H, V2.4H — V0 chains; V1, V2 constant (16-bit int)
@@ -1152,68 +1154,72 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
         run_one(name, fn, make_params(base, loops, unroll));
     }
 
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    if (cpu_has(CpuFeature::FP16)) {
 
-    // ── FMLA 8×f16 latency ────────────────────────────────────────────────
-    // FMLA V0.8H, V1.8H, V2.8H — fp16 FMA (8 lanes). V0 accumulator chains.
-    // Init all regs via MOVI with 0x3C, LSL #8 → 0x3C00 = fp16(1.0).
-    {
-        auto fn = build_fp_loop(loops, unroll,
-            [](a64::Assembler& a) {
-                a.movi(kVRegs[2].h8(), Imm(0x3C), Imm(8));  // fp16(1.0) in all lanes
-                a.movi(kVRegs[1].h8(), Imm(0x3C), Imm(8));
-                a.movi(kVRegs[0].h8(), Imm(0x3C), Imm(8));
-            },
-            [](a64::Assembler& a, uint32_t) {
-                a.fmla(kVRegs[0].h8(), kVRegs[1].h8(), kVRegs[2].h8());
-            });
-        snprintf(name, sizeof(name), "FMLA v8f16 acc-chain  (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
-    }
-
-    // ── FMLA 8×f16 throughput: 4 chains ──────────────────────────────────
-    {
-        const uint32_t nc = 4;
-        const uint32_t au = (unroll / nc) * nc;
-        if (au) {
-            auto fn = build_fp_loop(loops, au,
+        // ── FMLA 8×f16 latency ────────────────────────────────────────────────
+        // FMLA V0.8H, V1.8H, V2.8H — fp16 FMA (8 lanes). V0 accumulator chains.
+        // Init all regs via MOVI with 0x3C, LSL #8 → 0x3C00 = fp16(1.0).
+        {
+            auto fn = build_fp_loop(loops, unroll,
                 [](a64::Assembler& a) {
-                    a.movi(kVRegs[nc    ].h8(), Imm(0x3C), Imm(8));
-                    a.movi(kVRegs[nc + 1].h8(), Imm(0x3C), Imm(8));
-                    for (uint32_t i = 0; i < nc; ++i)
-                        a.movi(kVRegs[i].h8(), Imm(0x3C), Imm(8));
+                    a.movi(kVRegs[2].h8(), Imm(0x3C), Imm(8));  // fp16(1.0) in all lanes
+                    a.movi(kVRegs[1].h8(), Imm(0x3C), Imm(8));
+                    a.movi(kVRegs[0].h8(), Imm(0x3C), Imm(8));
                 },
-                [](a64::Assembler& a, uint32_t u) {
-                    a.fmla(kVRegs[u % nc].h8(), kVRegs[nc].h8(), kVRegs[nc + 1].h8());
+                [](a64::Assembler& a, uint32_t) {
+                    a.fmla(kVRegs[0].h8(), kVRegs[1].h8(), kVRegs[2].h8());
                 });
-            snprintf(name, sizeof(name),
-                     "FMLA v8f16 tput (%u chains, %ux unroll)", nc, au);
-            run_one(name, fn, make_params(base, loops, au));
+            snprintf(name, sizeof(name), "FMLA v8f16 acc-chain  (%ux unroll)", unroll);
+            run_one(name, fn, make_params(base, loops, unroll));
         }
+
+        // ── FMLA 8×f16 throughput: 4 chains ──────────────────────────────────
+        {
+            const uint32_t nc = 4;
+            const uint32_t au = (unroll / nc) * nc;
+            if (au) {
+                auto fn = build_fp_loop(loops, au,
+                    [](a64::Assembler& a) {
+                        a.movi(kVRegs[nc    ].h8(), Imm(0x3C), Imm(8));
+                        a.movi(kVRegs[nc + 1].h8(), Imm(0x3C), Imm(8));
+                        for (uint32_t i = 0; i < nc; ++i)
+                            a.movi(kVRegs[i].h8(), Imm(0x3C), Imm(8));
+                    },
+                    [](a64::Assembler& a, uint32_t u) {
+                        a.fmla(kVRegs[u % nc].h8(), kVRegs[nc].h8(), kVRegs[nc + 1].h8());
+                    });
+                snprintf(name, sizeof(name),
+                         "FMLA v8f16 tput (%u chains, %ux unroll)", nc, au);
+                run_one(name, fn, make_params(base, loops, au));
+            }
+        }
+
+    } else {
+        skip_feature(CpuFeature::FP16, "FMLA v8f16");
     }
 
-#endif // __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+    if (cpu_has(CpuFeature::FHM)) {
 
-#if defined(__ARM_FEATURE_FP16_FML)
+        // ── FMLAL v4s latency (f16×f16 → f32 widening accumulate) ────────────
+        // FMLAL V0.4S, V1.4H, V2.4H — V0.4S is the f32 accumulator (chains).
+        // V1 and V2 are fp16 inputs. Useful for mixed-precision ML inference.
+        {
+            auto fn = build_fp_loop(loops, unroll,
+                [](a64::Assembler& a) {
+                    a.movi(kVRegs[2].h4(), Imm(0x3C), Imm(8));  // fp16(1.0) in 4 lanes
+                    a.movi(kVRegs[1].h4(), Imm(0x3C), Imm(8));
+                    a.movi(kVRegs[0].s4(), Imm(0));              // f32(0.0) accumulator
+                },
+                [](a64::Assembler& a, uint32_t) {
+                    a.fmlal(kVRegs[0].s4(), kVRegs[1].h4(), kVRegs[2].h4());
+                });
+            snprintf(name, sizeof(name), "FMLAL v4s latency     (%ux unroll)", unroll);
+            run_one(name, fn, make_params(base, loops, unroll));
+        }
 
-    // ── FMLAL v4s latency (f16×f16 → f32 widening accumulate) ────────────
-    // FMLAL V0.4S, V1.4H, V2.4H — V0.4S is the f32 accumulator (chains).
-    // V1 and V2 are fp16 inputs. Useful for mixed-precision ML inference.
-    {
-        auto fn = build_fp_loop(loops, unroll,
-            [](a64::Assembler& a) {
-                a.movi(kVRegs[2].h4(), Imm(0x3C), Imm(8));  // fp16(1.0) in 4 lanes
-                a.movi(kVRegs[1].h4(), Imm(0x3C), Imm(8));
-                a.movi(kVRegs[0].s4(), Imm(0));              // f32(0.0) accumulator
-            },
-            [](a64::Assembler& a, uint32_t) {
-                a.fmlal(kVRegs[0].s4(), kVRegs[1].h4(), kVRegs[2].h4());
-            });
-        snprintf(name, sizeof(name), "FMLAL v4s latency     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+    } else {
+        skip_feature(CpuFeature::FHM, "FMLAL");
     }
-
-#endif // __ARM_FEATURE_FP16_FML
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1245,27 +1251,11 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
 // proxy is PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE (WinSDK 10.0.26100+): SVE-I8MM
 // implies plain I8MM. Used by FFmpeg, dav1d, and others for the same purpose.
 
-#if defined(__APPLE__)
-static bool has_feat_i8mm() {
-    int val = 0; size_t len = sizeof(val);
-    return sysctlbyname("hw.optional.arm.FEAT_I8MM", &val, &len, nullptr, 0) == 0 && val != 0;
-}
-#elif defined(_WIN32)
-static bool has_feat_i8mm() {
-#  ifdef PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE
-    return IsProcessorFeaturePresent(PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE) != 0;
-#  else
-    return true;  // Snapdragon X Elite / Oryon always has FEAT_I8MM
-#  endif
-}
-#else
-static bool has_feat_i8mm() { return true; }
-#endif
 
 static void run_i8mm_tests(const BenchmarkParams& base,
                             uint64_t loops, uint32_t unroll) {
-    if (!has_feat_i8mm()) {
-        printf("  (FEAT_I8MM not available on this CPU — skipping)\n");
+    if (!cpu_has(CpuFeature::I8MM)) {
+        skip_feature(CpuFeature::I8MM, "USDOT/SMMLA/UMMLA/USMMLA");
         return;
     }
 
