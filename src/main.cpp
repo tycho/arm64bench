@@ -24,6 +24,7 @@
 #include "gen_mlp.h"
 #include "gen_frontend.h"
 #include "gen_icache.h"
+#include "gen_prefetch.h"
 #include "gen_lse.h"
 
 static void print_usage(const char* prog) {
@@ -48,6 +49,7 @@ static void print_usage(const char* prog) {
     printf("  --mlp           Run memory-level parallelism (outstanding-miss) tests\n");
     printf("  --frontend      Run decode width / MOV elimination / zero idiom / fusion tests\n");
     printf("  --icache        Run I-cache size and iTLB reach sweeps\n");
+    printf("  --prefetch      Run hardware-prefetcher stride sweeps and PRFM lookahead tests\n");
     printf("\n");
 }
 
@@ -64,6 +66,7 @@ int main(int argc, char** argv) {
     bool run_mlp      = false;
     bool run_frontend = false;
     bool run_icache   = false;
+    bool run_prefetch = false;
     bool csv_mode     = false;
     bool smoke_mode   = false;
     const char* name_filter = nullptr;
@@ -87,7 +90,7 @@ int main(int argc, char** argv) {
         } else if (strcmp(arg, "--filter") == 0 && i + 1 < argc) {
             name_filter = argv[++i];
         } else if (strcmp(arg, "--all") == 0) {
-            run_integer = run_memory = run_branch = run_simd = run_lse = run_pitfalls = run_ooo = run_sve = run_mlp = run_frontend = run_icache = true;
+            run_integer = run_memory = run_branch = run_simd = run_lse = run_pitfalls = run_ooo = run_sve = run_mlp = run_frontend = run_icache = run_prefetch = true;
         } else if (strcmp(arg, "--integer")  == 0) { run_integer  = true; }
         else if   (strcmp(arg, "--memory")   == 0) { run_memory   = true; }
         else if   (strcmp(arg, "--branch")   == 0) { run_branch   = true; }
@@ -99,6 +102,7 @@ int main(int argc, char** argv) {
         else if   (strcmp(arg, "--mlp")      == 0) { run_mlp      = true; }
         else if   (strcmp(arg, "--frontend") == 0) { run_frontend = true; }
         else if   (strcmp(arg, "--icache")   == 0) { run_icache   = true; }
+        else if   (strcmp(arg, "--prefetch") == 0) { run_prefetch = true; }
         else if (strcmp(arg, "--MHz") == 0 && i + 1 < argc) {
             override_mhz = static_cast<uint64_t>(atoll(argv[++i]));
         } else if (strcmp(arg, "--samples") == 0 && i + 1 < argc) {
@@ -117,7 +121,7 @@ int main(int argc, char** argv) {
 #endif
 
     // Default: run integer and memory tests if nothing specified.
-    if (!run_integer && !run_memory && !run_branch && !run_simd && !run_lse && !run_pitfalls && !run_ooo && !run_sve && !run_mlp && !run_frontend && !run_icache)
+    if (!run_integer && !run_memory && !run_branch && !run_simd && !run_lse && !run_pitfalls && !run_ooo && !run_sve && !run_mlp && !run_frontend && !run_icache && !run_prefetch)
         run_integer = run_memory = true;
 
     // Run mode must be set before any loop count is derived: scale_loops()
@@ -256,6 +260,12 @@ int main(int argc, char** argv) {
     if (run_icache) {
         printf("── Instruction cache / iTLB tests ────────────────────────────\n");
         arm64bench::gen::run_icache_tests(default_params);
+        printf("\n");
+    }
+
+    if (run_prefetch) {
+        printf("── Prefetcher tests ──────────────────────────────────────────\n");
+        arm64bench::gen::run_prefetch_tests(default_params);
         printf("\n");
     }
 
