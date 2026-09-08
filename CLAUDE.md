@@ -30,7 +30,7 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 ## Run
 
 ```bash
-./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve]
+./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
              [--smoke] [--filter <substr>]
 ```
@@ -70,6 +70,7 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding) |
 | `src/gen_ooo.h/.cpp` | Out-of-order window sizing: ROB, int/FP register files, load/store queues (two-miss probe) |
 | `src/gen_sve.h/.cpp` | SVE/SVE2 tests: native with FEAT_SVE, else streaming mode via SME (Apple M4/M5) |
+| `src/gen_mlp.h/.cpp` | Memory-level parallelism: K interleaved pointer chases per cache level (outstanding-miss capacity) |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
 | `.github/workflows/ci.yml` | GitHub Actions: build + selftest + smoke on macOS/Linux/Windows arm64 runners |
 
@@ -319,6 +320,17 @@ This indicates M5 implements SMMLA as two sequential SDOT micro-ops internally. 
 micro-architectural benefit to using SMMLA over SDOT on Apple M5. Whether Snapdragon Oryon has
 dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) is an open question.
 
+### Pointer-chase stride and L1 set conflicts
+
+Every pointer-chase test uses a 256-byte node stride. A 128 KB 8-way L1D has 256 sets of 64 B;
+a 256 B stride touches only every fourth set, so the chase sees an L1 of 32 KB (8 ways × 64
+sets), and the line footprint is buffer/4. That is why the latency sweep in `gen_memory.cpp`
+shows the L1 "boundary" at a 256 KB buffer on a 128 KB cache. It is consistent and the L2/DRAM
+levels are unaffected, but treat buffer sizes below ~1 MB as "quarter-L1" numbers, and if a
+test needs the real L1 capacity use a 64 B or 128 B stride (with a random permutation the
+next-line prefetcher cannot follow it anyway). `gen_mlp.cpp` picks its footprints with this in
+mind (64 KB = L1-resident control, 2 MB = L2).
+
 ### Out-of-order window probe: lessons (gen_ooo.cpp)
 
 - **Every timed call must traverse the whole pointer ring.** A partial walk revisits the same
@@ -410,6 +422,7 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 | **SHA3 / SHA512** | `gen_crypto.cpp` | EOR3, BCAX, RAX1, XAR all 2 clk, saturate at 6 chains ≈0.33 clk (3 units); SHA512H/H2/SU0/SU1 all 2 clk |
 | **FEAT_BF16** | `gen_bf16.cpp` | BFDOT 3 clk, 1/clk (half the SDOT rate); BFMMLA 4.9 clk, 1 per 2 clk — same 8 MAC/clk either way, no matrix-form advantage (as with SMMLA); BFMLALB/T 4 clk, ~1.5/clk |
 | **JSCVT** | `gen_fp_simd.cpp §7` | SCVTF/FJCVTZS round trip 6.0 clk = same as SCVTF/FCVTZS (5.9); JavaScript ToInt32 semantics are free |
+| **Memory-level parallelism** | `gen_mlp.cpp` | Effective MLP (1-chain latency / saturated per-load time): 2 MB ≈ 6.7, 16 MB ≈ 11, DRAM ≈ 18 misses in flight (13 GB/s random lines, floor leaves at 22–24 chains); L1 dependent loads issue at 1/clk |
 | **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W 57 clk/store (!); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
 
 ## Planned Test Coverage
