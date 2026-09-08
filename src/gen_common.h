@@ -4,10 +4,8 @@
 // builder, benchmark-run helpers, throughput chain sweeps, section headers,
 // and page-granular memory helpers.
 //
-// Every generator used to carry its own copy of these. The copies drifted
-// (different stack frames, different unroll rounding, different handling of
-// a failed compile), so new sections should build on this header instead of
-// copying a neighbour.
+// New sections build on this header rather than carrying private copies:
+// copies drift (stack frames, unroll rounding, handling of a failed compile).
 //
 // ── Register conventions inside a build_loop() body ──────────────────────────
 //
@@ -81,17 +79,23 @@ void skip_feature(CpuFeature f, const char* what);
 //
 // setup(a64::Assembler&)            runs once before the loop.
 // body (a64::Assembler&, uint32_t)  is called `unroll` times with u = 0..unroll-1.
+// teardown(a64::Assembler&)         (build_loop_with_teardown only) runs once
+//                                   after the loop, before the frame is
+//                                   restored — e.g. SMSTOP to leave streaming
+//                                   SVE mode entered in setup.
 //
 // Returns nullptr (after printing to stderr) if AsmJit rejects the code.
 
 inline constexpr uint32_t kLoopFrameBytes = 48;
 
-inline constexpr auto no_setup = [](asmjit::a64::Assembler&) {};
+inline constexpr auto no_setup    = [](asmjit::a64::Assembler&) {};
+inline constexpr auto no_teardown = [](asmjit::a64::Assembler&) {};
 
-template<class FSetup, class FBody>
-JitPool::TestFn build_loop(uint64_t loops, uint32_t unroll,
-                           FSetup&& setup, FBody&& body,
-                           uint32_t scratch_bytes = 0)
+template<class FSetup, class FBody, class FTeardown>
+JitPool::TestFn build_loop_with_teardown(uint64_t loops, uint32_t unroll,
+                                         FSetup&& setup, FBody&& body,
+                                         FTeardown&& teardown,
+                                         uint32_t scratch_bytes = 0)
 {
     using namespace asmjit;
     using namespace asmjit::a64;
@@ -121,6 +125,8 @@ JitPool::TestFn build_loop(uint64_t loops, uint32_t unroll,
     a.sub(x19, x19, Imm(1));    // SUB, not SUBS: leaves NZCV alone
     a.cbnz(x19, top);
 
+    teardown(a);
+
     if (scratch) a.add(sp, sp, Imm(scratch));
     a.ldr(x30, ptr(sp, 32));
     a.ldp(x21, x22, ptr(sp, 16));
@@ -131,6 +137,17 @@ JitPool::TestFn build_loop(uint64_t loops, uint32_t unroll,
     JitPool::TestFn fn = g_jit_pool->compile(code);
     if (!fn) fprintf(stderr, "build_loop: JIT compile failed\n");
     return fn;
+}
+
+template<class FSetup, class FBody>
+JitPool::TestFn build_loop(uint64_t loops, uint32_t unroll,
+                           FSetup&& setup, FBody&& body,
+                           uint32_t scratch_bytes = 0)
+{
+    return build_loop_with_teardown(loops, unroll,
+                                    static_cast<FSetup&&>(setup),
+                                    static_cast<FBody&&>(body),
+                                    no_teardown, scratch_bytes);
 }
 
 // ── Throughput chain sweeps ───────────────────────────────────────────────────

@@ -50,6 +50,9 @@ constexpr uint64_t kHwcapASIMDFHM = 1ULL << 23;
 constexpr uint64_t kHwcap2I8MM    = 1ULL << 13;
 constexpr uint64_t kHwcap2BF16    = 1ULL << 14;
 constexpr uint64_t kHwcap2LRCPC3  = 1ULL << 46;
+constexpr uint64_t kHwcapSVE      = 1ULL << 22;
+constexpr uint64_t kHwcap2SVE2    = 1ULL << 1;
+constexpr uint64_t kHwcap2SME     = 1ULL << 23;
 
 // ── Windows PF_ARM_* flags (winnt.h) ────────────────────────────────────────
 // Defined locally so older SDKs still build; the values are ABI.
@@ -59,6 +62,8 @@ constexpr int kPfAtomic = 34;   // PF_ARM_V81_ATOMIC_INSTRUCTIONS_AVAILABLE
 constexpr int kPfDotProd= 43;   // PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
 constexpr int kPfJscvt  = 44;   // PF_ARM_V83_JSCVT_INSTRUCTIONS_AVAILABLE
 constexpr int kPfLrcpc  = 45;   // PF_ARM_V83_LRCPC_INSTRUCTIONS_AVAILABLE
+constexpr int kPfSve    = 46;   // PF_ARM_SVE_INSTRUCTIONS_AVAILABLE
+constexpr int kPfSve2   = 47;   // PF_ARM_SVE2_INSTRUCTIONS_AVAILABLE
 // No direct I8MM flag exists; SVE-I8MM implies I8MM (used by FFmpeg/dav1d).
 #if defined(PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE)
 constexpr int kPfI8mm   = PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE;
@@ -93,6 +98,9 @@ constexpr FeatureInfo kFeatures[] = {
     { "FEAT_LRCPC",   "FEAT_LRCPC",   kHwcapLRCPC,    0,             kPfLrcpc,   true  },
     { "FEAT_LRCPC2",  "FEAT_LRCPC2",  kHwcapILRCPC,   0,             kPfNone,    true  },
     { "FEAT_LRCPC3",  "FEAT_LRCPC3",  0,              kHwcap2LRCPC3, kPfNone,    false },
+    { "FEAT_SVE",     "FEAT_SVE",     kHwcapSVE,      0,             kPfSve,     false },
+    { "FEAT_SVE2",    "FEAT_SVE2",    0,              kHwcap2SVE2,   kPfSve2,    false },
+    { "FEAT_SME",     "FEAT_SME",     0,              kHwcap2SME,    kPfNone,    false },
 };
 static_assert(sizeof(kFeatures) / sizeof(kFeatures[0]) ==
               static_cast<size_t>(CpuFeature::Count_),

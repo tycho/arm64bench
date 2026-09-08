@@ -38,6 +38,9 @@ enum class CpuFeature : uint8_t {
     LRCPC,      // FEAT_LRCPC  — LDAPR
     LRCPC2,     // FEAT_LRCPC2 — LDAPUR/STLUR
     LRCPC3,     // FEAT_LRCPC3 — LDIAPP/STILP
+    SVE,        // FEAT_SVE    — scalable vectors (non-streaming)
+    SVE2,       // FEAT_SVE2
+    SME,        // FEAT_SME    — streaming SVE mode + ZA (Apple M4+, Cortex-X/A 2023+)
 
     Count_
 };
