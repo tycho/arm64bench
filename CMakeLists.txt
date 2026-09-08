@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.25)
+
 project(arm64bench LANGUAGES CXX)
 
 # ── Toolchain requirements ─────────────────────────────────────────────────────
