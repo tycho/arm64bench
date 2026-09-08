@@ -63,8 +63,9 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_memory.h/.cpp` | Cache/memory hierarchy tests |
 | `src/gen_branch.h/.cpp` | Branch prediction tests |
 | `src/gen_fp_simd.h/.cpp` | FP, NEON SIMD, cross-domain, DotProd/FP16, POPCNT-idiom tests |
-| `src/gen_crypto.h/.cpp` | AES/SHA-256/PMULL/CRC32 tests (run by `--simd`) |
+| `src/gen_crypto.h/.cpp` | AES/SHA-256/PMULL/CRC32, SHA3 (EOR3/BCAX/RAX1/XAR), SHA512 tests (run by `--simd`) |
 | `src/gen_i8mm.h/.cpp` | FEAT_I8MM USDOT/SMMLA/UMMLA/USMMLA tests (run by `--simd`) |
+| `src/gen_bf16.h/.cpp` | FEAT_BF16 BFDOT/BFMMLA/BFMLALB/BFMLALT tests (run by `--simd`) |
 | `src/gen_lse.h/.cpp` | LSE atomics latency/throughput tests |
 | `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding) |
 | `src/gen_ooo.h/.cpp` | Out-of-order window sizing: ROB, int/FP register files, load/store queues (two-miss probe) |
@@ -362,6 +363,13 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 - `a.embed(&word, 4)` to hand-encode instructions not exposed in AsmJit's C++ API
   (used for LDAPR, LDAPUR, STLUR in `gen_pitfalls.cpp`)
 - `a.ldr(xzr, ptr(xN))` encodes (LDR to XZR: load and discard, no register written)
+- `a.fmov(sN, 0.0)` is NOT encodable (FMOV immediate has no zero); use `movi(vs4(N), Imm(0))`.
+  AsmJit rejects it, and before the JIT pool had an error handler the instruction vanished silently.
+- NEON XAR was mis-encoded in upstream asmjit since 2022 (RAX1's opcode bits); fixed in the fork.
+  SHA3: `eor3/bcax(vd, vn, vm, va)` all `.b16()`, `rax1(vd.d2(), vn.d2(), vm.d2())`,
+  `xar(vd.d2(), vn.d2(), vm.d2(), Imm(rot))`; SHA512: `sha512h(vd.q(), vn.q(), vm.d2())`,
+  `sha512su0(vd.d2(), vn.d2())`; BF16: `bfdot/bfmmla/bfmlalb(vd.s4(), vn.h8(), vm.h8())`,
+  bf16(0.5) = `movi(v.h8(), Imm(0x3F), Imm(8))`; `fjcvtzs(w0, d0)`.
 - SVE (fork): `z0.s()`/`.b()/.h()/.d()` element views; `p0.m()`/`p0.z()` governing predicates,
   `p0.s()` for PTRUE/WHILELT; `fmla(z0.s(), p0.m(), z1.s(), z2.s())`; `dup(z0.s(), w9)` broadcast
   from GPR, `dup(z0.s(), z0.s(0))` lane broadcast; `faddv(s0, p0, z0.s())`; `ld1w(z0.s(), p0.z(),
@@ -399,13 +407,15 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 | **LRCPC (LDAPR/LDAPUR)** | `gen_pitfalls.cpp §6` | LDAPR≈LDAR≈LDR=3 clk; store forwarding unchanged (~4.9 clk all variants) |
 | **BFI dest-dep stress** | `gen_pitfalls.cpp §7` | All three Mihocka variants (independent / overlapping rotation / full-width) report ~1 clk on M5 — no dep-breaking shortcut |
 | **OOO window** | `gen_ooo.cpp` | Two-miss probe: int PRF ≈ 386–418, FP PRF ≈ 834–898, load queue ≈ 482–515, store queue ≈ 138–146; NOP fill shows no limit to 2048 (NOPs are not allocated, or ROB > 2050). Sharp 1×→2× steps. ~2.5 min run |
+| **SHA3 / SHA512** | `gen_crypto.cpp` | EOR3, BCAX, RAX1, XAR all 2 clk, saturate at 6 chains ≈0.33 clk (3 units); SHA512H/H2/SU0/SU1 all 2 clk |
+| **FEAT_BF16** | `gen_bf16.cpp` | BFDOT 3 clk, 1/clk (half the SDOT rate); BFMMLA 4.9 clk, 1 per 2 clk — same 8 MAC/clk either way, no matrix-form advantage (as with SMMLA); BFMLALB/T 4 clk, ~1.5/clk |
+| **JSCVT** | `gen_fp_simd.cpp §7` | SCVTF/FJCVTZS round trip 6.0 clk = same as SCVTF/FCVTZS (5.9); JavaScript ToInt32 semantics are free |
 | **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W 57 clk/store (!); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
 
 ## Planned Test Coverage
 
 | Category | Tests | Notes |
 |---|---|---|
-| **UDIV throughput** | Independent UDIV chains | Latency known (~10 clk); throughput (units) unknown |
 | **Prefetcher** | Stride sweep, descending scan, PRFM effectiveness | How far ahead does the hardware prefetcher reach? |
 | **OOO window, more fillers** | Branch-order buffer, flag PRF, ROB via non-NOP filler | `gen_ooo.cpp` has the machinery; needs a filler with no PRF/queue footprint that Apple does not eliminate |
 | **FEAT_LRCPC3** | LDIAPP / STILP pair instructions | Not present on any current Apple Silicon (M1–M5); available check via `hw.optional.arm.FEAT_LRCPC3` |
@@ -421,6 +431,7 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 | FEAT_LRCPC | `hw.optional.arm.FEAT_LRCPC` | assume true (Oryon) |
 | FEAT_LRCPC2 | `hw.optional.arm.FEAT_LRCPC2` | assume true (Oryon) |
 | FEAT_LRCPC3 | `hw.optional.arm.FEAT_LRCPC3` | unknown |
+| FEAT_SHA3 / SHA512 / BF16 / JSCVT | `hw.optional.arm.FEAT_SHA3` etc. | no PF_ flag; assumed present (Oryon, N2 have them) |
 | FEAT_SVE / SVE2 | `hw.optional.arm.FEAT_SVE` (absent on Apple) | `PF_ARM_SVE_INSTRUCTIONS_AVAILABLE` (46) / `PF_ARM_SVE2_…` (47) |
 | FEAT_SME | `hw.optional.arm.FEAT_SME` (M4+) | no PF_ flag; assumed absent |
 | AES/Crypto | universal on all targets | assume true |
