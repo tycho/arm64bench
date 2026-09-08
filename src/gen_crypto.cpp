@@ -209,11 +209,119 @@ static void run_crypto_section(const BenchmarkParams& base,
     }
 }
 
+// ── FEAT_SHA3: EOR3 / RAX1 / XAR / BCAX ──────────────────────────────────────
+//
+// The SHA-3 (Keccak) helpers are general-purpose bit operations in disguise:
+// EOR3 is a three-input XOR, BCAX is Vn ^ (Vm & ~Va), RAX1 is Vn ^ ROL(Vm, 1)
+// per 64-bit lane, XAR is ROR(Vn ^ Vm, #imm) per lane. Compilers use EOR3
+// and BCAX for any code that XORs three things, so their latency and port
+// count matter well beyond Keccak.
+
+static void run_sha3_section(const BenchmarkParams& base,
+                             uint64_t loops, uint32_t unroll) {
+    if (!cpu_has(CpuFeature::SHA3)) {
+        skip_feature(CpuFeature::SHA3, "EOR3/BCAX/RAX1");
+        return;
+    }
+
+    char name[80];
+
+    auto seed = [](a64::Assembler& a, uint32_t nc) {
+        // Chains in vr(0..nc-1); constants in vr(nc), vr(nc+1).
+        a.movi(vr(nc    ).b16(), Imm(0x5A));
+        a.movi(vr(nc + 1).b16(), Imm(0xC3));
+        for (uint32_t i = 0; i < nc; ++i)
+            a.movi(vr(i).b16(), Imm(static_cast<uint64_t>(i + 1)));
+    };
+
+    struct Op {
+        const char* label;
+        void (*emit)(a64::Assembler&, uint32_t d, uint32_t c0, uint32_t c1);
+    };
+    const Op ops[] = {
+        { "EOR3 v16b", [](a64::Assembler& a, uint32_t d, uint32_t c0, uint32_t c1) {
+              a.eor3(vr(d).b16(), vr(d).b16(), vr(c0).b16(), vr(c1).b16()); } },
+        { "BCAX v16b", [](a64::Assembler& a, uint32_t d, uint32_t c0, uint32_t c1) {
+              a.bcax(vr(d).b16(), vr(d).b16(), vr(c0).b16(), vr(c1).b16()); } },
+        { "RAX1 v2d ", [](a64::Assembler& a, uint32_t d, uint32_t c0, uint32_t) {
+              a.rax1(vr(d).d2(), vr(d).d2(), vr(c0).d2()); } },
+        // XAR is not tested: the pinned asmjit encodes it in the RAX1 opcode
+        // group (0xCE60xxxx instead of 0xCE80xxxx) and the CPU faults. Add it
+        // back once asmjit's xar() emits 0xCE813400 for xar v0.2d,v0.2d,v1.2d,#13.
+    };
+
+    for (const Op& op : ops) {
+        auto emit = op.emit;
+        {
+            auto fn = build_loop(loops, unroll,
+                [seed](a64::Assembler& a) { seed(a, 1); },
+                [emit](a64::Assembler& a, uint32_t) { emit(a, 0, 1, 2); });
+            snprintf(name, sizeof(name), "%s latency      (%ux unroll)", op.label, unroll);
+            run_one(name, fn, params_for(base, loops, unroll));
+        }
+        snprintf(name, sizeof(name), "%s tput", op.label);
+        chain_sweep(base, loops, unroll, name, { 2, 3, 4, 6 },
+            [seed](a64::Assembler& a, uint32_t nc) { seed(a, nc); },
+            [emit](a64::Assembler& a, uint32_t nc, uint32_t u) { emit(a, u % nc, nc, nc + 1); });
+    }
+}
+
+// ── FEAT_SHA512 ──────────────────────────────────────────────────────────────
+//
+// SHA512H  Qd, Qn, Vm.2D   — hash update, Qd accumulates (chains)
+// SHA512SU0 Vd.2D, Vn.2D   — message schedule part 1, Vd accumulates
+// SHA512SU1 Vd.2D, Vn.2D, Vm.2D — message schedule part 2, Vd accumulates
+
+static void run_sha512_section(const BenchmarkParams& base,
+                               uint64_t loops, uint32_t unroll) {
+    if (!cpu_has(CpuFeature::SHA512)) {
+        skip_feature(CpuFeature::SHA512, "SHA512H/SHA512SU0/SHA512SU1");
+        return;
+    }
+
+    char name[80];
+    auto seed = [](a64::Assembler& a) {
+        a.movi(vr(0).b16(), Imm(0x11));
+        a.movi(vr(1).b16(), Imm(0x22));
+        a.movi(vr(2).b16(), Imm(0x33));
+    };
+
+    {
+        auto fn = build_loop(loops, unroll, seed,
+            [](a64::Assembler& a, uint32_t) { a.sha512h(vr(0).q(), vr(1).q(), vr(2).d2()); });
+        snprintf(name, sizeof(name), "SHA512H latency       (%ux unroll)", unroll);
+        run_one(name, fn, params_for(base, loops, unroll));
+    }
+    {
+        auto fn = build_loop(loops, unroll, seed,
+            [](a64::Assembler& a, uint32_t) { a.sha512h2(vr(0).q(), vr(1).q(), vr(2).d2()); });
+        snprintf(name, sizeof(name), "SHA512H2 latency      (%ux unroll)", unroll);
+        run_one(name, fn, params_for(base, loops, unroll));
+    }
+    {
+        auto fn = build_loop(loops, unroll, seed,
+            [](a64::Assembler& a, uint32_t) { a.sha512su0(vr(0).d2(), vr(1).d2()); });
+        snprintf(name, sizeof(name), "SHA512SU0 latency     (%ux unroll)", unroll);
+        run_one(name, fn, params_for(base, loops, unroll));
+    }
+    {
+        auto fn = build_loop(loops, unroll, seed,
+            [](a64::Assembler& a, uint32_t) { a.sha512su1(vr(0).d2(), vr(1).d2(), vr(2).d2()); });
+        snprintf(name, sizeof(name), "SHA512SU1 latency     (%ux unroll)", unroll);
+        run_one(name, fn, params_for(base, loops, unroll));
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 void run_crypto_tests(const BenchmarkParams& base_params) {
-    run_crypto_section(base_params, base_params.loops,
-                       base_params.instructions_per_loop);
+    const uint64_t loops  = base_params.loops;
+    const uint32_t unroll = base_params.instructions_per_loop;
+    run_crypto_section(base_params, loops, unroll);
+    section("FEAT_SHA3 (EOR3 / BCAX / RAX1)");
+    run_sha3_section(base_params, loops, unroll);
+    section("FEAT_SHA512");
+    run_sha512_section(base_params, loops, unroll);
 }
 
 } // namespace arm64bench::gen

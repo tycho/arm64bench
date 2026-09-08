@@ -45,6 +45,7 @@ constexpr uint64_t kHwcapJSCVT    = 1ULL << 13;
 constexpr uint64_t kHwcapLRCPC    = 1ULL << 15;
 constexpr uint64_t kHwcapILRCPC   = 1ULL << 16;
 constexpr uint64_t kHwcapSHA3     = 1ULL << 17;
+constexpr uint64_t kHwcapSHA512   = 1ULL << 21;
 constexpr uint64_t kHwcapASIMDDP  = 1ULL << 20;
 constexpr uint64_t kHwcapASIMDFHM = 1ULL << 23;
 constexpr uint64_t kHwcap2I8MM    = 1ULL << 13;
@@ -87,6 +88,7 @@ constexpr FeatureInfo kFeatures[] = {
     { "FEAT_PMULL",   "FEAT_PMULL",   kHwcapPMULL,    0,             kPfCrypto,  true  },
     { "FEAT_SHA256",  "FEAT_SHA256",  kHwcapSHA2,     0,             kPfCrypto,  true  },
     { "FEAT_SHA3",    "FEAT_SHA3",    kHwcapSHA3,     0,             kPfNone,    true  },
+    { "FEAT_SHA512",  "FEAT_SHA512",  kHwcapSHA512,   0,             kPfNone,    true  },
     { "FEAT_CRC32",   "FEAT_CRC32",   kHwcapCRC32,    0,             kPfCrc32,   true  },
     { "FEAT_LSE",     "FEAT_LSE",     kHwcapATOMICS,  0,             kPfAtomic,  true  },
     { "FEAT_DotProd", "FEAT_DotProd", kHwcapASIMDDP,  0,             kPfDotProd, true  },

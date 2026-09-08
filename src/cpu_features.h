@@ -27,6 +27,7 @@ enum class CpuFeature : uint8_t {
     PMULL,      // FEAT_PMULL  — PMULL/PMULL2 on poly64
     SHA256,     // FEAT_SHA256 — SHA256H/SHA256SU0/...
     SHA3,       // FEAT_SHA3   — EOR3/RAX1/XAR/BCAX
+    SHA512,     // FEAT_SHA512 — SHA512H/SHA512H2/SHA512SU0/SHA512SU1
     CRC32,      // FEAT_CRC32
     LSE,        // FEAT_LSE    — LDADD/SWP/CAS...
     DotProd,    // FEAT_DotProd — SDOT/UDOT
