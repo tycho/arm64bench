@@ -18,27 +18,13 @@
 //     1. The instruction's pipeline depth (latency in cycles).
 //     2. How many execution units handle it (1/throughput_clk_per_insn).
 //
-// LOOP STRUCTURE (generated machine code)
-//   sub  sp, sp, #16
-//   stp  x19, x20, [sp]       // save callee-saved regs (x19=counter, x20=const)
-//   mov  x19, #loops          // loop iteration count
-//   mov  x20, #source_val     // constant operand (never modified by test)
-//   mov  x0..xN, #init_vals   // seed test registers
-//   align 64                  // align loop to cache line (consistent fetch)
-// loop_top:
-//   <test body, unroll times>
-//   sub  x19, x19, #1
-//   cbnz x19, loop_top        // SUB+CBNZ avoids writing NZCV (no flag deps)
-//   ldp  x19, x20, [sp]
-//   add  sp, sp, #16
-//   ret
-//
-// WHY SUB + CBNZ (not SUBS + B.NE)?
-//   SUBS writes the NZCV condition flags register. If the test body under
-//   measurement also reads or writes NZCV (e.g. ADDS, SUBS, CMP), the
-//   loop counter decrement would create a false dependency. SUB + CBNZ
-//   is strictly cleaner: SUB never writes NZCV, and CBNZ reads the
-//   register directly without touching NZCV at all.
+// LOOP STRUCTURE
+//   The stack frame, the loop counter, the 64-byte loop alignment and the
+//   SUB + CBNZ loop control all come from gen::build_loop() in gen_common.h.
+//   The detail that matters for this file: the counter decrement is SUB and
+//   not SUBS, so it never writes NZCV. The flag-consuming tests here
+//   (ADDS + CSEL, CMP + CCMP) would otherwise pick up a false dependency on
+//   the loop counter.
 //
 // SLOW INSTRUCTION LOOP SCALING
 //   Instructions like SDIV/UDIV have latencies of ~10–25 cycles, making
@@ -47,8 +33,7 @@
 //   proportionally so samples stay in the ~100ms range.
 
 #include "gen_integer.h"
-#include "jit_buffer.h"
-#include "harness.h"
+#include "gen_common.h"
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
 #include <cstdio>
@@ -58,28 +43,6 @@ namespace arm64bench::gen {
 
 using namespace asmjit;
 using namespace asmjit::a64;
-
-// ── Register helpers ──────────────────────────────────────────────────────────
-//
-// AsmJit's newer a64 API collapses GpX/GpW into a single Gp type whose width
-// is encoded in the register object itself (from the predefined constants).
-// We use static lookup tables of those predefined constants so we never need
-// to know the internal Gp constructor signature.
-//
-// Registers 0–15 are safe to use as scratch; x19 and x20 are reserved by
-// build_loop for the loop counter and constant source respectively.
-
-static const a64::Gp kXRegs[] = {
-    x0,  x1,  x2,  x3,  x4,  x5,  x6,  x7,
-    x8,  x9,  x10, x11, x12, x13, x14, x15,
-};
-static const a64::Gp kWRegs[] = {
-    w0,  w1,  w2,  w3,  w4,  w5,  w6,  w7,
-    w8,  w9,  w10, w11, w12, w13, w14, w15,
-};
-
-static inline const a64::Gp& xr(uint32_t i) { return kXRegs[i]; }
-[[maybe_unused]] static inline const a64::Gp& wr(uint32_t i) { return kWRegs[i]; }
 
 // ── Loop configuration ────────────────────────────────────────────────────────
 
@@ -94,12 +57,15 @@ struct LoopConfig {
     uint32_t num_init_regs;
 };
 
+// The constant every test loads into x20 unless it asks for another one.
+inline constexpr uint64_t kDefaultSourceVal = 0x12345678ULL;
+
 // Sensible defaults: non-zero registers, a useful constant in x20.
 static LoopConfig default_cfg(uint64_t loops, uint32_t unroll) {
     LoopConfig cfg{};
     cfg.loops        = loops;
     cfg.unroll       = unroll;
-    cfg.source_val   = 0x12345678ULL;   // non-zero constant for x20
+    cfg.source_val   = kDefaultSourceVal;   // non-zero constant for x20
     cfg.num_init_regs = 8;
     for (uint32_t i = 0; i < 8; ++i)
         cfg.init_vals[i] = static_cast<uint64_t>(i + 1); // 1..8
@@ -107,6 +73,10 @@ static LoopConfig default_cfg(uint64_t loops, uint32_t unroll) {
 }
 
 // ── Core loop builder ─────────────────────────────────────────────────────────
+//
+// A LoopConfig is a register-seeding recipe and nothing more: gen::build_loop()
+// supplies the frame, the counter and the loop control, and this wrapper turns
+// the config into the `setup` pass that runs once before the loop.
 //
 // emit_body(assembler, unroll_iter) is called `cfg.unroll` times, with
 // unroll_iter in [0, cfg.unroll). It should emit exactly one instruction
@@ -116,56 +86,31 @@ static LoopConfig default_cfg(uint64_t loops, uint32_t unroll) {
 //   x0–x15  : scratch (caller-saved per ABI; we never save/restore them)
 //   x19     : loop counter — DO NOT TOUCH
 //   x20     : constant source (cfg.source_val) — treat as read-only
-//   x21–x28 : callee-saved, not touched by build_loop, available if
-//             the generator saves them itself (currently unused)
+//   x21–x22 : saved and restored by gen::build_loop; free, currently unused
+//   x30     : saved and restored by gen::build_loop; bodies may BL
 
 template<typename F>
 static JitPool::TestFn build_loop(const LoopConfig& cfg, F&& emit_body) {
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
+    return gen::build_loop(cfg.loops, cfg.unroll,
+        [&cfg](a64::Assembler& a) {
+            a.mov(x20, Imm(cfg.source_val));
 
-    // ── Prologue ─────────────────────────────────────────────────────────
-    // Allocate 16 bytes and save x19 (loop counter) and x20 (constant source).
-    // Stack must remain 16-byte aligned at all times on ARM64.
-    a.sub(sp, sp, Imm(16));
-    a.stp(x19, x20, ptr(sp));
+            // Seed test registers. Using mov into individual xN is cleaner
+            // than trying to vectorise the init; this code runs once.
+            for (uint32_t i = 0; i < cfg.num_init_regs && i < 16; ++i)
+                a.mov(xr(i), Imm(cfg.init_vals[i]));
+        },
+        static_cast<F&&>(emit_body));
+}
 
-    // Load loop control and constant-source values.
-    a.mov(x19, Imm(cfg.loops));
-    a.mov(x20, Imm(cfg.source_val));
-
-    // Seed test registers. Using mov into individual xN is cleaner than
-    // trying to vectorise the init; this code runs once at startup.
-    for (uint32_t i = 0; i < cfg.num_init_regs && i < 16; ++i)
-        a.mov(xr(i), Imm(cfg.init_vals[i]));
-
-    // ── Loop top — aligned to a 64-byte cache line ────────────────────────
-    // Alignment prevents the loop from spanning two fetch groups (cache
-    // lines). An unaligned loop can show artificially inflated or variable
-    // fetch/decode latency that masks the instruction latency we're measuring.
-    a.align(AlignMode::kCode, 64);
-
-    Label loop_top = a.new_label();
-    a.bind(loop_top);
-
-    // ── Test body (unrolled) ──────────────────────────────────────────────
-    for (uint32_t u = 0; u < cfg.unroll; ++u)
-        emit_body(a, u);
-
-    // ── Loop control ──────────────────────────────────────────────────────
-    a.sub(x19, x19, Imm(1));   // decrement (does NOT write NZCV)
-    a.cbnz(x19, loop_top);     // branch if counter != 0
-
-    // ── Epilogue ──────────────────────────────────────────────────────────
-    a.ldp(x19, x20, ptr(sp));
-    a.add(sp, sp, Imm(16));
-    a.ret(x30);
-
-    JitPool::TestFn fn = g_jit_pool->compile(code);
-    if (!fn)
-        fprintf(stderr, "build_loop: AsmJit compile failed\n");
-    return fn;
+// The LoopConfig equivalent for a chain_sweep(): the default constant in x20,
+// and the nc chain registers seeded 1..nc so no chain starts at zero. Sweeps
+// that need other seeds spell them out in their own setup lambda.
+static void seed_chains(a64::Assembler& a, uint32_t nc,
+                        uint64_t source_val = kDefaultSourceVal) {
+    a.mov(x20, Imm(source_val));
+    for (uint32_t i = 0; i < nc; ++i)
+        a.mov(xr(i), Imm(static_cast<uint64_t>(i + 1)));
 }
 
 // ── Reference function for Tier 2 ratio normalization ────────────────────────
@@ -179,27 +124,6 @@ TestFn create_add_latency_ref(uint64_t loops, uint32_t unroll) {
     return build_loop(cfg, [](a64::Assembler& a, uint32_t) {
         a.add(x0, x0, x20);   // x0 ← x0 + x20 (chained on x0; x20 is constant)
     });
-}
-
-// ── Benchmark helpers ─────────────────────────────────────────────────────────
-
-// Build a BenchmarkParams for a function that runs (loops) outer iterations
-// with (unroll) instructions per iteration.
-static BenchmarkParams make_params(const BenchmarkParams& base,
-                                   uint64_t loops, uint32_t unroll) {
-    BenchmarkParams p         = base;
-    p.loops                   = loops;
-    p.instructions_per_loop   = unroll;
-    return p;
-}
-
-// Compile, benchmark once, and immediately release the JIT function.
-// Releasing promptly keeps memory pressure low during long runs.
-static void run_one(const char* name, JitPool::TestFn fn,
-                    const BenchmarkParams& params) {
-    if (!fn) return;
-    benchmark(fn, name, params);
-    g_jit_pool->release(fn);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -229,7 +153,7 @@ static void run_add_tests(const BenchmarkParams& base,
             a.add(x0, x0, x1);   // x0 = x0 + x1 (chained on x0)
         });
         snprintf(name, sizeof(name), "ADD x64 latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── ADD x64 throughput: sweep chain count ─────────────────────────────
@@ -256,28 +180,11 @@ static void run_add_tests(const BenchmarkParams& base,
     // register file must supply x20 as a read operand on every instruction,
     // which is a read-bandwidth stress. On most implementations the register
     // file has enough read ports for this not to be the bottleneck.
-    {
-        static const uint32_t kChainCounts[] = { 2, 3, 4, 6, 8, 10, 12, 16 };
-        for (uint32_t nc : kChainCounts) {
-            // Round unroll down to nearest multiple of nc, minimum nc itself
-            // (at least 1 instruction per chain per iteration).
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            // Initialise all nc chain registers (default_cfg only inits 8).
-            cfg.num_init_regs = nc;
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = static_cast<uint64_t>(i + 1); // 1..nc
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
-                a.add(xr(u % nc), xr(u % nc), x20);
-            });
-            snprintf(name, sizeof(name),
-                     "ADD x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
-    }
+    chain_sweep(base, loops, unroll, "ADD x64 tput", kWideChains,
+        [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.add(xr(u % nc), xr(u % nc), x20);
+        });
 
     // ── ADD x64 imm throughput: sweep chain count ────────────────────────
     // Same sweep as the register-form test above, but uses ADD xN, xN, #1
@@ -304,25 +211,11 @@ static void run_add_tests(const BenchmarkParams& base,
     // same micro-op class on all known ARM64 implementations. The latency
     // test below confirms this; any latency difference there would invalidate
     // using imm-form as an ALU port probe.
-    {
-        static const uint32_t kImmChainCounts[] = { 2, 3, 4, 6, 8, 10, 12, 16 };
-        for (uint32_t nc : kImmChainCounts) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc;
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
-                a.add(xr(u % nc), xr(u % nc), Imm(1));
-            });
-            snprintf(name, sizeof(name),
-                     "ADD x64 imm tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
-    }
+    chain_sweep(base, loops, unroll, "ADD x64 imm tput", kWideChains,
+        [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.add(xr(u % nc), xr(u % nc), Imm(1));
+        });
 
     // ── ADD x64 self-form throughput: sweep chain count ─────────────────
     // ADD xN, xN, xN — Rd=Rn=Rm. Each instruction left-shifts xN by 1
@@ -350,26 +243,12 @@ static void run_add_tests(const BenchmarkParams& base,
     // This disambiguates whether the imm-form sweep is truly representative
     // of "clean" single-source throughput, or whether the instruction
     // encoding itself matters.
-    {
-        static const uint32_t kSelfChainCounts[] = { 2, 3, 4, 6, 8, 10, 12, 16 };
-        for (uint32_t nc : kSelfChainCounts) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc;
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
-                const auto& r = xr(u % nc);
-                a.add(r, r, r);    // xN = xN + xN  (Rd = Rn = Rm)
-            });
-            snprintf(name, sizeof(name),
-                     "ADD x64 self tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
-    }
+    chain_sweep(base, loops, unroll, "ADD x64 self tput", kWideChains,
+        [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            const auto& r = xr(u % nc);
+            a.add(r, r, r);    // xN = xN + xN  (Rd = Rn = Rm)
+        });
 
     // ── ADD w32 latency ───────────────────────────────────────────────────
     // On virtually all ARM64 cores, 32-bit ADD uses the same execution unit
@@ -382,7 +261,7 @@ static void run_add_tests(const BenchmarkParams& base,
             a.add(w0, w0, w1);   // 32-bit form
         });
         snprintf(name, sizeof(name), "ADD w32 latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── ADD x64 imm latency ───────────────────────────────────────────────
@@ -397,7 +276,7 @@ static void run_add_tests(const BenchmarkParams& base,
             a.add(x0, x0, Imm(1));
         });
         snprintf(name, sizeof(name), "ADD x64 imm latency  (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
@@ -476,21 +355,20 @@ static void run_sub_logical_tests(const BenchmarkParams& base,
             });
             snprintf(name, sizeof(name), "%s latency        (%ux unroll)",
                      op.label, unroll);
-            run_one(name, fn, make_params(base, loops, unroll));
+            run_one(name, fn, params_for(base, loops, unroll));
         }
 
         // Throughput (4 chains)
         {
-            constexpr uint32_t kTputChains = 4;
-            if (kTputChains > unroll) continue;
+            static const uint32_t kTputChains[] = { 4 };
+            if (kTputChains[0] > unroll) continue;
             auto emit_tput = op.emit_tput;
-            auto cfg = default_cfg(loops, unroll);
-            auto fn  = build_loop(cfg, [emit_tput](a64::Assembler& a, uint32_t u) {
-                emit_tput(a, kTputChains, u);
-            });
-            snprintf(name, sizeof(name), "%s tput (4 chains, %ux unroll)",
-                     op.label, unroll);
-            run_one(name, fn, make_params(base, loops, unroll));
+            snprintf(name, sizeof(name), "%s tput", op.label);
+            chain_sweep(base, loops, unroll, name, kTputChains,
+                [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
+                [emit_tput](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                    emit_tput(a, nc, u);
+                });
         }
     }
 
@@ -510,26 +388,15 @@ static void run_sub_logical_tests(const BenchmarkParams& base,
     // UNROLL ROUNDING applied to keep per-chain instruction counts equal.
     {
         static const uint32_t kNegChains[] = { 6, 8, 10, 12, 16 };
-        for (uint32_t nc : kNegChains) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc;
-            // Alternate seeds so adjacent chains start with different values;
-            // not required for correctness (NEG is involutory regardless) but
-            // avoids the trivially-identical state that might get optimized by
-            // a very aggressive microarchitecture.
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+        // Distinct seeds so adjacent chains start with different values; not
+        // required for correctness (NEG is involutory regardless) but avoids
+        // the trivially-identical state that might get optimized away by a
+        // very aggressive microarchitecture.
+        chain_sweep(base, loops, unroll, "NEG x64 tput", kNegChains,
+            [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 a.neg(xr(u % nc), xr(u % nc));
             });
-            snprintf(name, sizeof(name),
-                     "NEG x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
     }
 }
 
@@ -563,20 +430,21 @@ static void run_shift_tests(const BenchmarkParams& base,
             body(a);
         });
         snprintf(name, sizeof(name), "%s latency        (%ux unroll)", label, unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     };
 
     auto run_tput = [&](const char* label, uint32_t nc, auto body) {
         if (nc > unroll) return;
-        auto cfg = default_cfg(loops, unroll);
-        for (uint32_t i = 0; i < nc; ++i)
-            cfg.init_vals[i] = 0x0102030405060708ULL ^ (static_cast<uint64_t>(i + 1) << 8);
-        auto fn = build_loop(cfg, [nc, body](a64::Assembler& a, uint32_t u) {
-            body(a, u % nc);
-        });
-        snprintf(name, sizeof(name), "%s tput (%u chains, %ux unroll)",
-                 label, nc, unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        const uint32_t chains[] = { nc };
+        snprintf(name, sizeof(name), "%s tput", label);
+        chain_sweep(base, loops, unroll, name, chains,
+            [](a64::Assembler& a, uint32_t n) {
+                a.mov(x20, Imm(kDefaultSourceVal));
+                for (uint32_t i = 0; i < n; ++i)
+                    a.mov(xr(i), Imm(0x0102030405060708ULL ^
+                                     (static_cast<uint64_t>(i + 1) << 8)));
+            },
+            [body](a64::Assembler& a, uint32_t n, uint32_t u) { body(a, u % n); });
     };
 
     // LSL #1 (immediate): alias for UBFM. 1-cycle latency expected.
@@ -639,7 +507,7 @@ static void run_multiply_tests(const BenchmarkParams& base,
             a.mul(x0, x0, x1);
         });
         snprintf(name, sizeof(name), "MUL x64 latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── MUL x64 throughput sweep ──────────────────────────────────────────
@@ -662,27 +530,14 @@ static void run_multiply_tests(const BenchmarkParams& base,
     // pressure on the register file, but with MUL's 3-cycle latency the
     // max issue rate is R ≤ 3/cycle even with infinite units. That rate is
     // well within what register file broadcast networks handle without stall.
-    {
-        static const uint32_t kMulChains[] = { 2, 3, 4, 6, 8 };
-        for (uint32_t nc : kMulChains) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg      = default_cfg(loops, actual_unroll);
-            cfg.source_val = 0xDEADBEEFDEADBEEFULL; // odd multiplier in x20
-            cfg.num_init_regs = nc;
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = static_cast<uint64_t>(i + 1); // non-zero seeds
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
-                a.mul(xr(u % nc), xr(u % nc), x20);
-            });
-            snprintf(name, sizeof(name),
-                     "MUL x64 tput         (%u chains, %ux unroll)",
-                     nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
-    }
+    // x20 = odd multiplier; chains seeded 1..nc so no product starts at zero.
+    chain_sweep(base, loops, unroll, "MUL x64 tput", kDefaultChains,
+        [](a64::Assembler& a, uint32_t nc) {
+            seed_chains(a, nc, 0xDEADBEEFDEADBEEFULL);
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.mul(xr(u % nc), xr(u % nc), x20);
+        });
 
     // ── MADD: accumulator critical path ───────────────────────────────────
     // x0 = x1*x2 + x0: the addition of the accumulator (x0) is the
@@ -696,7 +551,7 @@ static void run_multiply_tests(const BenchmarkParams& base,
             a.madd(x0, x1, x2, x0);  // x0 = x1*x2 + x0
         });
         snprintf(name, sizeof(name), "MADD x64 acc-chain   (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── MADD: multiply critical path ──────────────────────────────────────
@@ -711,7 +566,7 @@ static void run_multiply_tests(const BenchmarkParams& base,
             a.madd(x1, x1, x2, x0);  // x1 = x1*x2 + 0
         });
         snprintf(name, sizeof(name), "MADD x64 mul-chain   (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
@@ -768,7 +623,7 @@ static void run_divide_tests(const BenchmarkParams& base,
 
         auto fn = build_loop(cfg, [body](a64::Assembler& a, uint32_t) { body(a); });
         snprintf(name, sizeof(name), "%s (%ux unroll)", label, div_unroll);
-        run_one(name, fn, make_params(base, div_loops, div_unroll));
+        run_one(name, fn, params_for(base, div_loops, div_unroll));
     };
 
     // ── UDIV x64 latency ──────────────────────────────────────────────────
@@ -790,42 +645,24 @@ static void run_divide_tests(const BenchmarkParams& base,
                 49, inits, 1);
     }
 
-    // ── UDIV throughput: 2 independent chains ─────────────────────────────
-    // x0 = 49/x0 and x1 = 49/x1, both starting at 7. These are entirely
-    // independent: the CPU can issue both simultaneously if the divider
-    // is pipelined or there are 2 divider units.
+    // ── UDIV throughput: 2 and 4 independent chains ───────────────────────
+    // Every chain runs xN = 49/xN starting at 7, so all of them are entirely
+    // independent: the CPU can issue them simultaneously if the divider is
+    // pipelined or there is more than one divider unit.
     //
-    // Expected outcome on most ARM64 cores: clk/insn is roughly double
-    // that of the 1-chain case (1 non-pipelined divider, serialized).
+    // Expected outcome on most ARM64 cores: clk/insn is roughly double that
+    // of the 1-chain case (1 non-pipelined divider, serialized).
     // An Apple M-series surprise: they appear to have partial pipelining.
     {
-        LoopConfig cfg{};
-        cfg.loops        = div_loops;
-        cfg.unroll       = div_unroll;
-        cfg.source_val   = 49;
-        cfg.num_init_regs = 2;
-        cfg.init_vals[0] = 7;
-        cfg.init_vals[1] = 7;
-        auto fn = build_loop(cfg, [](a64::Assembler& a, uint32_t u) {
-            a.udiv(xr(u % 2), x20, xr(u % 2));
-        });
-        snprintf(name, sizeof(name), "UDIV x64 tput        (2 chains, %ux unroll)", div_unroll);
-        run_one(name, fn, make_params(base, div_loops, div_unroll));
-    }
-
-    // ── UDIV throughput: 4 independent chains ─────────────────────────────
-    {
-        LoopConfig cfg{};
-        cfg.loops        = div_loops;
-        cfg.unroll       = div_unroll;
-        cfg.source_val   = 49;
-        cfg.num_init_regs = 4;
-        for (uint32_t i = 0; i < 4; ++i) cfg.init_vals[i] = 7;
-        auto fn = build_loop(cfg, [](a64::Assembler& a, uint32_t u) {
-            a.udiv(xr(u % 4), x20, xr(u % 4));
-        });
-        snprintf(name, sizeof(name), "UDIV x64 tput        (4 chains, %ux unroll)", div_unroll);
-        run_one(name, fn, make_params(base, div_loops, div_unroll));
+        static const uint32_t kUdivChains[] = { 2, 4 };
+        chain_sweep(base, div_loops, div_unroll, "UDIV x64 tput", kUdivChains,
+            [](a64::Assembler& a, uint32_t nc) {
+                a.mov(x20, Imm(49));
+                for (uint32_t i = 0; i < nc; ++i) a.mov(xr(i), Imm(7));
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                a.udiv(xr(u % nc), x20, xr(u % nc));
+            });
     }
 }
 
@@ -847,7 +684,7 @@ static void run_bit_tests(const BenchmarkParams& base,
     char name[80];
 
     // Common non-trivial seed for x0 (avoids degenerate all-zero results).
-    const uint64_t kSeed = 0x0102030405060708ULL;
+    static constexpr uint64_t kSeed = 0x0102030405060708ULL;
 
     struct BitOp {
         const char* label;
@@ -877,7 +714,7 @@ static void run_bit_tests(const BenchmarkParams& base,
         cfg.init_vals[0] = kSeed;
         auto fn = build_loop(cfg, [emit](a64::Assembler& a, uint32_t) { emit(a); });
         snprintf(name, sizeof(name), "%-18s   (%ux unroll)", op.label, unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CLZ and RBIT extended throughput sweeps ───────────────────────────
@@ -903,43 +740,27 @@ static void run_bit_tests(const BenchmarkParams& base,
     {
         static const uint32_t kBitChains[] = { 4, 6, 8, 10, 12, 16 };
 
-        // CLZ sweep
-        for (uint32_t nc : kBitChains) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc;
-            // Distinct non-zero seeds so chains start in meaningfully
-            // different states; XOR with position to avoid all-same.
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = kSeed ^ (static_cast<uint64_t>(i + 1) << 16);
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+        // Distinct non-zero seeds so chains start in meaningfully different
+        // states; the XOR with the chain position avoids all-same.
+        chain_sweep(base, loops, unroll, "CLZ x64 tput", kBitChains,
+            [](a64::Assembler& a, uint32_t nc) {
+                a.mov(x20, Imm(kDefaultSourceVal));
+                for (uint32_t i = 0; i < nc; ++i)
+                    a.mov(xr(i), Imm(kSeed ^ (static_cast<uint64_t>(i + 1) << 16)));
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 a.clz(xr(u % nc), xr(u % nc));
             });
-            snprintf(name, sizeof(name),
-                     "CLZ x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
 
-        // RBIT sweep
-        for (uint32_t nc : kBitChains) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc;
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = kSeed ^ (static_cast<uint64_t>(i + 1) << 8);
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+        chain_sweep(base, loops, unroll, "RBIT x64 tput", kBitChains,
+            [](a64::Assembler& a, uint32_t nc) {
+                a.mov(x20, Imm(kDefaultSourceVal));
+                for (uint32_t i = 0; i < nc; ++i)
+                    a.mov(xr(i), Imm(kSeed ^ (static_cast<uint64_t>(i + 1) << 8)));
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 a.rbit(xr(u % nc), xr(u % nc));
             });
-            snprintf(name, sizeof(name),
-                     "RBIT x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
     }
 }
 
@@ -991,7 +812,7 @@ static void run_mixed_tests(const BenchmarkParams& base,
         });
         snprintf(name, sizeof(name),
                  "ADD+MUL mix (4+2 chains, %ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── ADD + DIV interleaved ─────────────────────────────────────────────
@@ -1024,7 +845,7 @@ static void run_mixed_tests(const BenchmarkParams& base,
             });
             snprintf(name, sizeof(name),
                      "ADD+DIV mix (2+1 chains, %ux unroll)", div_unroll);
-            run_one(name, fn, make_params(base, div_loops, div_unroll));
+            run_one(name, fn, params_for(base, div_loops, div_unroll));
         }
     }
 
@@ -1052,7 +873,7 @@ static void run_mixed_tests(const BenchmarkParams& base,
         });
         snprintf(name, sizeof(name),
                  "ADD+CLZ mix (4+2 chains, %ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
@@ -1092,7 +913,7 @@ static void run_integer_gap_tests(const BenchmarkParams& base,
             a.extr(x0, x1, x0, Imm(32));
         });
         snprintf(name, sizeof(name), "EXTR x64 latency       (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── EXTR throughput sweep ─────────────────────────────────────────────
@@ -1101,22 +922,11 @@ static void run_integer_gap_tests(const BenchmarkParams& base,
     // similar to the ADD x64 throughput sweep.
     {
         static const uint32_t kExtrChains[] = { 4, 6, 8, 10, 12, 16 };
-        for (uint32_t nc : kExtrChains) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc;
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+        chain_sweep(base, loops, unroll, "EXTR x64 tput", kExtrChains,
+            [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 a.extr(xr(u % nc), x1, xr(u % nc), Imm(32));
             });
-            snprintf(name, sizeof(name),
-                     "EXTR x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
     }
 
     // ── UMULH latency ─────────────────────────────────────────────────────
@@ -1136,33 +946,22 @@ static void run_integer_gap_tests(const BenchmarkParams& base,
             a.umulh(x0, x0, x20);
         });
         snprintf(name, sizeof(name), "UMULH x64 latency      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── UMULH throughput sweep ────────────────────────────────────────────
     // Reveal the number of multiplier units that support UMULH.
     // On all known ARM64 implementations, UMULH uses the same 128-bit
     // multiplier as MUL, so UMULH saturation should match MUL saturation.
-    {
-        static const uint32_t kUmulhChains[] = { 2, 3, 4, 6, 8 };
-        for (uint32_t nc : kUmulhChains) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.source_val = 0xDEADBEEFDEADBEEFULL;
-            cfg.num_init_regs = nc;
+    chain_sweep(base, loops, unroll, "UMULH x64 tput", kDefaultChains,
+        [](a64::Assembler& a, uint32_t nc) {
+            a.mov(x20, Imm(0xDEADBEEFDEADBEEFULL));
             for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = 0xCAFEBABECAFEBABEULL ^ static_cast<uint64_t>(i + 1);
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
-                a.umulh(xr(u % nc), xr(u % nc), x20);
-            });
-            snprintf(name, sizeof(name),
-                     "UMULH x64 tput (%u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
-    }
+                a.mov(xr(i), Imm(0xCAFEBABECAFEBABEULL ^ static_cast<uint64_t>(i + 1)));
+        },
+        [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+            a.umulh(xr(u % nc), xr(u % nc), x20);
+        });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1222,7 +1021,7 @@ static void run_csel_tests(const BenchmarkParams& base,
                 a.csel(x0, x0, x1, CondCode::kNE);       // always selects x0 (true arm)
         });
         snprintf(name, sizeof(name), "ADDS+CSEL chain      (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── ADDS + CSINV latency chain ─────────────────────────────────────────
@@ -1239,7 +1038,7 @@ static void run_csel_tests(const BenchmarkParams& base,
                 a.csinv(x0, x0, x1, CondCode::kNE);      // always selects x0
         });
         snprintf(name, sizeof(name), "ADDS+CSINV chain     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── ADDS + CSNEG latency chain ─────────────────────────────────────────
@@ -1256,7 +1055,7 @@ static void run_csel_tests(const BenchmarkParams& base,
                 a.csneg(x0, x0, x1, CondCode::kNE);      // always selects x0
         });
         snprintf(name, sizeof(name), "ADDS+CSNEG chain     (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CSEL throughput sweep ─────────────────────────────────────────────
@@ -1273,28 +1072,19 @@ static void run_csel_tests(const BenchmarkParams& base,
     // Each pair is 2 instructions; clk/insn at saturation ≈ 1 / min_units.
     {
         static const uint32_t kCselChains[] = { 2, 4, 6, 8 };
-        for (uint32_t nc : kCselChains) {
-            const uint32_t period       = 2 * nc;
-            const uint32_t actual_unroll = (unroll >= period)
-                ? (unroll / period) * period : period;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc;
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
-
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+        // group = 2: the unroll is rounded to a multiple of 2*nc so that every
+        // iteration holds a whole number of nc-ADDS / nc-CSEL phases.
+        chain_sweep(base, loops, unroll, "CSEL tput", kCselChains,
+            [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 const uint32_t phase = u % (2 * nc);
                 const uint32_t chain = phase % nc;
                 if (phase < nc)
                     a.adds(xr(chain), xr(chain), x20);
                 else
                     a.csel(xr(chain), xr(chain), xzr, CondCode::kNE);
-            });
-            snprintf(name, sizeof(name),
-                     "CSEL tput  (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
+            },
+            /*group=*/2);
     }
 }
 
@@ -1342,7 +1132,7 @@ static void run_bitfield_tests_impl(const BenchmarkParams& base,
             a.bfi(x0, x1, Imm(0), Imm(8));
         });
         snprintf(name, sizeof(name), "BFI x64 lat (#0,#8)    (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── BFI mid-bits latency (Prism hash-table-lookup idiom) ──────────────
@@ -1355,7 +1145,7 @@ static void run_bitfield_tests_impl(const BenchmarkParams& base,
             a.bfi(x0, x1, Imm(4), Imm(13));
         });
         snprintf(name, sizeof(name), "BFI x64 lat (#4,#13)   (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── BFXIL latency (16-bit subregister-merge idiom) ────────────────────
@@ -1369,7 +1159,7 @@ static void run_bitfield_tests_impl(const BenchmarkParams& base,
             a.bfxil(x0, x1, Imm(0), Imm(16));
         });
         snprintf(name, sizeof(name), "BFXIL x64 lat (#0,#16) (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── UBFX latency (pure extract, no read-modify) ───────────────────────
@@ -1385,7 +1175,7 @@ static void run_bitfield_tests_impl(const BenchmarkParams& base,
             a.ubfx(x0, x0, Imm(4), Imm(13));
         });
         snprintf(name, sizeof(name), "UBFX x64 lat (#4,#13)  (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── SBFX latency (signed extract) ─────────────────────────────────────
@@ -1397,7 +1187,7 @@ static void run_bitfield_tests_impl(const BenchmarkParams& base,
             a.sbfx(x0, x0, Imm(4), Imm(13));
         });
         snprintf(name, sizeof(name), "SBFX x64 lat (#4,#13)  (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── BFI throughput sweep ──────────────────────────────────────────────
@@ -1407,31 +1197,19 @@ static void run_bitfield_tests_impl(const BenchmarkParams& base,
     // capable of issuing BFI per cycle.
     {
         static const uint32_t kBfiChains[] = { 2, 4, 6, 8 };
-        for (uint32_t nc : kBfiChains) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc + 1;             // need x0..xN-1 + scratch x_nc
-            for (uint32_t i = 0; i <= nc; ++i)
-                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
-
-            // Pick a register outside the chain set as the source (last init slot).
-            const uint32_t src_idx = nc;
-            auto fn = build_loop(cfg, [nc, src_idx](a64::Assembler& a, uint32_t u) {
-                a.bfi(xr(u % nc), xr(src_idx), Imm(4), Imm(13));
+        chain_sweep(base, loops, unroll, "BFI x64 tput", kBfiChains,
+            // One register past the chain set (x_nc) is the shared BFI source.
+            [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc + 1); },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
+                a.bfi(xr(u % nc), xr(nc), Imm(4), Imm(13));
             });
-            snprintf(name, sizeof(name),
-                     "BFI x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
     }
 }
 
 void run_bitfield_tests(const BenchmarkParams& base_params) {
     const uint64_t loops  = base_params.loops;
     const uint32_t unroll = base_params.instructions_per_loop;
-    printf("\n── Bitfield insert/extract ─────────────────────────────────────\n");
+    section("Bitfield insert/extract");
     run_bitfield_tests_impl(base_params, loops, unroll);
 }
 
@@ -1463,26 +1241,22 @@ static void run_misc_bitops_tests_impl(const BenchmarkParams& base,
             a.cls(x0, x0);
         });
         snprintf(name, sizeof(name), "CLS x64 latency        (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CLS throughput sweep ──────────────────────────────────────────────
     {
         static const uint32_t kClsChains[] = { 2, 4, 6, 8 };
-        for (uint32_t nc : kClsChains) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc;
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = ~static_cast<uint64_t>(i + 1);
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+        chain_sweep(base, loops, unroll, "CLS x64 tput", kClsChains,
+            // Negated seeds: CLS on a mostly-ones value returns a useful count.
+            [](a64::Assembler& a, uint32_t nc) {
+                a.mov(x20, Imm(kDefaultSourceVal));
+                for (uint32_t i = 0; i < nc; ++i)
+                    a.mov(xr(i), Imm(~static_cast<uint64_t>(i + 1)));
+            },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 a.cls(xr(u % nc), xr(u % nc));
             });
-            snprintf(name, sizeof(name),
-                     "CLS x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
     }
 
     // ── BIC latency (x0 ← x0 AND ~x20) ────────────────────────────────────
@@ -1492,26 +1266,17 @@ static void run_misc_bitops_tests_impl(const BenchmarkParams& base,
             a.bic(x0, x0, x20);
         });
         snprintf(name, sizeof(name), "BIC x64 latency        (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── BIC throughput sweep ──────────────────────────────────────────────
     {
         static const uint32_t kBicChains[] = { 2, 4, 6, 8 };
-        for (uint32_t nc : kBicChains) {
-            const uint32_t actual_unroll =
-                (unroll >= nc) ? (unroll / nc) * nc : nc;
-            auto cfg = default_cfg(loops, actual_unroll);
-            cfg.num_init_regs = nc;
-            for (uint32_t i = 0; i < nc; ++i)
-                cfg.init_vals[i] = static_cast<uint64_t>(i + 1);
-            auto fn = build_loop(cfg, [nc](a64::Assembler& a, uint32_t u) {
+        chain_sweep(base, loops, unroll, "BIC x64 tput", kBicChains,
+            [](a64::Assembler& a, uint32_t nc) { seed_chains(a, nc); },
+            [](a64::Assembler& a, uint32_t nc, uint32_t u) {
                 a.bic(xr(u % nc), xr(u % nc), x20);
             });
-            snprintf(name, sizeof(name),
-                     "BIC x64 tput (%2u chains, %ux unroll)", nc, actual_unroll);
-            run_one(name, fn, make_params(base, loops, actual_unroll));
-        }
     }
 
     // ── ORN latency (x0 ← x0 OR ~x20) ─────────────────────────────────────
@@ -1521,7 +1286,7 @@ static void run_misc_bitops_tests_impl(const BenchmarkParams& base,
             a.orn(x0, x0, x20);
         });
         snprintf(name, sizeof(name), "ORN x64 latency        (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── EON latency (x0 ← x0 XOR ~x20) ────────────────────────────────────
@@ -1531,7 +1296,7 @@ static void run_misc_bitops_tests_impl(const BenchmarkParams& base,
             a.eon(x0, x0, x20);
         });
         snprintf(name, sizeof(name), "EON x64 latency        (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CCMP flag chain ───────────────────────────────────────────────────
@@ -1559,14 +1324,14 @@ static void run_misc_bitops_tests_impl(const BenchmarkParams& base,
                 a.ccmp(x0, x20, Imm(0), CondCode::kNE);
         });
         snprintf(name, sizeof(name), "CMP+CCMP flag chain    (%ux unroll)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
 void run_misc_bitops_tests(const BenchmarkParams& base_params) {
     const uint64_t loops  = base_params.loops;
     const uint32_t unroll = base_params.instructions_per_loop;
-    printf("\n── Misc bit-ops (CLS / BIC / ORN / EON / CCMP) ─────────────────\n");
+    section("Misc bit-ops (CLS / BIC / ORN / EON / CCMP)");
     run_misc_bitops_tests_impl(base_params, loops, unroll);
 }
 
@@ -1578,31 +1343,31 @@ void run_integer_tests(const BenchmarkParams& base_params) {
     const uint64_t loops  = base_params.loops;
     const uint32_t unroll = base_params.instructions_per_loop;
 
-    printf("\n── ADD ─────────────────────────────────────────────────────────\n");
+    section("ADD");
     run_add_tests(base_params, loops, unroll);
 
-    printf("\n── SUB / logical ───────────────────────────────────────────────\n");
+    section("SUB / logical");
     run_sub_logical_tests(base_params, loops, unroll);
 
-    printf("\n── Shifts ──────────────────────────────────────────────────────\n");
+    section("Shifts");
     run_shift_tests(base_params, loops, unroll);
 
-    printf("\n── Multiply ────────────────────────────────────────────────────\n");
+    section("Multiply");
     run_multiply_tests(base_params, loops, unroll);
 
-    printf("\n── Divide ──────────────────────────────────────────────────────\n");
+    section("Divide");
     run_divide_tests(base_params, loops, unroll);
 
-    printf("\n── Bit manipulation ────────────────────────────────────────────\n");
+    section("Bit manipulation");
     run_bit_tests(base_params, loops, unroll);
 
-    printf("\n── Mixed / port pressure ───────────────────────────────────────\n");
+    section("Mixed / port pressure");
     run_mixed_tests(base_params, loops, unroll);
 
-    printf("\n── Integer gaps ─────────────────────────────────────────────────\n");
+    section("Integer gaps");
     run_integer_gap_tests(base_params, loops, unroll);
 
-    printf("\n── Conditional select ───────────────────────────────────────────\n");
+    section("Conditional select");
     run_csel_tests(base_params, loops, unroll);
 
     run_bitfield_tests(base_params);
