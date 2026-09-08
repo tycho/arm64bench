@@ -254,7 +254,9 @@ static JitPool::TestFn build_rsb_chain(uint32_t depth, uint64_t loops) {
 // ── Indirect branch predictor builder ────────────────────────────────────────
 
 // Build N tiny trampoline functions (each just RET) and return their addresses
-// in caller-allocated out_addrs[0..n_targets). Returns false on failure.
+// in caller-allocated out_addrs[0..n_targets). Returns false on failure, in
+// which case every trampoline compiled so far has been released and
+// out_fns[0..n_targets) are all nullptr.
 static bool build_trampolines(uint32_t n_targets,
                               JitPool::TestFn* out_fns,
                               uintptr_t* out_addrs) {
@@ -269,7 +271,13 @@ static bool build_trampolines(uint32_t n_targets,
         a.ret(x30);
 
         out_fns[i] = g_jit_pool->compile(code);
-        if (!out_fns[i]) return false;
+        if (!out_fns[i]) {
+            for (uint32_t k = 0; k < i; ++k) {
+                g_jit_pool->release(out_fns[k]);
+                out_fns[k] = nullptr;
+            }
+            return false;
+        }
         out_addrs[i] = reinterpret_cast<uintptr_t>(out_fns[i]);
     }
     return true;
