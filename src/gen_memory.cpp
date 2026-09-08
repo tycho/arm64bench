@@ -12,10 +12,11 @@
 //   access latency including tag lookup, data delivery, and register writeback.
 //
 //   The permutation is generated with Fisher-Yates, seeded from a fixed
-//   constant for reproducibility. The stride between nodes (kNodeStride=256)
-//   is chosen to prevent set-conflict aliasing in typical 8-way caches:
-//   with 256-byte stride, consecutive nodes never map to the same cache set
-//   in a cache whose set count is not a multiple of 4 pages.
+//   constant for reproducibility — build_pointer_ring() in gen_common.cpp.
+//   The stride between nodes (kNodeStride=256) is chosen to prevent
+//   set-conflict aliasing in typical 8-way caches: with 256-byte stride,
+//   consecutive nodes never map to the same cache set in a cache whose set
+//   count is not a multiple of 4 pages.
 //
 // BANDWIDTH MEASUREMENT (sequential LDP/STP)
 //   The inner loop body issues kBwLines=8 cache lines worth of LDP (load-pair)
@@ -40,7 +41,9 @@
 //   to the execution core, which includes prefetcher assistance.
 //
 // TWO-LEVEL LOOP STRUCTURE
-//   Outer loop (x19 = num_passes): counts complete sweeps of the buffer.
+//   Outer loop (x19 = num_passes): counts complete sweeps of the buffer. This
+//     is build_loop()'s own counter; the entire inner loop is the loop body,
+//     emitted once (unroll = 1).
 //   Inner loop (x21 = inner_iters): advances through the buffer in kBwStep
 //     increments, executing the LDP/STP block each step.
 //
@@ -53,45 +56,22 @@
 //     bandwidth (GB/s) = bytes_per_insn(64) / min_ns_per_insn
 //
 // PLATFORM MEMORY ALLOCATION
-//   Uses mmap(MAP_ANONYMOUS|MAP_PRIVATE) on POSIX and VirtualAlloc on Windows.
-//   A single kMaxBufSize allocation is made at startup. All tests share this
-//   backing store; for latency tests the chain links overwrite the memory,
-//   but bandwidth tests don't depend on its content (we measure access time,
-//   not values).
+//   alloc_pages() (gen_common.cpp) maps anonymous pages — mmap on POSIX,
+//   VirtualAlloc on Windows. A single kMaxBufSize allocation is made at
+//   startup. All tests share this backing store; for latency tests the chain
+//   links overwrite the memory, but bandwidth tests don't depend on its
+//   content (we measure access time, not values).
 
 #include "gen_memory.h"
-#include "jit_buffer.h"
-#include "harness.h"
+#include "gen_common.h"
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
 #include <cstdio>
-#include <cstdlib>   // malloc, free
-
-#if defined(_WIN32)
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#else
-#  include <sys/mman.h>
-#endif
 
 namespace arm64bench::gen {
 
 using namespace asmjit;
 using namespace asmjit::a64;
-
-// ── Register lookup table ─────────────────────────────────────────────────────
-// (Same pattern as gen_integer.cpp — x0–x15 are scratch, x19–x21 reserved.)
-
-static const a64::Gp kXRegs[] = {
-    x0, x1, x2, x3, x4, x5, x6, x7,
-    x8, x9, x10, x11, x12, x13, x14, x15,
-};
-[[maybe_unused]] static inline const a64::Gp& xr(uint32_t i) { return kXRegs[i]; }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -131,105 +111,11 @@ static const size_t kBufSizes[] = {
 static constexpr size_t kNumBufSizes = sizeof(kBufSizes) / sizeof(kBufSizes[0]);
 static constexpr size_t kMaxBufSize  = 128ULL << 20;  // 128 MB
 
-// ── Platform memory allocation ────────────────────────────────────────────────
-//
-// We need large anonymous allocations that don't interact with malloc's heap
-// management or trigger any memory-accounting callbacks. mmap and VirtualAlloc
-// both provide zero-initialized, demand-paged memory.
-
-static void* alloc_large(size_t size) {
-#if defined(_WIN32)
-    void* p = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    return p;
-#else
-    void* p = mmap(nullptr, size,
-                   PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS,
-                   -1, 0);
-    return (p == MAP_FAILED) ? nullptr : p;
-#endif
-}
-
-static void free_large(void* p, size_t size) {
-    if (!p) return;
-#if defined(_WIN32)
-    (void)size;
-    VirtualFree(p, 0, MEM_RELEASE);
-#else
-    munmap(p, size);
-#endif
-}
-
-// ── Pseudo-random number generator ───────────────────────────────────────────
-// xorshift64: fast, statistically adequate for shuffling indices.
-// Fixed seed ensures the pointer chain is identical across runs
-// (important for reproducibility — different chain orders can have
-// measurably different TLB pressures for very large buffers).
-
-static uint64_t xorshift64(uint64_t& state) {
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    return state;
-}
-
-// ── Pointer chain setup ───────────────────────────────────────────────────────
-//
-// Divides buf[0..size) into n_nodes = size/stride slots.
-// Generates a random cyclic permutation of all n_nodes slots using
-// Fisher-Yates, then writes at each slot the address of the next slot
-// in the permuted order.
-//
-// The result is a single closed cycle visiting every slot exactly once.
-// Starting from the returned head pointer and following LDR x0,[x0]
-// repeatedly will visit every slot before returning to the start.
-//
-// Returns the starting address (head of the chain).
-
-static void* setup_pointer_chase(void* buf, size_t size, size_t stride) {
-    const size_t n_nodes = size / stride;
-    if (n_nodes < 2) return nullptr;
-
-    // Allocate a temporary index array. Using malloc here is fine — this
-    // is one-time setup outside the timed region. For 128MB with 256B stride:
-    // n_nodes = 512K, array = 512K * 4B = 2MB. Acceptable.
-    uint32_t* perm = static_cast<uint32_t*>(malloc(n_nodes * sizeof(uint32_t)));
-    if (!perm) {
-        fprintf(stderr, "setup_pointer_chase: malloc(%zu) failed\n",
-                n_nodes * sizeof(uint32_t));
-        return nullptr;
-    }
-
-    // Initialize to identity permutation.
-    for (uint32_t i = 0; i < n_nodes; ++i)
-        perm[i] = i;
-
-    // Fisher-Yates shuffle.
-    uint64_t rng = 0xDEADBEEF12345678ULL;  // fixed seed for reproducibility
-    for (size_t i = n_nodes - 1; i > 0; --i) {
-        const size_t j = xorshift64(rng) % (i + 1);
-        const uint32_t tmp = perm[i];
-        perm[i] = perm[j];
-        perm[j] = tmp;
-    }
-
-    // Write chain links: at slot perm[i], store the address of slot perm[i+1].
-    uint8_t* const base = static_cast<uint8_t*>(buf);
-    for (size_t i = 0; i < n_nodes; ++i) {
-        void** slot = reinterpret_cast<void**>(base + perm[i] * stride);
-        *slot = base + perm[(i + 1) % n_nodes] * stride;
-    }
-
-    void* head = base + perm[0] * stride;
-    free(perm);
-    return head;
-}
-
 // ── Latency chase JIT builder ─────────────────────────────────────────────────
 //
-// Generated loop (pseudo-assembly):
-//   sub sp, sp, #16
-//   str x19, [sp]
+// Generated loop (pseudo-assembly; the frame is build_loop()'s):
+//   sub sp, sp, #48
+//   stp x19, x20, [sp] ; stp x21, x22, [sp, #16] ; str x30, [sp, #32]
 //   mov x19, #loops
 //   mov x0, #chain_head      // 64-bit immediate: MOVZ + up to 3 MOVK
 //   align 64
@@ -237,57 +123,33 @@ static void* setup_pointer_chase(void* buf, size_t size, size_t stride) {
 //   ldr x0, [x0]             // x0 = *(uint64_t*)x0 — the serializing load
 //   sub x19, x19, #1
 //   cbnz x19, loop_top
-//   ldr x19, [sp]
-//   add sp, sp, #16
+//   ...restore x19–x22, x30; add sp, sp, #48...
 //   ret x30
 //
 // Instructions per harness "iteration": 1 (the LDR).
 // min_ns_per_insn from the harness = ns/load = cache access latency.
 
 static JitPool::TestFn build_latency_chase(uintptr_t chain_head, uint64_t loops) {
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    // Prologue: save only x19 (loop counter).
-    // Use 16-byte frame to maintain ABI stack alignment.
-    a.sub(sp, sp, Imm(16));
-    a.str(x19, ptr(sp));
-
-    a.mov(x19, Imm(loops));
-
-    // Bake chain_head as a 64-bit immediate. AsmJit emits MOVZ + MOVK as
-    // needed (1–4 instructions depending on the value).
-    a.mov(x0, Imm(static_cast<uint64_t>(chain_head)));
-
-    // Align to cache line boundary: prevents the loop from spanning two
-    // fetch groups, which would cause unpredictable front-end stalls.
-    a.align(AlignMode::kCode, 64);
-
-    Label loop_top = a.new_label();
-    a.bind(loop_top);
-
-    // The measurement: load the next pointer from the current address.
-    // x0 depends on the previous x0, strictly serializing execution.
-    a.ldr(x0, ptr(x0));
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, loop_top);
-
-    // Epilogue.
-    a.ldr(x19, ptr(sp));
-    a.add(sp, sp, Imm(16));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
+    return build_loop(loops, 1,
+        [chain_head](a64::Assembler& a) {
+            // Bake chain_head as a 64-bit immediate. AsmJit emits MOVZ + MOVK
+            // as needed (1–4 instructions depending on the value).
+            a.mov(x0, Imm(static_cast<uint64_t>(chain_head)));
+        },
+        [](a64::Assembler& a, uint32_t) {
+            // The measurement: load the next pointer from the current address.
+            // x0 depends on the previous x0, strictly serializing execution.
+            a.ldr(x0, ptr(x0));
+        });
 }
 
 // ── Sequential load bandwidth JIT builder ─────────────────────────────────────
 //
-// Generated structure:
-//   prologue: save x19, x20, x21
+// Generated structure (frame, x19 counter and outer loop from build_loop):
+//   prologue: save x19–x22, x30
 //   mov x19, #num_passes
 //   mov x20, #buf_base       // constant (never written inside loop)
+//   align 64
 // outer_top:
 //   mov x0, x20              // reset load pointer to buffer start
 //   mov x21, #inner_iters    // inner iteration count = buf_size / kBwStep
@@ -319,57 +181,35 @@ static JitPool::TestFn build_seq_load_bw(uintptr_t buf_base, size_t buf_size,
                                           uint64_t num_passes) {
     const uint64_t inner_iters = buf_size / kBwStep;
 
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
+    return build_loop(num_passes, 1,
+        [buf_base](a64::Assembler& a) {
+            a.mov(x20, Imm(static_cast<uint64_t>(buf_base)));
+        },
+        [inner_iters](a64::Assembler& a, uint32_t) {
+            a.mov(x0, x20);                     // reset load pointer each pass
+            a.mov(x21, Imm(inner_iters));
 
-    // Prologue: save x19 (outer counter), x20 (buf_base constant), x21 (inner counter).
-    // 32-byte frame: stp x19,x20 at [sp], str x21 at [sp+16].
-    a.sub(sp, sp, Imm(32));
-    a.stp(x19, x20, ptr(sp));
-    a.str(x21, ptr(sp, 16));
+            Label inner_top = a.new_label();
+            a.bind(inner_top);
 
-    a.mov(x19, Imm(num_passes));
-    a.mov(x20, Imm(static_cast<uint64_t>(buf_base)));
+            // Emit kBwLines cache lines worth of LDP instructions.
+            // Destination registers rotate through x2..x9 (4 pairs), repeating
+            // each cache line. Reuse is safe: LDP results are never consumed by
+            // subsequent LDPs in this block, so there is no dependency chain
+            // through destinations.
+            for (uint32_t line = 0; line < kBwLines; ++line) {
+                const int32_t base_off = static_cast<int32_t>(line * kCacheLine);
+                // 4 LDP pairs cover 64 bytes (one cache line).
+                a.ldp(x2, x3, ptr(x0, base_off + 0));
+                a.ldp(x4, x5, ptr(x0, base_off + 16));
+                a.ldp(x6, x7, ptr(x0, base_off + 32));
+                a.ldp(x8, x9, ptr(x0, base_off + 48));
+            }
 
-    a.align(AlignMode::kCode, 64);
-
-    Label outer_top = a.new_label();
-    Label inner_top = a.new_label();
-
-    a.bind(outer_top);
-    a.mov(x0, x20);                         // reset load pointer each pass
-    a.mov(x21, Imm(inner_iters));
-
-    a.bind(inner_top);
-
-    // Emit kBwLines cache lines worth of LDP instructions.
-    // Destination registers rotate through x2..x9 (4 pairs), repeating each
-    // cache line. Reuse is safe: LDP results are never consumed by subsequent
-    // LDPs in this block, so there is no dependency chain through destinations.
-    for (uint32_t line = 0; line < kBwLines; ++line) {
-        const int32_t base_off = static_cast<int32_t>(line * kCacheLine);
-        // 4 LDP pairs cover 64 bytes (one cache line).
-        a.ldp(x2, x3, ptr(x0, base_off + 0));
-        a.ldp(x4, x5, ptr(x0, base_off + 16));
-        a.ldp(x6, x7, ptr(x0, base_off + 32));
-        a.ldp(x8, x9, ptr(x0, base_off + 48));
-    }
-
-    a.add(x0, x0, Imm(static_cast<uint64_t>(kBwStep)));
-    a.sub(x21, x21, Imm(1));
-    a.cbnz(x21, inner_top);
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, outer_top);
-
-    // Epilogue.
-    a.ldp(x19, x20, ptr(sp));
-    a.ldr(x21, ptr(sp, 16));
-    a.add(sp, sp, Imm(32));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
+            a.add(x0, x0, Imm(static_cast<uint64_t>(kBwStep)));
+            a.sub(x21, x21, Imm(1));
+            a.cbnz(x21, inner_top);
+        });
 }
 
 // ── Sequential store bandwidth JIT builder ────────────────────────────────────
@@ -389,54 +229,34 @@ static JitPool::TestFn build_seq_store_bw(uintptr_t buf_base, size_t buf_size,
                                            uint64_t num_passes) {
     const uint64_t inner_iters = buf_size / kBwStep;
 
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
+    return build_loop(num_passes, 1,
+        [buf_base](a64::Assembler& a) {
+            a.mov(x20, Imm(static_cast<uint64_t>(buf_base)));
 
-    a.sub(sp, sp, Imm(32));
-    a.stp(x19, x20, ptr(sp));
-    a.str(x21, ptr(sp, 16));
+            // x10 = store value: use buf_base (a non-trivial 64-bit value).
+            // Both registers of each STP pair will hold the same value — fine
+            // for measuring store bandwidth.
+            a.mov(x10, x20);
+        },
+        [inner_iters](a64::Assembler& a, uint32_t) {
+            a.mov(x0, x20);
+            a.mov(x21, Imm(inner_iters));
 
-    a.mov(x19, Imm(num_passes));
-    a.mov(x20, Imm(static_cast<uint64_t>(buf_base)));
+            Label inner_top = a.new_label();
+            a.bind(inner_top);
 
-    // x10 = store value: use buf_base (a non-trivial 64-bit value).
-    // Both registers of each STP pair will hold the same value — fine for
-    // measuring store bandwidth.
-    a.mov(x10, x20);
+            for (uint32_t line = 0; line < kBwLines; ++line) {
+                const int32_t base_off = static_cast<int32_t>(line * kCacheLine);
+                a.stp(x10, x10, ptr(x0, base_off + 0));
+                a.stp(x10, x10, ptr(x0, base_off + 16));
+                a.stp(x10, x10, ptr(x0, base_off + 32));
+                a.stp(x10, x10, ptr(x0, base_off + 48));
+            }
 
-    a.align(AlignMode::kCode, 64);
-
-    Label outer_top = a.new_label();
-    Label inner_top = a.new_label();
-
-    a.bind(outer_top);
-    a.mov(x0, x20);
-    a.mov(x21, Imm(inner_iters));
-
-    a.bind(inner_top);
-
-    for (uint32_t line = 0; line < kBwLines; ++line) {
-        const int32_t base_off = static_cast<int32_t>(line * kCacheLine);
-        a.stp(x10, x10, ptr(x0, base_off + 0));
-        a.stp(x10, x10, ptr(x0, base_off + 16));
-        a.stp(x10, x10, ptr(x0, base_off + 32));
-        a.stp(x10, x10, ptr(x0, base_off + 48));
-    }
-
-    a.add(x0, x0, Imm(static_cast<uint64_t>(kBwStep)));
-    a.sub(x21, x21, Imm(1));
-    a.cbnz(x21, inner_top);
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, outer_top);
-
-    a.ldp(x19, x20, ptr(sp));
-    a.ldr(x21, ptr(sp, 16));
-    a.add(sp, sp, Imm(32));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
+            a.add(x0, x0, Imm(static_cast<uint64_t>(kBwStep)));
+            a.sub(x21, x21, Imm(1));
+            a.cbnz(x21, inner_top);
+        });
 }
 
 // ── Helper: format buffer size as a fixed-width string ───────────────────────
@@ -486,8 +306,11 @@ static uint64_t lat_loops_for_size(size_t buf_size) {
 }
 
 static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
-    printf("\n── Load latency (random pointer chase, %u-byte stride) ──────────\n",
-           static_cast<uint32_t>(kNodeStride));
+    char title[96];
+    snprintf(title, sizeof(title),
+             "Load latency (random pointer chase, %u-byte stride)",
+             static_cast<uint32_t>(kNodeStride));
+    section(title);
 
     // Boundary detection thresholds.
     // A latency jump of ≥2× between consecutive buffer sizes almost certainly
@@ -504,9 +327,9 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
         const size_t   buf_size = kBufSizes[si];
         const uint64_t loops    = lat_loops_for_size(buf_size);
 
-        void* head = setup_pointer_chase(buf, buf_size, kNodeStride);
+        void* head = build_pointer_ring(buf, buf_size, kNodeStride);
         if (!head) {
-            fprintf(stderr, "  [skipped: setup_pointer_chase failed]\n");
+            fprintf(stderr, "  [skipped: build_pointer_ring failed]\n");
             continue;
         }
 
@@ -514,10 +337,7 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
             reinterpret_cast<uintptr_t>(head), loops);
         if (!fn) continue;
 
-        BenchmarkParams p         = base;
-        p.loops                   = loops;
-        p.instructions_per_loop   = 1;
-        p.bytes_per_insn          = 0;
+        const BenchmarkParams p = params_for(base, loops, 1);
 
         char size_str[16];
         format_buf_size(size_str, sizeof(size_str), buf_size);
@@ -525,6 +345,7 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
         char name[64];
         snprintf(name, sizeof(name), "load latency %s", size_str);
 
+        // Not run_one(): the boundary annotation below needs the result.
         const BenchmarkResult r = benchmark(fn, name, p);
         g_jit_pool->release(fn);
 
@@ -582,7 +403,7 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
 //   Page walk: hardware MFPT, penalty varies
 
 static void run_tlb_sweep(void* buf, const BenchmarkParams& base) {
-    printf("\n── TLB hierarchy (pointer chase, 4KB page stride) ───────────────\n");
+    section("TLB hierarchy (pointer chase, 4KB page stride)");
 
     static constexpr size_t kPageStride = 4096;
     static const uint32_t kPageCounts[] = {
@@ -593,36 +414,32 @@ static void run_tlb_sweep(void* buf, const BenchmarkParams& base) {
         const size_t buf_size = static_cast<size_t>(pages) * kPageStride;
         if (buf_size > kMaxBufSize) break;
 
-        void* head = setup_pointer_chase(buf, buf_size, kPageStride);
+        void* head = build_pointer_ring(buf, buf_size, kPageStride);
         if (!head) continue;
 
         const uint64_t loops = lat_loops_for_size(buf_size);
         JitPool::TestFn fn = build_latency_chase(
             reinterpret_cast<uintptr_t>(head), loops);
-        if (!fn) continue;
-
-        BenchmarkParams p         = base;
-        p.loops                   = loops;
-        p.instructions_per_loop   = 1;
-        p.bytes_per_insn          = 0;
 
         char name[80];
         snprintf(name, sizeof(name), "TLB chase  %5u pages (%4zuKB buf)",
                  pages, buf_size / 1024);
 
-        benchmark(fn, name, p);
-        g_jit_pool->release(fn);
+        run_one(name, fn, params_for(base, loops, 1));
     }
 }
 
 // ── Bandwidth sweep ───────────────────────────────────────────────────────────
 
 static void run_bw_sweep(void* buf, const BenchmarkParams& base, bool is_store) {
-    printf("\n── Sequential %s bandwidth (%u-stream %s, %u-byte step) ─────────\n",
-           is_store ? "store" : "load",
-           kBwLines * 4u,
-           is_store ? "STP" : "LDP",
-           static_cast<uint32_t>(kBwStep));
+    char title[96];
+    snprintf(title, sizeof(title),
+             "Sequential %s bandwidth (%u-stream %s, %u-byte step)",
+             is_store ? "store" : "load",
+             kBwLines * 4u,
+             is_store ? "STP" : "LDP",
+             static_cast<uint32_t>(kBwStep));
+    section(title);
 
     for (size_t si = 0; si < kNumBufSizes; ++si) {
         const size_t buf_size = kBufSizes[si];
@@ -640,12 +457,6 @@ static void run_bw_sweep(void* buf, const BenchmarkParams& base, bool is_store) 
         JitPool::TestFn fn = is_store
             ? build_seq_store_bw(reinterpret_cast<uintptr_t>(buf), buf_size, num_passes)
             : build_seq_load_bw (reinterpret_cast<uintptr_t>(buf), buf_size, num_passes);
-        if (!fn) continue;
-
-        BenchmarkParams p         = base;
-        p.loops                   = num_passes;
-        p.instructions_per_loop   = static_cast<uint32_t>(lines_per_pass);
-        p.bytes_per_insn          = static_cast<uint32_t>(kCacheLine);
 
         char size_str[16];
         format_buf_size(size_str, sizeof(size_str), buf_size);
@@ -654,8 +465,10 @@ static void run_bw_sweep(void* buf, const BenchmarkParams& base, bool is_store) 
         snprintf(name, sizeof(name), "seq %s bw   %s",
                  is_store ? "store" : "load ", size_str);
 
-        benchmark(fn, name, p);
-        g_jit_pool->release(fn);
+        run_one(name, fn,
+                params_for(base, num_passes,
+                           static_cast<uint32_t>(lines_per_pass),
+                           static_cast<uint32_t>(kCacheLine)));
     }
 }
 
@@ -680,49 +493,29 @@ static JitPool::TestFn build_seq_ldnp_bw(uintptr_t buf_base, size_t buf_size,
                                            uint64_t num_passes) {
     const uint64_t inner_iters = buf_size / kBwStep;
 
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
+    return build_loop(num_passes, 1,
+        [buf_base](a64::Assembler& a) {
+            a.mov(x20, Imm(static_cast<uint64_t>(buf_base)));
+        },
+        [inner_iters](a64::Assembler& a, uint32_t) {
+            a.mov(x0, x20);
+            a.mov(x21, Imm(inner_iters));
 
-    a.sub(sp, sp, Imm(32));
-    a.stp(x19, x20, ptr(sp));
-    a.str(x21, ptr(sp, 16));
+            Label inner_top = a.new_label();
+            a.bind(inner_top);
 
-    a.mov(x19, Imm(num_passes));
-    a.mov(x20, Imm(static_cast<uint64_t>(buf_base)));
+            for (uint32_t line = 0; line < kBwLines; ++line) {
+                const int32_t base_off = static_cast<int32_t>(line * kCacheLine);
+                a.ldnp(x2, x3, ptr(x0, base_off + 0));
+                a.ldnp(x4, x5, ptr(x0, base_off + 16));
+                a.ldnp(x6, x7, ptr(x0, base_off + 32));
+                a.ldnp(x8, x9, ptr(x0, base_off + 48));
+            }
 
-    a.align(AlignMode::kCode, 64);
-
-    Label outer_top = a.new_label();
-    Label inner_top = a.new_label();
-
-    a.bind(outer_top);
-    a.mov(x0, x20);
-    a.mov(x21, Imm(inner_iters));
-
-    a.bind(inner_top);
-
-    for (uint32_t line = 0; line < kBwLines; ++line) {
-        const int32_t base_off = static_cast<int32_t>(line * kCacheLine);
-        a.ldnp(x2, x3, ptr(x0, base_off + 0));
-        a.ldnp(x4, x5, ptr(x0, base_off + 16));
-        a.ldnp(x6, x7, ptr(x0, base_off + 32));
-        a.ldnp(x8, x9, ptr(x0, base_off + 48));
-    }
-
-    a.add(x0, x0, Imm(static_cast<uint64_t>(kBwStep)));
-    a.sub(x21, x21, Imm(1));
-    a.cbnz(x21, inner_top);
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, outer_top);
-
-    a.ldp(x19, x20, ptr(sp));
-    a.ldr(x21, ptr(sp, 16));
-    a.add(sp, sp, Imm(32));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
+            a.add(x0, x0, Imm(static_cast<uint64_t>(kBwStep)));
+            a.sub(x21, x21, Imm(1));
+            a.cbnz(x21, inner_top);
+        });
 }
 
 // ── LDP→STP copy bandwidth JIT builder ───────────────────────────────────────
@@ -731,7 +524,7 @@ static JitPool::TestFn build_seq_ldnp_bw(uintptr_t buf_base, size_t buf_size,
 // Both buffers advance in lockstep; the total working set is 2×buf_size.
 //
 // Register layout:
-//   x19 = outer pass counter
+//   x19 = outer pass counter (build_loop's; not touched here)
 //   x20 = src_base (constant)
 //   x21 = inner iteration counter
 //   x22 = dst_base (constant; callee-saved so it persists across inner loops)
@@ -747,66 +540,48 @@ static JitPool::TestFn build_seq_copy_bw(uintptr_t src_base, uintptr_t dst_base,
                                            size_t buf_size, uint64_t num_passes) {
     const uint64_t inner_iters = buf_size / kBwStep;
 
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
+    return build_loop(num_passes, 1,
+        [src_base, dst_base](a64::Assembler& a) {
+            a.mov(x20, Imm(static_cast<uint64_t>(src_base)));
+            a.mov(x22, Imm(static_cast<uint64_t>(dst_base)));
+        },
+        [inner_iters](a64::Assembler& a, uint32_t) {
+            a.mov(x0,  x20);           // src read pointer
+            a.mov(x11, x22);           // dst write pointer (x11 = caller-saved)
+            a.mov(x21, Imm(inner_iters));
 
-    // 32-byte frame: save x19, x20, x21, x22 (all callee-saved).
-    a.sub(sp, sp, Imm(32));
-    a.stp(x19, x20, ptr(sp));
-    a.stp(x21, x22, ptr(sp, 16));
+            Label inner_top = a.new_label();
+            a.bind(inner_top);
 
-    a.mov(x19, Imm(num_passes));
-    a.mov(x20, Imm(static_cast<uint64_t>(src_base)));
-    a.mov(x22, Imm(static_cast<uint64_t>(dst_base)));
+            // Copy kBwLines cache lines per step.
+            // Each cache line: 4 LDP pairs (read) → 4 STP pairs (write).
+            for (uint32_t line = 0; line < kBwLines; ++line) {
+                const int32_t base_off = static_cast<int32_t>(line * kCacheLine);
+                a.ldp(x2, x3, ptr(x0,  base_off + 0));
+                a.stp(x2, x3, ptr(x11, base_off + 0));
+                a.ldp(x4, x5, ptr(x0,  base_off + 16));
+                a.stp(x4, x5, ptr(x11, base_off + 16));
+                a.ldp(x6, x7, ptr(x0,  base_off + 32));
+                a.stp(x6, x7, ptr(x11, base_off + 32));
+                a.ldp(x8, x9, ptr(x0,  base_off + 48));
+                a.stp(x8, x9, ptr(x11, base_off + 48));
+            }
 
-    a.align(AlignMode::kCode, 64);
-
-    Label outer_top = a.new_label();
-    Label inner_top = a.new_label();
-
-    a.bind(outer_top);
-    a.mov(x0,  x20);           // src read pointer
-    a.mov(x11, x22);           // dst write pointer (x11 = caller-saved, no save needed)
-    a.mov(x21, Imm(inner_iters));
-
-    a.bind(inner_top);
-
-    // Copy kBwLines cache lines per step.
-    // Each cache line: 4 LDP pairs (read) → 4 STP pairs (write).
-    for (uint32_t line = 0; line < kBwLines; ++line) {
-        const int32_t base_off = static_cast<int32_t>(line * kCacheLine);
-        a.ldp(x2, x3, ptr(x0,  base_off + 0));
-        a.stp(x2, x3, ptr(x11, base_off + 0));
-        a.ldp(x4, x5, ptr(x0,  base_off + 16));
-        a.stp(x4, x5, ptr(x11, base_off + 16));
-        a.ldp(x6, x7, ptr(x0,  base_off + 32));
-        a.stp(x6, x7, ptr(x11, base_off + 32));
-        a.ldp(x8, x9, ptr(x0,  base_off + 48));
-        a.stp(x8, x9, ptr(x11, base_off + 48));
-    }
-
-    a.add(x0,  x0,  Imm(static_cast<uint64_t>(kBwStep)));
-    a.add(x11, x11, Imm(static_cast<uint64_t>(kBwStep)));
-    a.sub(x21, x21, Imm(1));
-    a.cbnz(x21, inner_top);
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, outer_top);
-
-    a.ldp(x19, x20, ptr(sp));
-    a.ldp(x21, x22, ptr(sp, 16));
-    a.add(sp, sp, Imm(32));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
+            a.add(x0,  x0,  Imm(static_cast<uint64_t>(kBwStep)));
+            a.add(x11, x11, Imm(static_cast<uint64_t>(kBwStep)));
+            a.sub(x21, x21, Imm(1));
+            a.cbnz(x21, inner_top);
+        });
 }
 
 // ── Non-temporal load bandwidth sweep ────────────────────────────────────────
 
 static void run_ldnp_bw_sweep(void* buf, const BenchmarkParams& base) {
-    printf("\n── Non-temporal load bandwidth (LDNP, %u-stream, %u-byte step) ──\n",
-           kBwLines * 4u, static_cast<uint32_t>(kBwStep));
+    char title[96];
+    snprintf(title, sizeof(title),
+             "Non-temporal load bandwidth (LDNP, %u-stream, %u-byte step)",
+             kBwLines * 4u, static_cast<uint32_t>(kBwStep));
+    section(title);
 
     for (size_t si = 0; si < kNumBufSizes; ++si) {
         const size_t buf_size = kBufSizes[si];
@@ -819,12 +594,6 @@ static void run_ldnp_bw_sweep(void* buf, const BenchmarkParams& base) {
 
         JitPool::TestFn fn = build_seq_ldnp_bw(
             reinterpret_cast<uintptr_t>(buf), buf_size, num_passes);
-        if (!fn) continue;
-
-        BenchmarkParams p       = base;
-        p.loops                 = num_passes;
-        p.instructions_per_loop = static_cast<uint32_t>(lines_per_pass);
-        p.bytes_per_insn        = static_cast<uint32_t>(kCacheLine);
 
         char size_str[16];
         format_buf_size(size_str, sizeof(size_str), buf_size);
@@ -832,8 +601,10 @@ static void run_ldnp_bw_sweep(void* buf, const BenchmarkParams& base) {
         char name[64];
         snprintf(name, sizeof(name), "LDNP load bw   %s", size_str);
 
-        benchmark(fn, name, p);
-        g_jit_pool->release(fn);
+        run_one(name, fn,
+                params_for(base, num_passes,
+                           static_cast<uint32_t>(lines_per_pass),
+                           static_cast<uint32_t>(kCacheLine)));
     }
 }
 
@@ -843,8 +614,11 @@ static void run_ldnp_bw_sweep(void* buf, const BenchmarkParams& base) {
 // within the allocated buffer, we limit buf_size to kMaxBufSize/2.
 
 static void run_copy_bw_sweep(void* buf, const BenchmarkParams& base) {
-    printf("\n── LDP→STP copy bandwidth (%u-stream, %u-byte step) ────────────\n",
-           kBwLines * 4u, static_cast<uint32_t>(kBwStep));
+    char title[96];
+    snprintf(title, sizeof(title),
+             "LDP→STP copy bandwidth (%u-stream, %u-byte step)",
+             kBwLines * 4u, static_cast<uint32_t>(kBwStep));
+    section(title);
 
     const uintptr_t buf_addr = reinterpret_cast<uintptr_t>(buf);
     const size_t    half     = kMaxBufSize / 2;
@@ -863,12 +637,6 @@ static void run_copy_bw_sweep(void* buf, const BenchmarkParams& base) {
         num_passes = scale_loops(num_passes);
 
         JitPool::TestFn fn = build_seq_copy_bw(src_base, dst_base, buf_size, num_passes);
-        if (!fn) continue;
-
-        BenchmarkParams p       = base;
-        p.loops                 = num_passes;
-        p.instructions_per_loop = static_cast<uint32_t>(lines_per_pass);
-        p.bytes_per_insn        = static_cast<uint32_t>(kCacheLine);
 
         char size_str[16];
         format_buf_size(size_str, sizeof(size_str), buf_size);
@@ -876,8 +644,10 @@ static void run_copy_bw_sweep(void* buf, const BenchmarkParams& base) {
         char name[64];
         snprintf(name, sizeof(name), "LDP→STP copy   %s", size_str);
 
-        benchmark(fn, name, p);
-        g_jit_pool->release(fn);
+        run_one(name, fn,
+                params_for(base, num_passes,
+                           static_cast<uint32_t>(lines_per_pass),
+                           static_cast<uint32_t>(kCacheLine)));
     }
 }
 
@@ -885,7 +655,7 @@ static void run_copy_bw_sweep(void* buf, const BenchmarkParams& base) {
 
 void run_memory_tests(const BenchmarkParams& base_params) {
     // Allocate the backing buffer once. All sweeps share it.
-    void* buf = alloc_large(kMaxBufSize);
+    void* buf = alloc_pages(kMaxBufSize);
     if (!buf) {
         fprintf(stderr, "run_memory_tests: failed to allocate %zuMB backing buffer\n",
                 kMaxBufSize / (1024 * 1024));
@@ -895,14 +665,10 @@ void run_memory_tests(const BenchmarkParams& base_params) {
     // Touch all pages to fault them in before benchmarking. Without this,
     // the first sweep would pay page-fault overhead on top of cache-miss
     // latency, conflating two completely different costs.
-    // memset is deliberately avoided here — we don't want to warm the cache
-    // with a sequential write that might influence the first latency test.
-    // Instead, write a single byte per page (4KB) to commit the pages.
-    {
-        uint8_t* p = static_cast<uint8_t*>(buf);
-        for (size_t off = 0; off < kMaxBufSize; off += 4096)
-            p[off] = 0;
-    }
+    // commit_pages() deliberately avoids memset — a sequential write over the
+    // whole buffer would warm the cache and influence the first latency test.
+    // It writes a single byte per 4KB page instead.
+    commit_pages(buf, kMaxBufSize);
 
     run_latency_sweep(buf, base_params);
     run_tlb_sweep(buf, base_params);
@@ -911,7 +677,7 @@ void run_memory_tests(const BenchmarkParams& base_params) {
     run_ldnp_bw_sweep(buf, base_params);
     run_copy_bw_sweep(buf, base_params);
 
-    free_large(buf, kMaxBufSize);
+    free_pages(buf, kMaxBufSize);
 }
 
 } // namespace arm64bench::gen
