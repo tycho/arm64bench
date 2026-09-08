@@ -15,6 +15,20 @@ namespace arm64bench {
 
 JitPool* g_jit_pool = nullptr;
 
+// Without a handler AsmJit records an error and silently skips the offending
+// instruction, so a rejected encoding turns into a function with a hole in
+// it. Print every error as it happens; compile() also fails the function.
+namespace {
+struct PrintingErrorHandler : asmjit::ErrorHandler {
+    void handle_error(asmjit::Error err, const char* message,
+                      asmjit::BaseEmitter* /*origin*/) override {
+        fprintf(stderr, "asmjit error %u: %s\n", static_cast<unsigned>(err), message);
+        fflush(stderr);
+    }
+};
+PrintingErrorHandler s_error_handler;
+} // namespace
+
 JitPool::JitPool() {
     // JitRuntime's constructor detects the current architecture and OS and
     // configures the appropriate memory allocation strategy:
@@ -32,6 +46,7 @@ void JitPool::init_code_holder(asmjit::CodeHolder& code) {
                 "JitPool::init_code_holder failed: %s\n",
                 asmjit::stringify_error(err));
     }
+    code.set_error_handler(&s_error_handler);
 }
 
 JitPool::TestFn JitPool::compile(asmjit::CodeHolder& code) {
