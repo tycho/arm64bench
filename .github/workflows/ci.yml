@@ -37,7 +37,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build clang
+          sudo apt-get install -y cmake ninja-build clang
 
       # clang-cl needs the MSVC headers/libraries and the Windows SDK in the
       # environment (INCLUDE / LIB / PATH). vcvars sets all of that up.
@@ -111,7 +111,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build clang
+          sudo apt-get install -y cmake ninja-build clang
       - name: MSVC environment (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
