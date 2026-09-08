@@ -37,14 +37,17 @@ using TestFn = void (*)();
 // ── Reference function for Tier 2 ratio normalization ───────────────────────
 
 // A registered reference function is run (untimed) once to warm I-cache, then
-// timed once before and once after every timed test sample. The ratio
+// timed once before and once after every timed test sample. The reported
+// ratio is
 //
-//   ratio = (test_ns / test_total_insns) / avg(ref_before_ns, ref_after_ns)
-//            ────────────────────────────   ─────────────────────────────────
-//               test ns/insn                  ref ns/insn  (≈ 1 cycle worth)
+//   ratio = min over samples (test_ns / test_total_insns)
+//           ────────────────────────────────────────────
+//           min over probes  (ref_ns  / ref_total_insns)   (≈ 1 cycle worth)
 //
-// cancels out the clock frequency, making CPI portable across machines and
-// robust against external P-state drift between samples.
+// which cancels out the clock frequency, making CPI portable across machines
+// and robust against external P-state drift between samples. Each minimum is
+// the cleanest observation of its side; a per-sample paired ratio would be
+// biased on a noisy host toward whichever of test or reference is shorter.
 //
 // The reference should be a chained 1-cycle-per-instruction loop (e.g. ADD
 // latency chain) so that ratio directly equals the test's CPI.

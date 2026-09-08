@@ -241,7 +241,7 @@ available method at runtime.
 Normalize every test result against a 1-cycle reference instruction (ADD reg, reg, reg) measured
 immediately before and after each timed sample. Clock speed cancels in the ratio:
 
-    ratio = test_ns / avg(ref_before_ns, ref_after_ns)
+    ratio = min(test_ns/insn over samples) / min(ref_ns/insn over all probes)
 
 If `|ref_after - ref_before| / ref_before > threshold`, the measurement is flagged as potentially
 affected by a P-state change *between* the reference probes (external throttle). The sample is
@@ -251,10 +251,11 @@ re-taken up to a retry limit.
 clock speed; both reference probes see the un-throttled rate). For instruction classes known to
 risk this (SVE2 wide ops), results should be labelled as potentially reflecting throttled execution.
 
-**Second limitation**: the harness keeps the *minimum* per-sample ratio, so on a host where the
-longer reference probes are preempted more often than the shorter test, every ratio is biased
-low (seen on the macOS CI runner: 0.67 clk~ for a chained ADD). A stable machine does not show
-this; on a noisy one, prefer `sudo` (PMU) or treat `clk~` as approximate.
+**Why min/min and not min of paired ratios**: on an oversubscribed host the shorter of (test,
+reference) is more likely to get a preemption-free run, so the minimum of per-sample ratios is
+biased toward whichever side is shorter (the macOS CI runner produced 0.67 clk~ for a chained ADD
+against 5 ms reference probes). Each minimum approximates the uncontended time on its own, and on
+a quiet machine the two estimators agree to three digits.
 
 **Tier 3 — Wall-clock × calibrated frequency (current baseline)**
 

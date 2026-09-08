@@ -360,7 +360,7 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
 
     double   sample_ns[kMaxSamples];
     uint64_t sample_cyc[kMaxSamples]   = {};   // 0 when PMU not available
-    double   sample_ratio[kMaxSamples] = {};   // 0 when reference not available
+    double   min_ref_ns                = 0.0;  // fastest reference probe seen (0 = none)
     bool     any_ratio_unstable        = false;
 
     // ── Timed sampling (priority-elevated) ───────────────────────────────
@@ -418,17 +418,17 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
                         : 100.0;
                     const bool stable = (ref_diverge_pct <= s_ref.instability_pct);
 
+                    // Every probe, stable or not, is a candidate for the fastest
+                    // reference: a probe can only be slowed by interference,
+                    // never sped up, so the minimum is the cleanest estimate.
+                    if (ref_before_ns > 0.0 && (min_ref_ns == 0.0 || ref_before_ns < min_ref_ns))
+                        min_ref_ns = ref_before_ns;
+                    if (ref_after_ns > 0.0 && (min_ref_ns == 0.0 || ref_after_ns < min_ref_ns))
+                        min_ref_ns = ref_after_ns;
+
                     if (stable || attempt == s_ref.retry_limit) {
                         sample_ns[s]  = test_ns;
                         sample_cyc[s] = cyc1 - cyc0;
-
-                        // ratio = (test_ns/insn) / (ref_avg_ns/ref_insn)
-                        // When ref is a 1-cycle chain, ratio == CPI of the test.
-                        const double ref_avg_ns = (ref_before_ns + ref_after_ns) * 0.5;
-                        if (ref_avg_ns > 0.0) {
-                            sample_ratio[s] =
-                                (test_ns * inv_insns) / (ref_avg_ns * ref_inv_insns);
-                        }
                         if (!stable) any_ratio_unstable = true;
                         break;
                     }
@@ -469,14 +469,17 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
                 min_cycles = sample_cyc[s];
     }
 
-    // Minimum ratio (Tier 2): lowest CPI ratio across all samples.
+    // Tier 2 ratio: fastest test sample over fastest reference probe.
+    //
+    // Not the minimum of per-sample ratios: on an oversubscribed host the
+    // shorter of (test, reference) is more likely to get a preemption-free
+    // run, so min-of-ratios is biased toward whichever side is shorter (the
+    // macOS CI runner produced 0.67 clk for a chained ADD that way). The two
+    // minimums each approximate the uncontended time, and on a quiet machine
+    // they give the same answer as the paired ratio did.
     double min_ratio = 0.0;
-    if (use_ref) {
-        for (uint32_t s = 0; s < num_samples; ++s)
-            if (sample_ratio[s] > 0.0 &&
-                (min_ratio == 0.0 || sample_ratio[s] < min_ratio))
-                min_ratio = sample_ratio[s];
-    }
+    if (use_ref && min_ref_ns > 0.0 && stats.min > 0.0)
+        min_ratio = (stats.min * inv_insns) / (min_ref_ns * ref_inv_insns);
 
     BenchmarkResult result{};
     result.total_instructions  = total_insns;
