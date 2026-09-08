@@ -10,20 +10,42 @@ cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -G Ninja
 ninja
 ```
 
-**Requirements:** CMake 3.20+, Clang (MSVC is explicitly rejected). AsmJit is fetched automatically as a dependency.
+Or with presets (`macos-release`, `linux-clang-release`, `win-clangcl-release`, ...; see `CMakePresets.json`):
+
+```bash
+cmake --preset macos-release && cmake --build --preset macos-release && ctest --preset macos-release
+```
+
+**Requirements:** CMake 3.25+, Clang (MSVC is explicitly rejected; clang-cl is fine). AsmJit is a
+git submodule under `contrib/asmjit` — clone with `--recurse-submodules`.
 
 Default build type is `RelWithDebInfo`. Release builds use `-O3`.
+
+Targets: `arm64bench` (the benchmark), `arm64bench_core` (static library with everything but
+`main()`), `arm64bench_selftest` (measurement-machinery tests). CTest registers `selftest` and
+`smoke` (= `arm64bench --all --smoke`).
 
 Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU cycle counting; unprivileged runs fall back to Tier 2 ratio normalization.
 
 ## Run
 
 ```bash
-./arm64bench [--all | --integer | --memory | --branch | --simd | --pitfalls]
+./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
+             [--smoke] [--filter <substr>]
 ```
 
 Default (no flags): runs integer and memory tests.
+
+- `--smoke`: execute every generated test function once with loop counts divided by 1000, print
+  `ok` per test, record no measurements. Exit code is non-zero if no test ran. This is what CI
+  runs; a SIGILL from a bad encoding leaves the failing test name as the last line of output.
+- `--filter <substr>`: only run tests whose name contains the substring (use it to re-run a single
+  test that crashed under `--smoke`).
+
+```bash
+./arm64bench_selftest [--verbose]   # timer / PMU / calibration / harness sanity checks; sudo for PMU
+```
 
 ## Architecture
 
@@ -41,6 +63,8 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_fp_simd.h/.cpp` | FP, NEON SIMD, crypto, and advanced SIMD tests |
 | `src/gen_lse.h/.cpp` | LSE atomics latency/throughput tests |
 | `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding) |
+| `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
+| `.github/workflows/ci.yml` | GitHub Actions: build + selftest + smoke on macOS/Linux/Windows arm64 runners |
 
 ## Code Conventions
 
@@ -71,7 +95,44 @@ declaration without an implementation). When adding several related test
 sections, split them into a series of small commits — one per section —
 so any single one can be reverted cleanly without unwinding the rest.
 Build (`ninja`) and run the affected `--integer` / `--simd` / `--pitfalls`
-flag between each commit.
+flag between each commit. `ctest` (selftest + smoke) must stay green.
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs one job per OS on GitHub's arm64 hosted runners:
+
+| Runner | Hardware | Toolchain |
+|---|---|---|
+| `macos-15` | Apple Silicon VM | Xcode clang, preset `macos-release` |
+| `ubuntu-24.04-arm` | Azure Cobalt 100 (Neoverse N2) | apt clang, preset `linux-clang-release` |
+| `windows-11-arm` | Azure Cobalt 100 (Neoverse N2) | clang-cl via vcvars, preset `win-clangcl-release` |
+
+Each job builds, runs `arm64bench_selftest`, then `arm64bench --all --smoke`. A separate
+`workflow_dispatch`-only job runs the full measured suite and uploads the CSV.
+
+**What CI verifies:** every generator compiles on all three toolchains, and every JIT-emitted
+instruction sequence executes on the host core (feature-detection branches included — Neoverse N2
+has I8MM, BF16, LRCPC2, DotProd, so paths Apple Silicon never takes get exercised there).
+
+**What CI cannot verify:** numbers. All three runners are VMs with the PMU hidden (kpc fails even
+under `sudo`, PMCCNTR_EL0 traps), so everything falls to Tier 2 ratio normalization on a shared
+host. Never gate on a measured value. The selftest's PMU section reports SKIP there.
+
+**Running the jobs locally** (`act` is installed via Homebrew, Docker Desktop provides arm64
+containers):
+
+```bash
+# macOS job, directly on this machine (no container):
+act push -W .github/workflows/ci.yml -j build-test --matrix os:macos-15 -P macos-15=-self-hosted
+
+# Linux job, in an arm64 Ubuntu container:
+act push -W .github/workflows/ci.yml -j build-test --matrix os:ubuntu-24.04-arm \
+    -P ubuntu-24.04-arm=catthehacker/ubuntu:act-24.04 --container-architecture linux/arm64
+```
+
+The act Ubuntu image lacks cmake, which is why the Linux apt step installs it (a no-op on GitHub).
+The Windows job cannot run under act; test it live on GitHub, or register a self-hosted runner in a
+Windows 11 ARM64 VM (Parallels/UTM) and point `runs-on` at it temporarily.
 
 ## JIT Loop Structure
 
