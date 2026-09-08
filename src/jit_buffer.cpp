@@ -19,15 +19,22 @@ JitPool* g_jit_pool = nullptr;
 // instruction, so a rejected encoding turns into a function with a hole in
 // it. Print every error as it happens; compile() also fails the function.
 namespace {
+uint32_t s_error_count = 0;
+
 struct PrintingErrorHandler : asmjit::ErrorHandler {
     void handle_error(asmjit::Error err, const char* message,
                       asmjit::BaseEmitter* /*origin*/) override {
+        ++s_error_count;
         fprintf(stderr, "asmjit error %u: %s\n", static_cast<unsigned>(err), message);
         fflush(stderr);
     }
 };
 PrintingErrorHandler s_error_handler;
 } // namespace
+
+uint32_t jit_error_count() {
+    return s_error_count;
+}
 
 JitPool::JitPool() {
     // JitRuntime's constructor detects the current architecture and OS and

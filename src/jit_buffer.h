@@ -79,6 +79,10 @@ private:
     asmjit::JitRuntime _rt;
 };
 
+// Number of AsmJit emit errors reported so far (each one is an instruction
+// that was rejected and therefore missing from the generated code).
+uint32_t jit_error_count();
+
 // Process-wide JIT pool. Created in main() before any test generators run,
 // and valid for the entire lifetime of the process.
 //

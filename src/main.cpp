@@ -241,14 +241,21 @@ int main(int argc, char** argv) {
 
     int exit_code = 0;
     if (smoke_mode) {
-        const uint32_t n = arm64bench::smoke_test_count();
+        const uint32_t n    = arm64bench::smoke_test_count();
+        const uint32_t errs = arm64bench::jit_error_count();
         printf("── Smoke summary ─────────────────────────────────────────────\n");
         if (n == 0) {
             printf("FAIL: no tests executed%s\n",
                    name_filter ? " (filter matched nothing)" : "");
             exit_code = 1;
+        } else if (errs > 0) {
+            // A rejected instruction is a test that ran without part of its
+            // body; the run is not evidence that the body encodes.
+            printf("FAIL: %u tests executed, but AsmJit rejected %u instruction(s)"
+                   " (see 'asmjit error' lines above)\n", n, errs);
+            exit_code = 1;
         } else {
-            printf("OK: %u tests executed\n", n);
+            printf("OK: %u tests executed, no encoding errors\n", n);
         }
     }
 
