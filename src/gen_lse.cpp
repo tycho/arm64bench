@@ -2,8 +2,7 @@
 // LSE atomic microbenchmark generator.
 
 #include "gen_lse.h"
-#include "jit_buffer.h"
-#include "harness.h"
+#include "gen_common.h"
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
 #include <cstdio>
@@ -22,28 +21,11 @@ using namespace asmjit::a64;
 // start state.
 alignas(64) static uint64_t g_atomic_target;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-static BenchmarkParams make_params(const BenchmarkParams& base,
-                                   uint64_t loops, uint32_t unroll) {
-    BenchmarkParams p         = base;
-    p.loops                   = loops;
-    p.instructions_per_loop   = unroll;
-    return p;
-}
-
-static void run_one(const char* name, JitPool::TestFn fn,
-                    const BenchmarkParams& params) {
-    if (!fn) { fprintf(stderr, "LSE: skipping %s (compile failed)\n", name); return; }
-    benchmark(fn, name, params);
-    g_jit_pool->release(fn);
-}
-
 // ── Generic atomic loop builder ───────────────────────────────────────────────
 //
 // Register assignments in the generated code:
-//   x19  = outer loop counter (callee-saved; saved/restored in prologue)
-//   x20  = address of g_atomic_target (callee-saved; saved/restored)
+//   x19  = outer loop counter (managed by build_loop)
+//   x20  = address of g_atomic_target (saved/restored by build_loop)
 //   x0   = constant operand: addend for LDADD, swap value for SWP (= 1)
 //   x1   = result register: receives the old memory value (discarded)
 //
@@ -54,39 +36,13 @@ template<typename F>
 static JitPool::TestFn build_atomic_loop(uint64_t loops, uint32_t unroll,
                                           F&& emit_body) {
     g_atomic_target = 0;
-
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    // ── Prologue ─────────────────────────────────────────────────────────
-    a.sub(sp, sp, Imm(16));
-    a.stp(x19, x20, ptr(sp));
-
-    a.mov(x19, Imm(loops));
-    a.mov(x20, Imm(reinterpret_cast<uint64_t>(&g_atomic_target)));
-    a.mov(x0,  Imm(1));        // constant addend / swap value
-    a.mov(x1,  Imm(0));        // result register pre-cleared
-
-    // ── Loop (64-byte aligned) ────────────────────────────────────────────
-    a.align(AlignMode::kCode, 64);
-    Label top = a.new_label();
-    a.bind(top);
-
-    for (uint32_t u = 0; u < unroll; ++u)
-        emit_body(a, u);
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, top);
-
-    // ── Epilogue ──────────────────────────────────────────────────────────
-    a.ldp(x19, x20, ptr(sp));
-    a.add(sp, sp, Imm(16));
-    a.ret(x30);
-
-    JitPool::TestFn fn = g_jit_pool->compile(code);
-    if (!fn) fprintf(stderr, "build_atomic_loop: compile failed\n");
-    return fn;
+    return build_loop(loops, unroll,
+        [](a64::Assembler& a) {
+            a.mov(x20, Imm(reinterpret_cast<uint64_t>(&g_atomic_target)));
+            a.mov(x0,  Imm(1));        // constant addend / swap value
+            a.mov(x1,  Imm(0));        // result register pre-cleared
+        },
+        emit_body);
 }
 
 // ── CAS loop builder ─────────────────────────────────────────────────────────
@@ -107,41 +63,19 @@ static JitPool::TestFn build_atomic_loop(uint64_t loops, uint32_t unroll,
 static JitPool::TestFn build_cas_loop(uint64_t loops, uint32_t unroll,
                                        bool acquire_release) {
     g_atomic_target = 0;
-
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    a.sub(sp, sp, Imm(16));
-    a.stp(x19, x20, ptr(sp));
-
-    a.mov(x19, Imm(loops));
-    a.mov(x20, Imm(reinterpret_cast<uint64_t>(&g_atomic_target)));
-    a.mov(x0,  Imm(0));   // expected = 0 (= current memory value)
-    a.mov(x1,  Imm(0));   // new value = 0 (CAS writes 0, no change to mem)
-
-    a.align(AlignMode::kCode, 64);
-    Label top = a.new_label();
-    a.bind(top);
-
-    for (uint32_t u = 0; u < unroll; ++u) {
-        if (acquire_release)
-            a.casal(x0, x1, ptr(x20));   // full seq-cst CAS
-        else
-            a.cas(x0, x1, ptr(x20));     // relaxed CAS
-        // After: x0 = old_mem = 0 (data dep chain); mem = 0 (unchanged)
-    }
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, top);
-
-    a.ldp(x19, x20, ptr(sp));
-    a.add(sp, sp, Imm(16));
-    a.ret(x30);
-
-    JitPool::TestFn fn = g_jit_pool->compile(code);
-    if (!fn) fprintf(stderr, "build_cas_loop: compile failed\n");
-    return fn;
+    return build_loop(loops, unroll,
+        [](a64::Assembler& a) {
+            a.mov(x20, Imm(reinterpret_cast<uint64_t>(&g_atomic_target)));
+            a.mov(x0,  Imm(0));   // expected = 0 (= current memory value)
+            a.mov(x1,  Imm(0));   // new value = 0 (CAS writes 0, no change to mem)
+        },
+        [acquire_release](a64::Assembler& a, uint32_t) {
+            if (acquire_release)
+                a.casal(x0, x1, ptr(x20));   // full seq-cst CAS
+            else
+                a.cas(x0, x1, ptr(x20));     // relaxed CAS
+            // After: x0 = old_mem = 0 (data dep chain); mem = 0 (unchanged)
+        });
 }
 
 // ── LL/SC loop builder ────────────────────────────────────────────────────────
@@ -160,39 +94,17 @@ static JitPool::TestFn build_cas_loop(uint64_t loops, uint32_t unroll,
 
 static JitPool::TestFn build_llsc_loop(uint64_t loops, uint32_t unroll) {
     g_atomic_target = 0;
-
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    a.sub(sp, sp, Imm(16));
-    a.stp(x19, x20, ptr(sp));
-
-    a.mov(x19, Imm(loops));
-    a.mov(x20, Imm(reinterpret_cast<uint64_t>(&g_atomic_target)));
-    a.mov(x0,  Imm(1));   // addend
-
-    a.align(AlignMode::kCode, 64);
-    Label top = a.new_label();
-    a.bind(top);
-
-    for (uint32_t u = 0; u < unroll; ++u) {
-        a.ldaxr(x1, ptr(x20));      // load-acquire-exclusive
-        a.add(x1, x1, x0);          // x1 += 1
-        a.stlxr(w2, x1, ptr(x20)); // store-release-exclusive (result in w2)
-        // No CBNZ retry: see comment above.
-    }
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, top);
-
-    a.ldp(x19, x20, ptr(sp));
-    a.add(sp, sp, Imm(16));
-    a.ret(x30);
-
-    JitPool::TestFn fn = g_jit_pool->compile(code);
-    if (!fn) fprintf(stderr, "build_llsc_loop: compile failed\n");
-    return fn;
+    return build_loop(loops, unroll,
+        [](a64::Assembler& a) {
+            a.mov(x20, Imm(reinterpret_cast<uint64_t>(&g_atomic_target)));
+            a.mov(x0,  Imm(1));   // addend
+        },
+        [](a64::Assembler& a, uint32_t) {
+            a.ldaxr(x1, ptr(x20));      // load-acquire-exclusive
+            a.add(x1, x1, x0);          // x1 += 1
+            a.stlxr(w2, x1, ptr(x20)); // store-release-exclusive (result in w2)
+            // No CBNZ retry: see comment above.
+        });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -236,7 +148,7 @@ static void run_lse_atomic_tests(const BenchmarkParams& base,
         g_atomic_target = 0;
         auto fn = build_atomic_loop(loops, unroll, t.emit);
         snprintf(name, sizeof(name), "%s (%ux)", t.label, unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── STADD: store-add (no return value) ─────────────────────────────────
@@ -266,7 +178,7 @@ static void run_lse_atomic_tests(const BenchmarkParams& base,
         g_atomic_target = 0;
         auto fn = build_atomic_loop(loops, unroll, t.emit);
         snprintf(name, sizeof(name), "%s (%ux)", t.label, unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── SWP: atomic exchange ────────────────────────────────────────────────
@@ -300,7 +212,7 @@ static void run_lse_atomic_tests(const BenchmarkParams& base,
         g_atomic_target = 0;
         auto fn = build_atomic_loop(loops, unroll, t.emit);
         snprintf(name, sizeof(name), "%s (%ux)", t.label, unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── CAS: compare-and-swap ───────────────────────────────────────────────
@@ -322,7 +234,7 @@ static void run_lse_atomic_tests(const BenchmarkParams& base,
         auto fn = build_cas_loop(loops, unroll, acqrel);
         snprintf(name, sizeof(name), "%-22s (%ux)",
                  acqrel ? "CASAL   (acq+rel)" : "CAS     (no ord) ", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 
     // ── LDAXR + ADD + STLXR (LL/SC, full ordering) ─────────────────────────
@@ -343,7 +255,7 @@ static void run_lse_atomic_tests(const BenchmarkParams& base,
         g_atomic_target = 0;
         auto fn = build_llsc_loop(loops, unroll);
         snprintf(name, sizeof(name), "LDAXR+STLXR (acq+rel) (%ux)", unroll);
-        run_one(name, fn, make_params(base, loops, unroll));
+        run_one(name, fn, params_for(base, loops, unroll));
     }
 }
 
@@ -357,7 +269,7 @@ void run_lse_tests(const BenchmarkParams& base_params) {
     const uint32_t unroll = (base_params.instructions_per_loop > 8)
                           ? 8u : base_params.instructions_per_loop;
 
-    printf("\n── LSE atomics (single-threaded, L1-hot) ──────────────────────\n");
+    section("LSE atomics (single-threaded, L1-hot)");
     printf("  clk/op = round-trip latency per atomic RMW on a hot cache line.\n"
            "  All ops target one 64-byte-aligned L1-resident word.\n\n");
     run_lse_atomic_tests(base_params, loops, unroll);

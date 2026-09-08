@@ -43,6 +43,7 @@ add_library(arm64bench_core STATIC
     src/cpu_features.cpp
     src/jit_buffer.cpp
     src/calibrate.cpp
+    src/gen_common.cpp
     src/gen_integer.cpp
     src/gen_memory.cpp
     src/gen_branch.cpp
