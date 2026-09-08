@@ -20,7 +20,16 @@
 // are reported as SKIP, not FAIL. The process exit code is the number of
 // failed checks, so `ctest` and CI treat any failure as red.
 //
-// Usage: arm64bench_selftest [--verbose]
+// Two kinds of check: correctness (call counts, monotonic clocks, feature
+// implications, result-structure invariants) and measurement quality (a
+// chained ADD reads ~1 clk, sleeps are not absurdly long, calibration is
+// plausible). On a shared, oversubscribed CI VM the quality checks can fail
+// with nothing wrong in the code — a runner where 10 ms sleeps take 50 ms
+// makes the reference probes slower than the test and drags ratios below
+// 1. With --lenient (or ARM64BENCH_SELFTEST_LENIENT=1) quality checks print
+// WARN instead of FAIL and do not affect the exit code.
+//
+// Usage: arm64bench_selftest [--verbose] [--lenient]
 
 #include "harness.h"
 #include "timer.h"
@@ -37,6 +46,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -59,13 +69,31 @@ using namespace asmjit::a64;
 static int  s_failed  = 0;
 static int  s_passed  = 0;
 static int  s_skipped = 0;
+static int  s_warned  = 0;
 static bool s_verbose = false;
+static bool s_lenient = false;
 
 #define CHECK(cond, ...)                                                     \
     do {                                                                     \
         if (cond) {                                                          \
             ++s_passed;                                                      \
             if (s_verbose) { printf("    pass: "); printf(__VA_ARGS__); printf("\n"); } \
+        } else {                                                             \
+            ++s_failed;                                                      \
+            printf("    FAIL: "); printf(__VA_ARGS__); printf("\n");         \
+        }                                                                    \
+        fflush(stdout);                                                      \
+    } while (0)
+
+// Measurement-quality check: FAIL normally, WARN under --lenient.
+#define CHECK_Q(cond, ...)                                                   \
+    do {                                                                     \
+        if (cond) {                                                          \
+            ++s_passed;                                                      \
+            if (s_verbose) { printf("    pass: "); printf(__VA_ARGS__); printf("\n"); } \
+        } else if (s_lenient) {                                              \
+            ++s_warned;                                                      \
+            printf("    WARN: "); printf(__VA_ARGS__); printf("  [lenient]\n"); \
         } else {                                                             \
             ++s_failed;                                                      \
             printf("    FAIL: "); printf(__VA_ARGS__); printf("\n");         \
@@ -239,8 +267,8 @@ static void test_sleep_wall_time() {
         if (measured[i] > 200.0) none_absurd = false;
     }
     CHECK(none_short,  "no sleep returned early (all >= 9 ms)");
-    CHECK(none_absurd, "no sleep took more than 200 ms");
-    CHECK(total < 500.0, "5 x 10 ms sleeps took %.1f ms total (< 500 ms)", total);
+    CHECK_Q(none_absurd, "no sleep took more than 200 ms");
+    CHECK_Q(total < 500.0, "5 x 10 ms sleeps took %.1f ms total (< 500 ms)", total);
 }
 
 // PMU-implied clock from a 10 ms spin, or 0 if the PMU is unavailable.
@@ -284,7 +312,7 @@ static void test_cycle_counter() {
         const double   wall_ns = spin_ns(10'000'000);
         const uint64_t c1 = cycle_counter_read();
         s_pmu_spin_ghz = static_cast<double>(c1 - c0) / wall_ns;
-        CHECK(s_pmu_spin_ghz > 0.3 && s_pmu_spin_ghz < 8.0,
+        CHECK_Q(s_pmu_spin_ghz > 0.3 && s_pmu_spin_ghz < 8.0,
               "10 ms spin implies %.3f GHz (expect 0.3-8 GHz)", s_pmu_spin_ghz);
     }
 
@@ -299,7 +327,7 @@ static void test_cycle_counter() {
         const double sleep_ghz = static_cast<double>(c1 - c0) / 10e6;
         note("10 ms sleep charged %.3f GHz-equivalent of cycles", sleep_ghz);
 #if defined(__APPLE__)
-        CHECK(sleep_ghz < s_pmu_spin_ghz * 0.5,
+        CHECK_Q(sleep_ghz < s_pmu_spin_ghz * 0.5,
               "per-thread counter charges < 50%% of spin rate while sleeping");
 #endif
     }
@@ -321,7 +349,7 @@ static void test_cycle_counter() {
                 const double cpi = static_cast<double>(c1 - c0) / (kLoops * kUnroll);
                 if (cpi < best) best = cpi;
             }
-            CHECK(best > 0.90 && best < 1.25,
+            CHECK_Q(best > 0.90 && best < 1.25,
                   "chained ADD = %.3f cycles/insn by PMU (expect ~1.0)", best);
             g_jit_pool->release(fn);
         }
@@ -333,7 +361,7 @@ static void test_calibration() {
 
     const uint64_t hz = calibrate_cpu_freq();
     CHECK(hz == g_cpu_freq_hz, "calibrate_cpu_freq() stores its result in g_cpu_freq_hz");
-    CHECK(hz >= 300'000'000ULL && hz <= 8'000'000'000ULL,
+    CHECK_Q(hz >= 300'000'000ULL && hz <= 8'000'000'000ULL,
           "calibrated %.0f MHz (expect 300-8000 MHz)", hz / 1e6);
 
     // Sanity: ticks_to_cycles() uses the calibrated value.
@@ -469,12 +497,12 @@ static void test_harness_measurements() {
             CHECK(r.coeff_variation_pct >= 0.0, "CoV = %.2f%% >= 0", r.coeff_variation_pct);
             CHECK(r.cycle_source != CycleSource::Unknown,
                   "a cycle source was selected (%d)", static_cast<int>(r.cycle_source));
-            CHECK(r.min_clocks_per_insn > 0.80 && r.min_clocks_per_insn < 1.30,
+            CHECK_Q(r.min_clocks_per_insn > 0.80 && r.min_clocks_per_insn < 1.30,
                   "chained ADD = %.3f clk/insn (expect ~1.0)", r.min_clocks_per_insn);
             // Under the ratio tier the number is ~1 by construction (the
             // reference is the same instruction), so also check the raw wall
             // time is plausible: 1 cycle at 0.3–8 GHz is 0.125–3.3 ns.
-            CHECK(r.min_ns_per_insn > 0.10 && r.min_ns_per_insn < 4.0,
+            CHECK_Q(r.min_ns_per_insn > 0.10 && r.min_ns_per_insn < 4.0,
                   "chained ADD = %.4f ns/insn (expect 0.1-4 ns)", r.min_ns_per_insn);
             g_jit_pool->release(fn);
         }
@@ -493,7 +521,7 @@ static void test_harness_measurements() {
             p.loops = 100'000; p.instructions_per_loop = 64;
             const BenchmarkResult r64 = benchmark(f64, "selftest ADD latency x64", p);
             const double ratio = r8.min_ns_per_insn / r64.min_ns_per_insn;
-            CHECK(ratio > 0.85 && ratio < 1.20,
+            CHECK_Q(ratio > 0.85 && ratio < 1.20,
                   "ns/insn ratio 8x/64x = %.3f (expect ~1.0)", ratio);
             g_jit_pool->release(f8);
             g_jit_pool->release(f64);
@@ -509,7 +537,7 @@ static void test_harness_measurements() {
         if (fn) {
             p.loops = 200'000; p.instructions_per_loop = 32;
             const BenchmarkResult r = benchmark(fn, "selftest ADD tput 4 chains", p);
-            CHECK(r.min_clocks_per_insn > 0.0 && r.min_clocks_per_insn < 0.80,
+            CHECK_Q(r.min_clocks_per_insn > 0.0 && r.min_clocks_per_insn < 0.80,
                   "4-chain ADD = %.3f clk/insn (expect < 0.8)", r.min_clocks_per_insn);
             g_jit_pool->release(fn);
         }
@@ -574,17 +602,22 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             s_verbose = true;
+        } else if (strcmp(argv[i], "--lenient") == 0) {
+            s_lenient = true;
         } else {
-            fprintf(stderr, "Usage: %s [--verbose]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--verbose] [--lenient]\n", argv[0]);
             return 2;
         }
     }
+    if (const char* e = getenv("ARM64BENCH_SELFTEST_LENIENT"); e && *e && *e != '0')
+        s_lenient = true;
 
 #if defined(_WIN32)
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
-    printf("arm64bench selftest  (built %s %s)\n\n", __DATE__, __TIME__);
+    printf("arm64bench selftest  (built %s %s)%s\n\n", __DATE__, __TIME__,
+           s_lenient ? "  [lenient: measurement-quality checks warn only]" : "");
 
     JitPool jit_pool;
     g_jit_pool = &jit_pool;
@@ -601,7 +634,7 @@ int main(int argc, char** argv) {
 
     g_jit_pool = nullptr;
 
-    printf("\n%d passed, %d failed, %d skipped\n", s_passed, s_failed, s_skipped);
+    printf("\n%d passed, %d failed, %d warned, %d skipped\n", s_passed, s_failed, s_warned, s_skipped);
     printf(s_failed ? "SELFTEST FAILED\n" : "SELFTEST OK\n");
     return s_failed > 255 ? 255 : s_failed;
 }

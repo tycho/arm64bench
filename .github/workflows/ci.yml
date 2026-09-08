@@ -67,7 +67,12 @@ jobs:
       # the PMU), calibration, and harness call accounting. Smoke executes
       # every generated test once so any encoding that faults on this core
       # fails the job with the test name as the last line of output.
+      # Shared runner VMs are heavily oversubscribed (10 ms sleeps have been
+      # measured at 50 ms), so measurement-quality checks only warn here;
+      # correctness checks still fail the job.
       - name: Selftest
+        env:
+          ARM64BENCH_SELFTEST_LENIENT: "1"
         run: ctest --preset ${{ matrix.preset }} -R '^selftest$'
 
       - name: Smoke (all categories)
