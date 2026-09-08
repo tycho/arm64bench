@@ -52,6 +52,7 @@ add_library(arm64bench_core STATIC
     src/gen_i8mm.cpp
     src/gen_lse.cpp
     src/gen_pitfalls.cpp
+    src/gen_ooo.cpp
 )
 target_include_directories(arm64bench_core PUBLIC src)
 target_link_libraries(arm64bench_core PUBLIC asmjit::asmjit)

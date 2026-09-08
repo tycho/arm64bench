@@ -30,7 +30,7 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 ## Run
 
 ```bash
-./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls]
+./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
              [--smoke] [--filter <substr>]
 ```
@@ -67,6 +67,7 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_i8mm.h/.cpp` | FEAT_I8MM USDOT/SMMLA/UMMLA/USMMLA tests (run by `--simd`) |
 | `src/gen_lse.h/.cpp` | LSE atomics latency/throughput tests |
 | `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding) |
+| `src/gen_ooo.h/.cpp` | Out-of-order window sizing: ROB, int/FP register files, load/store queues (two-miss probe) |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
 | `.github/workflows/ci.yml` | GitHub Actions: build + selftest + smoke on macOS/Linux/Windows arm64 runners |
 
@@ -316,11 +317,27 @@ This indicates M5 implements SMMLA as two sequential SDOT micro-ops internally. 
 micro-architectural benefit to using SMMLA over SDOT on Apple M5. Whether Snapdragon Oryon has
 dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) is an open question.
 
+### Out-of-order window probe: lessons (gen_ooo.cpp)
+
+- **Every timed call must traverse the whole pointer ring.** A partial walk revisits the same
+  nodes every call; the per-sample warm-up then leaves them in L2 and a "DRAM miss" silently
+  becomes an L2 hit (27 ns instead of 81 ns on M5). `loops = ring_nodes / misses_per_iteration`.
+- **Check overlap before trusting knees:** two independent chains with no fillers must cost the
+  same as one (`overlap factor ≈ 1.0`). If it is ~2–3×, the misses are not real misses.
+- **Fillers must not touch the structure you are not measuring.** `LDR xN` consumes an integer
+  physical register, so its knee is the int PRF; `LDR XZR` is a load-queue entry with no register.
+  NOPs on M5 show no limit to 2048 — they are apparently dropped before allocation.
+- **Two dependent misses per chain** double the shadow (~750 clk) so 2 × 2048 fillers stay inside it.
+- **Masked pointers** (`link ^ 0xA5A5…`, unmasked with EOR) defeat any data-dependent prefetcher;
+  M5 showed no plain-vs-masked difference (DIT made none either), but the sweeps use masked rings.
+
 ### AsmJit API notes
 
 - `Gp` not `GpX` for general-purpose register arguments in helper functions
 - `a.embed(&word, 4)` to hand-encode instructions not exposed in AsmJit's C++ API
   (used for LDAPR, LDAPUR, STLUR in `gen_pitfalls.cpp`)
+- `a.ldr(xzr, ptr(xN))` encodes (LDR to XZR: load and discard, no register written)
+- `MSR DIT, #imm` = `0xD503405F | (imm << 8)` if ever needed (FEAT_DIT; no effect seen on M5)
 - AESE/AESMC: `.b16()` element type
 - PMULL poly64: `.q()` result, `.d()` inputs
 - SHA256H: `.q()` first two args, `.s4()` third
@@ -351,6 +368,7 @@ dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) i
 | **Memory barriers** | `gen_pitfalls.cpp §5` | DMB=1.5 clk standalone; in load chain: 0 added (completes within LDR latency) |
 | **LRCPC (LDAPR/LDAPUR)** | `gen_pitfalls.cpp §6` | LDAPR≈LDAR≈LDR=3 clk; store forwarding unchanged (~4.9 clk all variants) |
 | **BFI dest-dep stress** | `gen_pitfalls.cpp §7` | All three Mihocka variants (independent / overlapping rotation / full-width) report ~1 clk on M5 — no dep-breaking shortcut |
+| **OOO window** | `gen_ooo.cpp` | Two-miss probe: int PRF ≈ 386–418, FP PRF ≈ 834–898, load queue ≈ 482–515, store queue ≈ 138–146; NOP fill shows no limit to 2048 (NOPs are not allocated, or ROB > 2050). Sharp 1×→2× steps. ~2.5 min run |
 
 ## Planned Test Coverage
 
@@ -358,7 +376,7 @@ dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) i
 |---|---|---|
 | **UDIV throughput** | Independent UDIV chains | Latency known (~10 clk); throughput (units) unknown |
 | **Prefetcher** | Stride sweep, descending scan, PRFM effectiveness | How far ahead does the hardware prefetcher reach? |
-| **OOO window** | Dependent chain length × latency product → ROB depth | Complex to expose cleanly for ALU-only chains; requires careful design |
+| **OOO window, more fillers** | Branch-order buffer, flag PRF, ROB via non-NOP filler | `gen_ooo.cpp` has the machinery; needs a filler with no PRF/queue footprint that Apple does not eliminate |
 | **FEAT_LRCPC3** | LDIAPP / STILP pair instructions | Not present on any current Apple Silicon (M1–M5); available check via `hw.optional.arm.FEAT_LRCPC3` |
 | **SVE2** | Wide vector ops (if present) | Not on Apple Silicon; check at runtime on Linux/Windows (Snapdragon X has SVE2). Results may require PMU (Tier 1) to be trustworthy — instruction-induced throttling risk |
 | **SDOT/SMMLA cross-platform** | Compare MAC throughput on Snapdragon X | Does Oryon have dedicated SMMLA hardware, or also micro-op fusion like M5? |
