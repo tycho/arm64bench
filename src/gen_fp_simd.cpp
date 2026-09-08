@@ -699,6 +699,28 @@ static void run_crossdomain_tests(const BenchmarkParams& base,
                  "SCVTF/FCVTZS d64 round-trip (%ux)", u2);
         run_one(name, fn, params_for(base, loops, u2));
     }
+
+    // ── FJCVTZS round-trip (FEAT_JSCVT) ───────────────────────────────────
+    // FJCVTZS W0, D0 is the JavaScript ToInt32 conversion: truncate toward
+    // zero, wrap modulo 2^32 instead of saturating, and set NZCV. Same chain
+    // shape as the SCVTF/FCVTZS round-trip above, so the difference between
+    // the two lines is what the JavaScript semantics cost.
+    if (cpu_has(CpuFeature::JSCVT)) {
+        auto fn = build_loop(loops, u2,
+            [](a64::Assembler& a) {
+                a.mov(w0, Imm(1));
+                a.scvtf(d0, w0);   // seed d0 = 1.0
+            },
+            [](a64::Assembler& a, uint32_t u) {
+                if (u & 1) a.fjcvtzs(w0, d0);  // double → int32 (JS semantics)
+                else       a.scvtf  (d0, w0);  // int32 → double
+            });
+        snprintf(name, sizeof(name),
+                 "SCVTF/FJCVTZS d64 round-trip (%ux)", u2);
+        run_one(name, fn, params_for(base, loops, u2));
+    } else {
+        skip_feature(CpuFeature::JSCVT, "FJCVTZS");
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
