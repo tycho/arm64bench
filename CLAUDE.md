@@ -30,7 +30,7 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 ## Run
 
 ```bash
-./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp]
+./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp | --frontend]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
              [--smoke] [--filter <substr>]
 ```
@@ -73,6 +73,7 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_ooo.h/.cpp` | Out-of-order window sizing: ROB, int/FP register files, load/store queues (two-miss probe) |
 | `src/gen_sve.h/.cpp` | SVE/SVE2 tests: native with FEAT_SVE, else streaming mode via SME (Apple M4/M5) |
 | `src/gen_mlp.h/.cpp` | Memory-level parallelism: K interleaved pointer chases per cache level (outstanding-miss capacity) |
+| `src/gen_frontend.h/.cpp` | Decode width (NOP), MOV elimination, zero idioms, macro-op fusion pairs, branch throughput, ISB |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
 | `.github/workflows/ci.yml` | GitHub Actions: build + selftest + smoke on macOS/Linux/Windows arm64 runners |
 
@@ -332,6 +333,16 @@ This indicates M5 implements SMMLA as two sequential SDOT micro-ops internally. 
 micro-architectural benefit to using SMMLA over SDOT on Apple M5. Whether Snapdragon Oryon has
 dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) is an open question.
 
+### Fusion tests: what throughput can and cannot show (gen_frontend.cpp)
+
+A fused pair is one micro-op, so pairs/clk should match the cheaper single's rate. That only
+discriminates when the two halves would otherwise compete for the same resource. On M5 the
+branch unit and the ALUs are separate ports, so unfused CMP+B.NE can already reach the branch
+rate; the measured 0.41 clk/pair versus 0.35 for B.NE alone is consistent with either. ADRP+ADD
+at exactly the ADRP-alone rate, well under the sum, is the clearer case. To pin CMP+B.cond down
+you need a rename-width-bound test (pad each pair with enough independent NOPs that 10-wide
+rename is the limit, then see whether the pair counts as one or two).
+
 ### Pointer-chase stride and L1 set conflicts
 
 Every pointer-chase test uses a 256-byte node stride. A 128 KB 8-way L1D has 256 sets of 64 B;
@@ -438,6 +449,7 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 | **FEAT_BF16** | `gen_bf16.cpp` | BFDOT 3 clk, 1/clk (half the SDOT rate); BFMMLA 4.9 clk, 1 per 2 clk — same 8 MAC/clk either way, no matrix-form advantage (as with SMMLA); BFMLALB/T 4 clk, ~1.5/clk |
 | **JSCVT** | `gen_fp_simd.cpp §7` | SCVTF/FJCVTZS round trip 6.0 clk = same as SCVTF/FCVTZS (5.9); JavaScript ToInt32 semantics are free |
 | **Memory-level parallelism** | `gen_mlp.cpp` | Effective MLP (1-chain latency / saturated per-load time): 2 MB ≈ 6.7, 16 MB ≈ 11, DRAM ≈ 18 misses in flight (13 GB/s random lines, floor leaves at 22–24 chains); L1 dependent loads issue at 1/clk |
+| **Front-end / rename** | `gen_frontend.cpp` | 10 NOPs/clk at every body size; GPR MOV eliminated only when consumed by an ALU op (pure MOV chain 0.9 clk); FMOV d,d and ORR v,v 2 clk (executed); **no zero idioms** (EOR/SUB/AND-xzr, vector EOR/SUB all stay dependent); ADRP+ADD pairs = ADRP alone; MOVZ 8.8/clk without an ALU; 2 taken B/clk; ISB 34 clk |
 | **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W 57 clk/store (!); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
 
 ## Planned Test Coverage
