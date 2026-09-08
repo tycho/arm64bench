@@ -30,6 +30,7 @@
 #include "gen_fp_simd.h"
 #include "gen_crypto.h"
 #include "gen_i8mm.h"
+#include "gen_bf16.h"
 #include "gen_common.h"
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
@@ -1010,6 +1011,9 @@ void run_fp_simd_tests(const BenchmarkParams& base_params) {
 
     section("FEAT_I8MM (int8 matrix multiply)");
     run_i8mm_tests(base_params);
+
+    section("FEAT_BF16 (bfloat16 dot / matrix multiply)");
+    run_bf16_tests(base_params);
 
     section("Population count / POPCNT idiom");
     run_popcount_idiom_tests(base_params, loops, unroll);

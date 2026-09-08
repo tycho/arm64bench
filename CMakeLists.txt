@@ -50,6 +50,7 @@ add_library(arm64bench_core STATIC
     src/gen_fp_simd.cpp
     src/gen_crypto.cpp
     src/gen_i8mm.cpp
+    src/gen_bf16.cpp
     src/gen_lse.cpp
     src/gen_pitfalls.cpp
     src/gen_ooo.cpp
