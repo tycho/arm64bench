@@ -13,7 +13,9 @@ if(MSVC)
 	add_compile_options(/MP)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+# AsmJit exports cxx_std_20 as a PUBLIC compile feature, so every target that
+# links it is compiled as C++20 regardless of this setting. State it plainly.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 

@@ -71,7 +71,10 @@ Default (no flags): runs integer and memory tests.
 - **Namespace:** `arm64bench` (generators in `arm64bench::gen`)
 - **Naming:** `PascalCase` for types, `snake_case` for functions/variables, `g_` prefix for globals
 - **Headers:** `#pragma once`
+- **C++20** (AsmJit requires it and propagates `cxx_std_20`; designated initializers,
+  `std::span`, and `<bit>` are fair game)
 - **No exceptions, no RTTI** (`-fno-exceptions -fno-rtti`)
+- **Feature gating:** `cpu_has(CpuFeature::X)` from `cpu_features.h`, never `__ARM_FEATURE_*`
 - Section separators: `// ── Description ──────────────────────`
 - Platform guards: `#if defined(_WIN32)`, `#ifdef __APPLE__`, `#ifdef __linux__`
 
