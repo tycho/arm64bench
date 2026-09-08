@@ -41,6 +41,14 @@ const Gp& wr(uint32_t i) {
     return kW[i & 15u];
 }
 
+const Vec& vr(uint32_t i) {
+    static const Vec kV[17] = {
+        v0,  v1,  v2,  v3,  v4,  v5,  v6,  v7,
+        v16, v17, v18, v19, v20, v21, v22, v23, v24,
+    };
+    return kV[i < 17 ? i : 16];
+}
+
 // ── Benchmark-run helpers ─────────────────────────────────────────────────────
 
 BenchmarkParams params_for(const BenchmarkParams& base, uint64_t loops,

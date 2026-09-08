@@ -41,6 +41,11 @@ namespace arm64bench::gen {
 const asmjit::a64::Gp& xr(uint32_t i);
 const asmjit::a64::Gp& wr(uint32_t i);
 
+// Vector registers by index: 0–7 → v0–v7, 8–16 → v16–v24. Skips v8–v15,
+// which are callee-saved and which build_loop does not preserve. Apply an
+// element view at the use site: vr(i).s4(), vr(i).b16(), vr(i).d2(), ...
+const asmjit::a64::Vec& vr(uint32_t i);
+
 // ── Benchmark-run helpers ─────────────────────────────────────────────────────
 
 // BenchmarkParams for a function that runs `loops` iterations of
