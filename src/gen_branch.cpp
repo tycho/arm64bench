@@ -79,10 +79,7 @@
 //      loop iteration effectively.) Compares taken vs not-taken throughput.
 
 #include "gen_branch.h"
-#include "jit_buffer.h"
-#include "harness.h"
-#include <asmjit/core.h>
-#include <asmjit/a64.h>
+#include "gen_common.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -180,6 +177,11 @@ static uint64_t ind_capacity_loops_for_n(uint32_t n) {
 }
 
 // ── RSB depth test builder ────────────────────────────────────────────────────
+//
+// Hand-rolled rather than built on build_loop: the depth level functions are
+// emitted *after* the outer function's RET, and build_loop has no hook there
+// (its setup runs ahead of the loop top, where the level bodies would be
+// fallen into instead of called).
 
 static JitPool::TestFn build_rsb_chain(uint32_t depth, uint64_t loops) {
     CodeHolder code;
@@ -302,54 +304,26 @@ static bool build_trampolines(uint32_t n_targets,
 //     cbnz x19, loop_top
 //
 // Note: x30 is set by BLR to point at the ADD x21 instruction. The trampoline
-// RET returns there. This means x30 is safe to not save in our outer loop:
-// BLR overwrites x30, the trampoline returns to the ADD, and the loop proceeds.
-// The outer loop's own return address (to the harness) is saved in the prologue
-// and restored in the epilogue before the final RET.
+// RET returns there. BLR is therefore free to clobber x30 inside the loop;
+// the outer function's own return address (to the harness) is saved and
+// restored by build_loop.
 
 static JitPool::TestFn build_indirect_pred_loop(uintptr_t table_base,
                                                  uint64_t loops) {
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    // Prologue: save x19 (loop counter), x20 (table base), x21 (index), x30 (LR).
-    // 32-byte frame: stp x19,x20 + stp x21,x30.
-    a.sub(sp, sp, Imm(32));
-    a.stp(x19, x20, ptr(sp));
-    a.stp(x21, x30, ptr(sp, 16));
-
-    a.mov(x19, Imm(loops));
-    a.mov(x20, Imm(static_cast<uint64_t>(table_base)));
-    a.mov(x21, Imm(0));  // start at index 0
-
-    a.align(AlignMode::kCode, 64);
-
-    Label loop_top = a.new_label();
-    a.bind(loop_top);
-
-    // Compute byte offset into table, wrapping via bitmask.
-    // AND is single-cycle latency; LSL folds into the LDR addressing.
-    a.and_(x1, x21, Imm(kIndTableMask));   // x1 = x21 & mask
-    a.lsl(x1, x1, Imm(3));                 // x1 = x1 * 8 (pointer size)
-    a.ldr(x0, ptr(x20, x1));               // x0 = table[x1/8]
-    a.blr(x0);                             // indirect call — this is what we measure
-
-    // BLR overwrites x30 with the return address (this ADD instruction).
-    // The trampoline RET returns here. We don't need to save/restore x30
-    // inside the loop — but we DO need the prologue-saved x30 for the
-    // final epilogue RET, which is why we saved it above.
-    a.add(x21, x21, Imm(1));
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, loop_top);
-
-    // Epilogue: restore all callee-saved registers including x30 (harness LR).
-    a.ldp(x19, x20, ptr(sp));
-    a.ldp(x21, x30, ptr(sp, 16));
-    a.add(sp, sp, Imm(32));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
+    return build_loop(loops, 1,
+        [table_base](a64::Assembler& a) {
+            a.mov(x20, Imm(static_cast<uint64_t>(table_base)));
+            a.mov(x21, Imm(0));  // start at index 0
+        },
+        [](a64::Assembler& a, uint32_t) {
+            // Compute byte offset into table, wrapping via bitmask.
+            // AND is single-cycle latency; LSL folds into the LDR addressing.
+            a.and_(x1, x21, Imm(kIndTableMask));   // x1 = x21 & mask
+            a.lsl(x1, x1, Imm(3));                 // x1 = x1 * 8 (pointer size)
+            a.ldr(x0, ptr(x20, x1));               // x0 = table[x1/8]
+            a.blr(x0);                             // indirect call — this is what we measure
+            a.add(x21, x21, Imm(1));
+        });
 }
 
 // ── Indirect predictor CAPACITY test builder ──────────────────────────────────
@@ -396,36 +370,14 @@ static JitPool::TestFn build_indirect_pred_loop(uintptr_t table_base,
 static JitPool::TestFn build_ind_capacity_loop(uintptr_t trampoline_addr,
                                                 uint32_t  n_sites,
                                                 uint64_t  loops) {
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    // Minimal prologue: save only x19 (loop counter) and x30 (harness LR).
-    // x0 is caller-saved and holds the target — no need to save it.
-    a.sub(sp, sp, Imm(16));
-    a.stp(x19, x30, ptr(sp));
-
-    a.mov(x19, Imm(loops));
-    a.mov(x0, Imm(static_cast<uint64_t>(trampoline_addr)));
-
-    a.align(AlignMode::kCode, 64);
-
-    Label loop_top = a.new_label();
-    a.bind(loop_top);
-
-    // Emit n_sites BLR x0 instructions at n_sites distinct code addresses.
-    // Each BLR sets x30 = (address of next instruction), trampoline RETs there.
-    for (uint32_t s = 0; s < n_sites; ++s)
-        a.blr(x0);
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, loop_top);
-
-    a.ldp(x19, x30, ptr(sp));
-    a.add(sp, sp, Imm(16));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
+    // unroll = n_sites: one BLR x0 per unrolled body, so the n_sites BLR
+    // instructions sit at n_sites distinct code addresses. Each BLR sets
+    // x30 = (address of the next instruction) and the trampoline RETs there.
+    return build_loop(loops, n_sites,
+        [trampoline_addr](a64::Assembler& a) {
+            a.mov(x0, Imm(static_cast<uint64_t>(trampoline_addr)));
+        },
+        [](a64::Assembler& a, uint32_t) { a.blr(x0); });
 }
 
 // ── Indirect predictor unique-target test builder ─────────────────────────────
@@ -476,36 +428,16 @@ static JitPool::TestFn build_ind_unique_target_loop(
         const uintptr_t* addrs,  // addrs[0..n_sites)
         uint32_t         n_sites,
         uint64_t         loops) {
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    a.sub(sp, sp, Imm(16));
-    a.stp(x19, x30, ptr(sp));
-
-    a.mov(x19, Imm(loops));
-
-    a.align(AlignMode::kCode, 64);
-
-    Label loop_top = a.new_label();
-    a.bind(loop_top);
-
-    for (uint32_t s = 0; s < n_sites; ++s) {
-        // Load the unique target for site s into x0.
-        // BLR x0 then executes at a distinct PC each iteration.
-        a.mov(x0, Imm(static_cast<uint64_t>(addrs[s])));
-        a.blr(x0);
-    }
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, loop_top);
-
-    a.ldp(x19, x30, ptr(sp));
-    a.add(sp, sp, Imm(16));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
+    return build_loop(loops, n_sites, no_setup,
+        [addrs](a64::Assembler& a, uint32_t s) {
+            // Load the unique target for site s into x0.
+            // BLR x0 then executes at a distinct PC each iteration.
+            a.mov(x0, Imm(static_cast<uint64_t>(addrs[s])));
+            a.blr(x0);
+        });
 }
+
+// ── Conditional branch loop builder ───────────────────────────────────────────
 //
 // Generates a loop with `unroll` copies of a conditional branch per iteration.
 //
@@ -528,55 +460,26 @@ static JitPool::TestFn build_ind_unique_target_loop(
 // local label for the branch target, bound immediately after the instruction.
 //
 // Registers:
-//   x19 = loop outer counter
+//   x19 = loop outer counter (managed by build_loop)
 //   x0  = constant 1 (CBZ x0 → never taken; CBNZ x0 → always taken)
 //   x1  = iteration counter (bit 0 alternates 0,1,0,1... for TBZ tests)
 
 template<typename F>
 static JitPool::TestFn build_cond_branch_loop(uint64_t loops, uint32_t unroll,
                                                F&& emit_body) {
-    CodeHolder code;
-    g_jit_pool->init_code_holder(code);
-    a64::Assembler a(&code);
-
-    a.sub(sp, sp, Imm(32));
-    a.stp(x19, x20, ptr(sp));
-    a.stp(x21, x30, ptr(sp, 16));
-
-    a.mov(x19, Imm(loops));
-    a.mov(x0,  Imm(1));   // constant non-zero for CBZ/CBNZ tests
-    a.mov(x1,  Imm(0));   // iteration counter for TBZ alternating tests
-
-    a.align(AlignMode::kCode, 64);
-
-    Label loop_top = a.new_label();
-    a.bind(loop_top);
-
-    // Each call to emit_body emits one branch + binds its own local skip label.
-    for (uint32_t u = 0; u < unroll; ++u)
-        emit_body(a, u);
-
-    // Advance iteration counter once per outer iteration.
-    a.add(x1, x1, Imm(1));
-
-    a.sub(x19, x19, Imm(1));
-    a.cbnz(x19, loop_top);
-
-    a.ldp(x19, x20, ptr(sp));
-    a.ldp(x21, x30, ptr(sp, 16));
-    a.add(sp, sp, Imm(32));
-    a.ret(x30);
-
-    return g_jit_pool->compile(code);
-}
-
-// ── Benchmark runner helpers ──────────────────────────────────────────────────
-
-static void run_one(const char* name, JitPool::TestFn fn,
-                    const BenchmarkParams& params) {
-    if (!fn) return;
-    benchmark(fn, name, params);
-    g_jit_pool->release(fn);
+    return build_loop(loops, unroll,
+        [](a64::Assembler& a) {
+            a.mov(x0, Imm(1));   // constant non-zero for CBZ/CBNZ tests
+            a.mov(x1, Imm(0));   // iteration counter for TBZ alternating tests
+        },
+        [&emit_body, unroll](a64::Assembler& a, uint32_t u) {
+            // Each call to emit_body emits one branch + binds its own local
+            // skip label.
+            emit_body(a, u);
+            // Advance the iteration counter once per outer iteration, after
+            // the last unrolled copy.
+            if (u == unroll - 1) a.add(x1, x1, Imm(1));
+        });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -584,7 +487,7 @@ static void run_one(const char* name, JitPool::TestFn fn,
 // ════════════════════════════════════════════════════════════════════════════
 
 static void run_rsb_tests(const BenchmarkParams& base) {
-    printf("\n── RSB (Return Stack Buffer) depth sweep ───────────────────────\n");
+    section("RSB (Return Stack Buffer) depth sweep");
     printf("  min_ns and clk are per BL+RET pair.\n"
            "  A latency jump identifies the RSB capacity.\n\n");
 
@@ -597,10 +500,8 @@ static void run_rsb_tests(const BenchmarkParams& base) {
         JitPool::TestFn fn = build_rsb_chain(depth, loops);
         if (!fn) continue;
 
-        BenchmarkParams p       = base;
-        p.loops                 = loops;
-        p.instructions_per_loop = depth;   // N BL+RET pairs per outer iteration
-        p.bytes_per_insn        = 0;
+        // N BL+RET pairs per outer iteration.
+        const BenchmarkParams p = params_for(base, loops, depth);
 
         char name[48];
         snprintf(name, sizeof(name), "RSB depth %2u", depth);
@@ -633,7 +534,7 @@ static void run_indirect_pred_tests(const BenchmarkParams& base) {
     // Result on M1: No — latency jumps immediately at N=2 and stays flat,
     // indicating the predictor only tracks the last-seen target per site.
     // The flat ~10 clk from N=2 to N=1024 is the raw misprediction penalty.
-    printf("\n── BLR cycling N targets (misprediction penalty probe) ─────────\n");
+    section("BLR cycling N targets (misprediction penalty probe)");
     printf("  One BLR site cycling round-robin through N targets.\n"
            "  Flat latency ≥ N=2 = predictor cannot learn cycling patterns.\n"
            "  The N=1 latency is the predicted baseline; N=2 reveals penalty.\n\n");
@@ -667,10 +568,7 @@ static void run_indirect_pred_tests(const BenchmarkParams& base) {
             reinterpret_cast<uintptr_t>(table), loops);
         if (!fn) continue;
 
-        BenchmarkParams p       = base;
-        p.loops                 = loops;
-        p.instructions_per_loop = 1;
-        p.bytes_per_insn        = 0;
+        const BenchmarkParams p = params_for(base, loops, 1);
 
         char name[56];
         snprintf(name, sizeof(name), "BLR cycling %4u targets", n);
@@ -702,7 +600,7 @@ static void run_ind_capacity_tests(const BenchmarkParams& base) {
     //   - The RSB/return-prediction mechanism for non-varying targets
     // The per-BLR latency decreases as N grows because the OOO can pipeline
     // more BLR+RET pairs in flight simultaneously.
-    printf("\n── BLR N sites → 1 target (OOO throughput, all same target) ────\n");
+    section("BLR N sites → 1 target (OOO throughput, all same target)");
     printf("  Decreasing clk/BLR with N = OOO pipelining BLR+RET pairs.\n"
            "  Not a capacity test — all sites predict to the same target.\n\n");
 
@@ -723,10 +621,8 @@ static void run_ind_capacity_tests(const BenchmarkParams& base) {
         JitPool::TestFn fn = build_ind_capacity_loop(trampoline_addr, n, loops);
         if (!fn) continue;
 
-        BenchmarkParams p       = base;
-        p.loops                 = loops;
-        p.instructions_per_loop = n;  // N BLR instructions per loop iteration
-        p.bytes_per_insn        = 0;
+        // N BLR instructions per loop iteration.
+        const BenchmarkParams p = params_for(base, loops, n);
 
         char name[56];
         snprintf(name, sizeof(name), "BLR %2u sites → 1 target", n);
@@ -768,15 +664,13 @@ static void run_ind_capacity_tests(const BenchmarkParams& base) {
 // Unroll=16: dilutes loop-control overhead to <7%, fits in ≤2 cache lines.
 
 static void run_cond_branch_tests(const BenchmarkParams& base) {
-    printf("\n── Conditional branch throughput ───────────────────────────────\n");
+    section("Conditional branch throughput");
 
     const uint64_t loops  = base.loops;
     const uint32_t unroll = 16;
     char name[64];
 
-    BenchmarkParams p       = base;
-    p.instructions_per_loop = unroll;
-    p.bytes_per_insn        = 0;
+    const BenchmarkParams p = params_for(base, loops, unroll);
 
     // ── CBZ never-taken ───────────────────────────────────────────────────
     // x0=1. CBZ branches only if zero → never fires. Each copy emits a local
@@ -865,7 +759,7 @@ static void run_ind_unique_target_tests(const BenchmarkParams& base) {
     // At N=256 the loop body is ~5KB — still within I-cache but may stress
     // the loop buffer. Any CoV spike at large N may reflect I-cache pressure
     // rather than predictor pressure. The annotation threshold is conservative.
-    printf("\n── BLR N sites → N unique targets (predictor capacity probe) ───\n");
+    section("BLR N sites → N unique targets (predictor capacity probe)");
     printf("  N BLR sites each with a distinct target trampoline.\n"
            "  Flat clk/BLR = predictor holds all N entries.\n"
            "  Rising clk/BLR = evictions beginning (capacity exceeded).\n\n");
@@ -893,10 +787,7 @@ static void run_ind_unique_target_tests(const BenchmarkParams& base) {
             trampoline_addrs, n, loops);
         if (!fn) return 0.0;
 
-        BenchmarkParams p       = base;
-        p.loops                 = loops;
-        p.instructions_per_loop = n;
-        p.bytes_per_insn        = 0;
+        const BenchmarkParams p = params_for(base, loops, n);
 
         char name[64];
         snprintf(name, sizeof(name), fmt, n, n);
