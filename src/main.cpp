@@ -22,6 +22,7 @@
 #include "gen_ooo.h"
 #include "gen_sve.h"
 #include "gen_mlp.h"
+#include "gen_frontend.h"
 #include "gen_lse.h"
 
 static void print_usage(const char* prog) {
@@ -44,6 +45,7 @@ static void print_usage(const char* prog) {
     printf("  --ooo           Run out-of-order window (ROB / PRF / LSQ) tests\n");
     printf("  --sve           Run SVE/SVE2 tests (native, or streaming via SME)\n");
     printf("  --mlp           Run memory-level parallelism (outstanding-miss) tests\n");
+    printf("  --frontend      Run decode width / MOV elimination / zero idiom / fusion tests\n");
     printf("\n");
 }
 
@@ -58,6 +60,7 @@ int main(int argc, char** argv) {
     bool run_ooo      = false;
     bool run_sve      = false;
     bool run_mlp      = false;
+    bool run_frontend = false;
     bool csv_mode     = false;
     bool smoke_mode   = false;
     const char* name_filter = nullptr;
@@ -81,7 +84,7 @@ int main(int argc, char** argv) {
         } else if (strcmp(arg, "--filter") == 0 && i + 1 < argc) {
             name_filter = argv[++i];
         } else if (strcmp(arg, "--all") == 0) {
-            run_integer = run_memory = run_branch = run_simd = run_lse = run_pitfalls = run_ooo = run_sve = run_mlp = true;
+            run_integer = run_memory = run_branch = run_simd = run_lse = run_pitfalls = run_ooo = run_sve = run_mlp = run_frontend = true;
         } else if (strcmp(arg, "--integer")  == 0) { run_integer  = true; }
         else if   (strcmp(arg, "--memory")   == 0) { run_memory   = true; }
         else if   (strcmp(arg, "--branch")   == 0) { run_branch   = true; }
@@ -91,6 +94,7 @@ int main(int argc, char** argv) {
         else if   (strcmp(arg, "--ooo")      == 0) { run_ooo      = true; }
         else if   (strcmp(arg, "--sve")      == 0) { run_sve      = true; }
         else if   (strcmp(arg, "--mlp")      == 0) { run_mlp      = true; }
+        else if   (strcmp(arg, "--frontend") == 0) { run_frontend = true; }
         else if (strcmp(arg, "--MHz") == 0 && i + 1 < argc) {
             override_mhz = static_cast<uint64_t>(atoll(argv[++i]));
         } else if (strcmp(arg, "--samples") == 0 && i + 1 < argc) {
@@ -109,7 +113,7 @@ int main(int argc, char** argv) {
 #endif
 
     // Default: run integer and memory tests if nothing specified.
-    if (!run_integer && !run_memory && !run_branch && !run_simd && !run_lse && !run_pitfalls && !run_ooo && !run_sve && !run_mlp)
+    if (!run_integer && !run_memory && !run_branch && !run_simd && !run_lse && !run_pitfalls && !run_ooo && !run_sve && !run_mlp && !run_frontend)
         run_integer = run_memory = true;
 
     // Run mode must be set before any loop count is derived: scale_loops()
@@ -236,6 +240,12 @@ int main(int argc, char** argv) {
     if (run_mlp) {
         printf("── Memory-level parallelism tests ────────────────────────────\n");
         arm64bench::gen::run_mlp_tests(default_params);
+        printf("\n");
+    }
+
+    if (run_frontend) {
+        printf("── Front-end / rename tests ──────────────────────────────────\n");
+        arm64bench::gen::run_frontend_tests(default_params);
         printf("\n");
     }
 
