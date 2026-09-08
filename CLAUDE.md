@@ -30,7 +30,7 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 ## Run
 
 ```bash
-./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp | --frontend | --icache | --prefetch]
+./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp | --frontend | --icache | --prefetch | --c2c]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
              [--smoke] [--filter <substr>]
 ```
@@ -76,6 +76,8 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_frontend.h/.cpp` | Decode width (NOP), MOV elimination, zero idioms, macro-op fusion pairs, branch throughput, ISB |
 | `src/gen_icache.h/.cpp` | I-cache size sweep (straight-line NOP bodies), BTB chain (dense), iTLB chain (one branch per 16 KB page) |
 | `src/gen_prefetch.h/.cpp` | Hardware prefetcher stride streams (asc/desc, constant footprint) and PRFM lookahead on a random chase |
+| `src/gen_c2c.h/.cpp` | Core-to-core: 1-line and 2-line cache-line round trips, contended LDADDAL, against a partner thread running a JIT'd responder |
+| `src/affinity.h/.cpp` | Thread placement: pin to a CPU (Linux/Windows), QoS cluster hint (macOS) |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
 | `.github/workflows/ci.yml` | GitHub Actions: build + selftest + smoke on macOS/Linux/Windows arm64 runners |
 
@@ -395,6 +397,27 @@ NEON pipes); LD1W/LDR z ≈1 clk per 64 B (265 GB/s); ST1W 57 clk per store (4.9
 bimodal 28–57 clk — streaming-mode stores are pathologically slow and deserve a closer look;
 WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not SME-unit clocks.
 
+### Core-to-core tests (gen_c2c.cpp)
+
+A partner thread runs a JIT'd responder (spin on a line, reply, check a stop line only while
+idle) while the main thread runs the timed function through the ordinary harness. Three things
+keep that honest:
+
+- **Protocol counters are never reset.** The timed function loads the current counter in its
+  setup and continues from it, so warm-up calls, reference calls and timed calls all agree with
+  the responder whatever ran before; a reset between calls would race the responder's last reply.
+- **Placement.** Linux and Windows pin both threads (`affinity.h`); the main thread sits on the
+  first allowed CPU and the partner sweeps the rest. macOS has no affinity API for user threads
+  (`thread_affinity_policy` is a hint Apple Silicon ignores), so the partner is placed by QoS
+  class instead: user-interactive lands on the performance cluster, background on the efficiency
+  cluster. That gives P↔P and P↔E, with the exact cores the scheduler's choice.
+- **A single available CPU skips the section.** A spinning partner sharing the main thread's
+  core turns every hop into a timeslice.
+
+The contended-LDADDAL line is inherently noisy (CoV 20–40 % on M5): line ownership alternates in
+bursts, so the main thread's share of the increments varies sample to sample. Read it against the
+no-partner reference line, not to three digits.
+
 ### AsmJit API notes
 
 - `Gp` not `GpX` for general-purpose register arguments in helper functions
@@ -454,6 +477,8 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 | **Memory-level parallelism** | `gen_mlp.cpp` | Effective MLP (1-chain latency / saturated per-load time): 2 MB ≈ 6.7, 16 MB ≈ 11, DRAM ≈ 18 misses in flight (13 GB/s random lines, floor leaves at 22–24 chains); L1 dependent loads issue at 1/clk |
 | **Front-end / rename** | `gen_frontend.cpp` | 10 NOPs/clk at every body size; GPR MOV eliminated only when consumed by an ALU op (pure MOV chain 0.9 clk); FMOV d,d and ORR v,v 2 clk (executed); **no zero idioms** (EOR/SUB/AND-xzr, vector EOR/SUB all stay dependent); ADRP+ADD pairs = ADRP alone; MOVZ 8.8/clk without an ALU; 2 taken B/clk; ISB 34 clk |
 | **I-cache / BTB / iTLB** | `gen_icache.cpp` | L1I 192 KB (10 NOP/clk to 192 KB, 3.2/clk from L2, ~2/clk at 16 MB); BTB: zero-bubble taken branches to 48–64 sites, 2–3 clk to ~384, 4.2 clk beyond; L1 iTLB ≥ 192 × 16 KB pages, L2 TLB +9 clk from 256 to ≥ 2048 pages |
+| **FP width conversions** | `gen_fp_simd.cpp §8` | FCVTL/FCVTN (f16↔f32, f32↔f64, low and high halves) and scalar FCVT all 3 clk latency, 4 per clk; FCVTN2's destination merge is free |
+| **Core-to-core** | `gen_c2c.cpp` | Unpinned (QoS-placed) on M5: P↔P round trip ≈ 104 ns (~52 ns one way), P↔E ≈ 320 ns; identical for LDAR/STLR, LDR/STR, 1-line and 2-line; LDADDAL 7 clk alone, ≈ 6.5–9 ns contended (CoV 20–40 %, arbitration is bursty). Pinned core matrices come from Linux/Windows |
 | **Prefetcher** | `gen_prefetch.cpp` | Stride streams followed at every stride 64 B–32 KB, both directions, across 16 KB pages (9–27 ns/load vs 88 ns random; 512 B oddly worst); PRFM honored, scales as latency/D: 45 ns at D=2, 12.8 at D=8, 5.1 at D=32 (= the MLP floor) |
 | **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W 57 clk/store (!); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
 
@@ -465,7 +490,6 @@ WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not S
 | **FEAT_LRCPC3** | LDIAPP / STILP pair instructions | Not present on any current Apple Silicon (M1–M5); available check via `hw.optional.arm.FEAT_LRCPC3` |
 | **SVE2, more** | Gather/scatter, MOVPRFX fusion, BFMMLA z, predicate-heavy loops, streaming-mode store pathology | Native on CI (N2, 128-bit); streaming on M4/M5. Wide native SVE may need PMU (Tier 1) to be trustworthy — instruction-induced throttling risk |
 | **SDOT/SMMLA cross-platform** | Compare MAC throughput on Snapdragon X | Does Oryon have dedicated SMMLA hardware, or also micro-op fusion like M5? |
-| **FCVTL/FCVTN** | FP16↔FP32 conversion throughput | Widening/narrowing pipeline characterization |
 
 ## Feature Detection Reference
 
