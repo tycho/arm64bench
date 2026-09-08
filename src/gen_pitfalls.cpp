@@ -667,37 +667,6 @@ static void run_cas_tests(const BenchmarkParams& base, void* buf) {
 //   If forwarding is preserved: ordering semantics don't inhibit the store
 //   buffer bypass. If latency rises: the barrier drained the store buffer.
 
-// ── LRCPC instruction emission helpers ───────────────────────────────────────
-//
-// AsmJit (this version) does not expose ldapr/ldapur/stlur as named assembler
-// methods. We embed raw 32-bit instruction words using their ARM Architecture
-// Reference Manual encodings from the AsmJit isa_aarch64.json database.
-//
-//  LDAPR Xd, [Xn]          (FEAT_LRCPC)
-//    encoding: 11111000|101|11111|1|10000|Rn|Rd  → base 0xF8BFC000
-//
-//  LDAPUR Xd, [Xn, #off]   (FEAT_LRCPC2)  off ∈ [-256, 255]
-//    encoding: 11011001|010|offS:9|00|Rn|Rd      → base 0xD9400000
-//
-//  STLUR Xs, [Xn, #off]    (FEAT_LRCPC2)  off ∈ [-256, 255]
-//    encoding: 11011001|000|offS:9|00|Rn|Rs      → base 0xD9000000
-
-static void emit_ldapr_x(a64::Assembler& a, const Gp& Rd, const Gp& Rn) {
-    uint32_t w = 0xF8BFC000u | (Rn.id() << 5) | Rd.id();
-    a.embed(&w, 4);
-}
-
-static void emit_ldapur_x(a64::Assembler& a, const Gp& Rd, const Gp& Rn, int32_t off = 0) {
-    uint32_t w = 0xD9400000u | ((uint32_t(off) & 0x1FFu) << 12) | (Rn.id() << 5) | Rd.id();
-    a.embed(&w, 4);
-}
-
-static void emit_stlur_x(a64::Assembler& a, const Gp& Rs, const Gp& Rn, int32_t off = 0) {
-    uint32_t w = 0xD9000000u | ((uint32_t(off) & 0x1FFu) << 12) | (Rn.id() << 5) | Rs.id();
-    a.embed(&w, 4);
-}
-
-
 static void run_lrcpc_tests(const BenchmarkParams& base) {
     const bool lrcpc  = cpu_has(CpuFeature::LRCPC);
     const bool lrcpc2 = cpu_has(CpuFeature::LRCPC2);
@@ -732,9 +701,9 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
             [](a64::Assembler& a) {
                 a.mov(x9, sp);
                 a.str(x9, ptr(x9));
-                emit_ldapr_x(a, x0, x9);  // prime
+                a.ldapr(x0, ptr(x9));  // prime
             },
-            [](a64::Assembler& a, uint32_t) { emit_ldapr_x(a, x0, x0); },
+            [](a64::Assembler& a, uint32_t) { a.ldapr(x0, ptr(x0)); },
             /*scratch_bytes=*/16);
         snprintf(name, sizeof(name), "LDAPR  x64 (FEAT_LRCPC,  L1 chain)");
         run_one(name, fn, params_for(base, loops, unroll));
@@ -749,9 +718,9 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
             [](a64::Assembler& a) {
                 a.mov(x9, sp);
                 a.str(x9, ptr(x9));
-                emit_ldapur_x(a, x0, x9, 0);  // prime
+                a.ldapur(x0, ptr(x9));  // prime
             },
-            [](a64::Assembler& a, uint32_t) { emit_ldapur_x(a, x0, x0, 0); },
+            [](a64::Assembler& a, uint32_t) { a.ldapur(x0, ptr(x0)); },
             /*scratch_bytes=*/16);
         snprintf(name, sizeof(name), "LDAPUR x64 (FEAT_LRCPC2, L1 chain)");
         run_one(name, fn, params_for(base, loops, unroll));
@@ -793,12 +762,12 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
             },
             [use_stlr, use_stlur, use_ldapur](a64::Assembler& a, uint32_t) {
                 // Store.
-                if (use_stlur)     emit_stlur_x(a, x0, x9, 0);
+                if (use_stlur)     a.stlur(x0, ptr(x9));
                 else if (use_stlr) a.stlr(x0, ptr(x9));
                 else               a.str (x0, ptr(x9));
                 // Load.
-                if (use_ldapur) emit_ldapur_x(a, x0, x9, 0);
-                else            emit_ldapr_x (a, x0, x9);
+                if (use_ldapur) a.ldapur(x0, ptr(x9));
+                else            a.ldapr(x0, ptr(x9));
             },
             /*scratch_bytes=*/16);
         snprintf(name, sizeof(name), "%-46s", c.label);
