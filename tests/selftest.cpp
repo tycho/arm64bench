@@ -290,7 +290,7 @@ static void test_cycle_counter() {
 #elif defined(_WIN32)
         skip("PMCCNTR_EL0 not readable from EL0 (no PMU driver enabling user access, or a VM)");
 #else
-        skip("PMU cycle counting not implemented on this platform");
+        skip("perf_event_open refused (no PMU in this VM, or perf_event_paranoid too strict)");
 #endif
         return;
     }

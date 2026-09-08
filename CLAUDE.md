@@ -233,7 +233,9 @@ regardless of clock frequency, so P-state changes of any kind are irrelevant.
   **macOS ≥ 15 requires root for all kpc calls** (EPERM without it); earlier
   versions allowed fixed-counter reads from userspace. Run `sudo ./arm64bench`
   to enable PMU cycle counting on macOS 15+.
-- **Linux**: `perf_event_open(PERF_COUNT_HW_CPU_CYCLES)` per-thread (not yet implemented).
+- **Linux**: `perf_event_open(PERF_COUNT_HW_CPU_CYCLES)` for the calling thread, user mode only,
+  read with `read(2)`. VMs without a virtualized PMU and hosts with `perf_event_paranoid` above
+  2 refuse the open and the harness falls back to Tier 2 (the CI runner does).
 - **Windows ARM64**: `PMCCNTR_EL0` read via `__builtin_arm_rsr64` inside a SEH `__try` block.
   Requires thread affinity pinning (the counter is per-CPU; migrations between reads produce
   garbage). `QueryProcessorCycleTime` returns 100ns units, not cycles. `__rdtsc()` maps to

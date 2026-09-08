@@ -19,7 +19,9 @@
 //     PMUSERENR_EL0.EN is set by the Qualcomm PMU driver (qpmu.sys).
 //     Probed at init time via SEH; falls back to ratio normalization if
 //     the register is not accessible from EL0.
-//   Linux: not yet implemented (perf_event_open is the right path).
+//   Linux: perf_event_open(PERF_COUNT_HW_CPU_CYCLES) for the calling thread,
+//     user mode only; unavailable on VMs without a PMU or under a strict
+//     perf_event_paranoid, in which case ratio normalization is used.
 //
 // Typical usage:
 //

@@ -36,8 +36,8 @@
 //
 // ── Linux ──────────────────────────────────────────────────────────────────
 //
-// Not yet implemented. perf_event_open(PERF_COUNT_HW_CPU_CYCLES) per-thread
-// is the right path.
+// perf_event_open(PERF_COUNT_HW_CPU_CYCLES) for the calling thread, read
+// with read(2). See the Linux block below.
 
 #include "cycle_counter.h"
 #include "timer.h"
@@ -293,9 +293,87 @@ uint64_t cycle_counter_read() {
 
 } // namespace arm64bench
 
-#else // ── Non-Apple, non-Windows stub (Linux etc.) ──────────────────────────
+#elif defined(__linux__) // ── Linux: perf_event_open ──────────────────────────
 
-// TODO: Linux — perf_event_open(PERF_COUNT_HW_CPU_CYCLES) per-thread.
+// One hardware cycle counter for the calling thread (pid 0, cpu -1): the
+// kernel saves and restores it across context switches and migrations, so
+// two read() calls give this thread's own cycles. User space only; the
+// harness's samples run entirely in user mode. Reading is a syscall (about
+// a microsecond), negligible against millisecond samples.
+//
+// A VM without a virtualized PMU fails at open() (ENOENT / EOPNOTSUPP), and
+// a locked-down perf_event_paranoid fails with EACCES; both fall back to
+// Tier 2.
+
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+
+namespace arm64bench {
+
+static bool s_available      = false;
+static bool s_init_attempted = false;
+static int  s_fd             = -1;
+
+bool cycle_counter_init() {
+    if (s_init_attempted) return s_available;
+    s_init_attempted = true;
+
+    perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type           = PERF_TYPE_HARDWARE;
+    attr.size           = sizeof(attr);
+    attr.config         = PERF_COUNT_HW_CPU_CYCLES;
+    attr.disabled       = 1;
+    attr.exclude_kernel = 1;
+    attr.exclude_hv     = 1;
+
+    const long fd = syscall(SYS_perf_event_open, &attr, 0, -1, -1, 0);
+    if (fd < 0) return false;
+    s_fd = static_cast<int>(fd);
+
+    if (ioctl(s_fd, PERF_EVENT_IOC_RESET, 0) != 0 ||
+        ioctl(s_fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
+        close(s_fd);
+        s_fd = -1;
+        return false;
+    }
+
+    // The counter must advance while we spin; a counter the hypervisor
+    // silently zeroes is worse than none.
+    uint64_t c0 = 0, c1 = 0;
+    if (read(s_fd, &c0, sizeof(c0)) != sizeof(c0)) { close(s_fd); s_fd = -1; return false; }
+    volatile uint64_t v = 1;
+    for (uint32_t i = 0; i < 200'000; ++i)
+        v ^= v * 6364136223846793005ULL + 1442695040888963407ULL;
+    (void)v;
+    if (read(s_fd, &c1, sizeof(c1)) != sizeof(c1) || c1 <= c0) {
+        close(s_fd);
+        s_fd = -1;
+        return false;
+    }
+
+    s_available = true;
+    return true;
+}
+
+bool cycle_counter_available() {
+    return s_available;
+}
+
+uint64_t cycle_counter_read() {
+    if (!s_available) return 0;
+    uint64_t c = 0;
+    if (read(s_fd, &c, sizeof(c)) != sizeof(c)) return 0;
+    return c;
+}
+
+} // namespace arm64bench
+
+#else // ── Other platforms: no PMU access ─────────────────────────────────────
 
 namespace arm64bench {
 
@@ -305,4 +383,4 @@ uint64_t cycle_counter_read()      { return 0; }
 
 } // namespace arm64bench
 
-#endif // __APPLE__ / _WIN32
+#endif // __APPLE__ / _WIN32 / __linux__
