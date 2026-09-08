@@ -156,7 +156,7 @@ static constexpr uint32_t kIndTableBytes  = kIndTableSize * sizeof(uintptr_t);
 static uint64_t rsb_loops_for_depth(uint32_t depth) {
     const uint64_t target = 150'000'000ULL;  // loop-iters × pairs to fill ~100ms
     const uint64_t loops  = target / depth;
-    return (loops < 500'000) ? 500'000 : loops;
+    return scale_loops((loops < 500'000) ? 500'000 : loops);
 }
 
 // Indirect cycling test: loop count per target count N.
@@ -169,14 +169,14 @@ static uint64_t ind_cycle_loops_for_n(uint32_t /*n*/) {
     // All cycle test entries converge to ~10 clk (mispredicting), so they're
     // already ~16ms at 5M. Only N=1 is short (~5ms). Use 30M for all — it
     // keeps N=1 clean (~30ms) and N≥2 at ~100ms. Cap at 30M.
-    return 30'000'000ULL;
+    return scale_loops(30'000'000ULL);
 }
 
 static uint64_t ind_capacity_loops_for_n(uint32_t n) {
     // Each iteration executes N BLR instructions. Target ~50ms per sample.
     // At predicted ~3 clk/BLR: loops = 50ms × 3GHz / (3 × N) = 50M / N.
     const uint64_t loops = 50'000'000ULL / n;
-    return (loops < 200'000) ? 200'000 : loops;
+    return scale_loops((loops < 200'000) ? 200'000 : loops);
 }
 
 // ── RSB depth test builder ────────────────────────────────────────────────────
@@ -461,7 +461,7 @@ static uint64_t ind_unique_loops_for_n(uint32_t n) {
     // Target ~50ms per sample. Each iteration: N BLR calls, each ~3–10 clk.
     // Conservative estimate: 10 clk/BLR → loops = 50ms×3GHz / (10×N) = 15M/N.
     const uint64_t loops = 15'000'000ULL / n;
-    return (loops < 100'000) ? 100'000 : loops;
+    return scale_loops((loops < 100'000) ? 100'000 : loops);
 }
 
 static JitPool::TestFn build_ind_unique_target_loop(

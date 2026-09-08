@@ -67,6 +67,46 @@ struct ReferenceParams {
 // ReferenceParams{} (fn == nullptr) to disable.
 void set_reference_function(const ReferenceParams& ref);
 
+// ── Run mode ────────────────────────────────────────────────────────────────
+//
+// Measure: normal operation — full sampling, statistics, and output.
+// Smoke:   execute every generated test function exactly once with a heavily
+//          reduced loop count, print "ok" per test, and record no measurements.
+//          Used by CI to verify that every JIT'd instruction sequence encodes
+//          and executes on the host (no SIGILL, no encoder error), on machines
+//          where timing data would be meaningless anyway (shared VMs, no PMU).
+enum class RunMode : uint8_t {
+    Measure = 0,
+    Smoke   = 1,
+};
+
+void    set_run_mode(RunMode mode);
+RunMode run_mode();
+
+// Scale a nominal loop count for the current run mode.
+//
+// Measure: returns `nominal` unchanged.
+// Smoke:   returns nominal / kSmokeLoopDivisor, floored at 1, so a test that
+//          would run ~100 ms runs in ~100 µs.
+//
+// Generators must route every JIT-baked loop count through this function so
+// that the count the harness normalizes by (BenchmarkParams::loops) always
+// matches the count baked into the generated code.
+static constexpr uint64_t kSmokeLoopDivisor = 1000;
+uint64_t scale_loops(uint64_t nominal);
+
+// Number of test functions executed so far in Smoke mode (0 in Measure mode).
+uint32_t smoke_test_count();
+
+// ── Name filter ─────────────────────────────────────────────────────────────
+
+// Restrict benchmark() to tests whose name contains `substr` (case-sensitive
+// substring match). Non-matching tests are skipped: nothing is run or
+// printed, and a zeroed BenchmarkResult is returned. Pass nullptr or "" to
+// clear the filter. The pointer must stay valid for the life of the process
+// (argv storage is fine).
+void set_name_filter(const char* substr);
+
 // ── Parameters ─────────────────────────────────────────────────────────────
 
 struct BenchmarkParams {
@@ -176,6 +216,12 @@ struct BenchmarkResult {
 //   5. Drop priority, sort samples, discard the discard_highest slowest.
 //   6. Compute and print statistics. Return BenchmarkResult.
 //      min_clocks_per_insn uses the best available source: PMU > Ratio > Calibrated.
+//
+// In RunMode::Smoke the above is replaced by: print the name, call fn once,
+// print "ok" — and return a zeroed BenchmarkResult. The name is printed and
+// flushed *before* the call so that a crash (SIGILL from a bad encoding, a
+// fault from a bad address) leaves the failing test's name as the last line
+// of output.
 BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& params);
 
 // ── Output control ──────────────────────────────────────────────────────────

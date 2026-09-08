@@ -7,6 +7,7 @@
 #include "cycle_counter.h"
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
 
 #if defined(_WIN32)
@@ -31,6 +32,42 @@ static ReferenceParams s_ref{};
 
 void set_reference_function(const ReferenceParams& ref) {
     s_ref = ref;
+}
+
+// ── Run mode / loop scaling ─────────────────────────────────────────────────
+
+static RunMode  s_run_mode    = RunMode::Measure;
+static uint32_t s_smoke_count = 0;
+
+void set_run_mode(RunMode mode) {
+    s_run_mode = mode;
+}
+
+RunMode run_mode() {
+    return s_run_mode;
+}
+
+uint64_t scale_loops(uint64_t nominal) {
+    if (s_run_mode != RunMode::Smoke)
+        return nominal;
+    const uint64_t scaled = nominal / kSmokeLoopDivisor;
+    return scaled ? scaled : 1;
+}
+
+uint32_t smoke_test_count() {
+    return s_smoke_count;
+}
+
+// ── Name filter ─────────────────────────────────────────────────────────────
+
+static const char* s_name_filter = nullptr;
+
+void set_name_filter(const char* substr) {
+    s_name_filter = (substr && *substr) ? substr : nullptr;
+}
+
+static bool name_selected(const char* name) {
+    return !s_name_filter || strstr(name, s_name_filter) != nullptr;
 }
 
 // ── Output mode ─────────────────────────────────────────────────────────────
@@ -250,9 +287,41 @@ static void print_result(const char* name, const BenchmarkResult& r) {
     fflush(stdout);
 }
 
+// ── Smoke runner ─────────────────────────────────────────────────────────────
+//
+// Execute fn exactly once and report that it returned. No warm-up, no
+// priority elevation, no sleeps, no statistics: the only question being
+// answered is "does this generated code run on this CPU?".
+
+static BenchmarkResult run_smoke(TestFn fn, const char* name) {
+    if (s_output_mode == OutputMode::CSV)
+        printf("%s,", name);
+    else
+        printf("%-48s: ", name);
+    fflush(stdout);   // must reach the terminal/log before fn() can crash
+
+    const RawTick t0 = tick_now();
+    fn();
+    const RawTick t1 = tick_now();
+
+    if (s_output_mode == OutputMode::CSV)
+        printf("ok,%.1f\n", ticks_to_ns_f(t1 - t0) * 1e-3);
+    else
+        printf("ok  %9.1f us\n", ticks_to_ns_f(t1 - t0) * 1e-3);
+    fflush(stdout);
+
+    ++s_smoke_count;
+    return BenchmarkResult{};
+}
+
 // ── Benchmark runner ─────────────────────────────────────────────────────────
 
 BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& params) {
+    if (!name_selected(name))
+        return BenchmarkResult{};
+    if (s_run_mode == RunMode::Smoke)
+        return run_smoke(fn, name);
+
     // Hard cap so the sample array stays on the stack.
     static constexpr uint32_t kMaxSamples = 32;
 

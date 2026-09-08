@@ -246,7 +246,7 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
 
     // Loop counts: forwarding latency ≈ 4–16 cycles → target ~100ms.
     // At 15 cyc × (1/3.2 GHz) × 8 unroll = ~37.5ns/iter → 100ms/37.5ns ≈ 2.7M.
-    const uint64_t loops  = 3'000'000;
+    const uint64_t loops  = scale_loops(3'000'000);
     const uint32_t unroll = 8;
     char name[80];
 
@@ -346,7 +346,7 @@ static void run_barrier_tests(const BenchmarkParams& base) {
     printf("\n── Memory ordering barriers ────────────────────────────────────\n");
     printf("  clk/insn = cycles per barrier instruction (unroll=8).\n\n");
 
-    const uint64_t loops  = 3'000'000;
+    const uint64_t loops  = scale_loops(3'000'000);
     const uint32_t unroll = 8;
     char name[80];
 
@@ -646,7 +646,8 @@ static void run_nontemporal_tests(const BenchmarkParams& base,
         if (sz.bytes > bufsz) continue;
         const uint64_t lines     = sz.bytes / kNTCacheLine;
         const uint64_t passes    = 50'000'000 / lines;
-        const uint64_t p_clamped = (passes < 4) ? 4 : (passes > 2'000'000 ? 2'000'000 : passes);
+        const uint64_t p_clamped = scale_loops(
+            (passes < 4) ? 4 : (passes > 2'000'000 ? 2'000'000 : passes));
 
         BenchmarkParams p       = base;
         p.loops                 = p_clamped;
@@ -693,7 +694,7 @@ static void run_misaligned_tests(const BenchmarkParams& base, void* buf) {
     printf("  Pointer-chase through a buffer; each pointer is misaligned\n"
            "  by the given byte offset from 8-byte alignment.\n\n");
 
-    const uint64_t loops   = 10'000'000;
+    const uint64_t loops   = scale_loops(10'000'000);
     char name[80];
 
     // Offsets to test. 0 = naturally aligned. Others probe crossing points.
@@ -786,7 +787,7 @@ static void run_cas_tests(const BenchmarkParams& base, void* buf) {
     printf("  Single-threaded CAS on an L1-resident cache line.\n"
            "  clk/insn = total CAS round-trip latency (load+compare+store).\n\n");
 
-    const uint64_t loops  = 5'000'000;
+    const uint64_t loops  = scale_loops(5'000'000);
     const uint32_t unroll = 4;
     char name[80];
 
@@ -1010,7 +1011,7 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
            "    so LDAPR = LDAR = LDR is CORRECT — check forwarding tests below.\n"
            "  LDAPUR/STLUR (FEAT_LRCPC2): unscaled-offset variants.\n\n");
 
-    const uint64_t loops  = 3'000'000;
+    const uint64_t loops  = scale_loops(3'000'000);
     const uint32_t unroll = 8;
     char name[80];
     auto make_p = [&](uint64_t l, uint32_t u) { return make_lat_params(base, l, u); };
@@ -1187,7 +1188,7 @@ static void run_bfi_dependency_tests(const BenchmarkParams& base) {
     printf("  Variant B: overlapping bitfield rotation across x0/x1/x2 (true latency)\n");
     printf("  Variant C: full-width BFI (degenerates to MOV — does µarch dep-break?)\n\n");
 
-    const uint64_t loops  = 5'000'000;
+    const uint64_t loops  = scale_loops(5'000'000);
     const uint32_t unroll = 24;            // multiple of 3 for variant B rotation
     char name[80];
 

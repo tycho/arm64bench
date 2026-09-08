@@ -28,6 +28,9 @@ static void print_usage(const char* prog) {
     printf("  --samples <n>   Samples per benchmark (default 7)\n");
     printf("  --warmup  <n>   Warm-up calls before timing (default 2)\n");
     printf("  --csv           Machine-readable CSV output\n");
+    printf("  --smoke         Execute every test once with tiny loop counts;\n");
+    printf("                  report ok/crash, record no measurements (CI)\n");
+    printf("  --filter <s>    Only run tests whose name contains <s>\n");
     printf("  --all           Run all test categories\n");
     printf("  --integer       Run integer ALU tests\n");
     printf("  --memory        Run memory / cache hierarchy tests\n");
@@ -47,12 +50,14 @@ int main(int argc, char** argv) {
     bool run_lse      = false;
     bool run_pitfalls = false;
     bool csv_mode     = false;
+    bool smoke_mode   = false;
+    const char* name_filter = nullptr;
     uint64_t override_mhz = 0;
 
     arm64bench::BenchmarkParams default_params{};
-    default_params.loops                = 6'000'128;
     default_params.instructions_per_loop = 32;
-    // (num_samples, num_warmup, etc. use struct defaults)
+    // (num_samples, num_warmup, etc. use struct defaults; loops is set below
+    //  once the run mode is known)
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -62,6 +67,10 @@ int main(int argc, char** argv) {
             return 0;
         } else if (strcmp(arg, "--csv") == 0) {
             csv_mode = true;
+        } else if (strcmp(arg, "--smoke") == 0) {
+            smoke_mode = true;
+        } else if (strcmp(arg, "--filter") == 0 && i + 1 < argc) {
+            name_filter = argv[++i];
         } else if (strcmp(arg, "--all") == 0) {
             run_integer = run_memory = run_branch = run_simd = run_lse = run_pitfalls = true;
         } else if (strcmp(arg, "--integer")  == 0) { run_integer  = true; }
@@ -91,6 +100,15 @@ int main(int argc, char** argv) {
     if (!run_integer && !run_memory && !run_branch && !run_simd && !run_lse && !run_pitfalls)
         run_integer = run_memory = true;
 
+    // Run mode must be set before any loop count is derived: scale_loops()
+    // consults it, and generators bake the result into their JIT code.
+    if (smoke_mode)
+        arm64bench::set_run_mode(arm64bench::RunMode::Smoke);
+    arm64bench::set_name_filter(name_filter);
+
+    // Nominal 6M iterations × 32 instructions ≈ 60 ms per call at 3 GHz.
+    default_params.loops = arm64bench::scale_loops(6'000'128);
+
     // ── Initialise ─────────────────────────────────────────────────────────
     printf("\narm64bench  (built %s %s)\n", __DATE__, __TIME__);
 
@@ -109,6 +127,9 @@ int main(int argc, char** argv) {
         arm64bench::g_cpu_freq_hz = override_mhz * 1'000'000ULL;
         printf("CPU frequency: %llu MHz (user override)\n",
                static_cast<unsigned long long>(override_mhz));
+    } else if (smoke_mode) {
+        // ~1.5 s of calibration would produce a number nothing consumes.
+        printf("CPU frequency: not calibrated (smoke mode)\n");
     } else {
         printf("Calibrating CPU frequency...\n");
         const uint64_t hz = arm64bench::calibrate_cpu_freq();
@@ -136,7 +157,13 @@ int main(int argc, char** argv) {
         arm64bench::set_reference_function(ref);
     }
 
-    if (pmu_ok) {
+    if (smoke_mode) {
+        printf("Run mode: smoke — each test executed once with loop counts / %llu;"
+               " no measurements recorded\n",
+               static_cast<unsigned long long>(arm64bench::kSmokeLoopDivisor));
+        printf("CPU cycle source: %s (unused in smoke mode)\n\n",
+               pmu_ok ? "hardware PMU available" : "hardware PMU unavailable");
+    } else if (pmu_ok) {
         printf("CPU cycle source: hardware PMU (Tier 1 — P-state immune)\n\n");
     } else {
         printf("CPU cycle source: ratio normalization vs ADD reference"
@@ -182,7 +209,20 @@ int main(int argc, char** argv) {
         printf("\n");
     }
 
+    int exit_code = 0;
+    if (smoke_mode) {
+        const uint32_t n = arm64bench::smoke_test_count();
+        printf("── Smoke summary ─────────────────────────────────────────────\n");
+        if (n == 0) {
+            printf("FAIL: no tests executed%s\n",
+                   name_filter ? " (filter matched nothing)" : "");
+            exit_code = 1;
+        } else {
+            printf("OK: %u tests executed\n", n);
+        }
+    }
+
     // g_jit_pool goes out of scope here, releasing all compiled functions.
     arm64bench::g_jit_pool = nullptr;
-    return 0;
+    return exit_code;
 }

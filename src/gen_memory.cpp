@@ -477,10 +477,12 @@ static uint64_t lat_loops_for_size(size_t buf_size) {
     // These are lower bounds — if the real latency is higher, the sample is
     // longer than 150ms, which is fine. If faster, we still get a clean result
     // because we never go below what's needed.
-    if      (buf_size <=  128ULL * 1024)     return 75'000'000;   // L1
-    else if (buf_size <=    8ULL * 1024*1024) return 20'000'000;  // L2/SLC
-    else if (buf_size <=   32ULL * 1024*1024) return  5'000'000;  // SLC/DRAM edge
-    else                                       return  kLatLoopsMax;  // DRAM
+    uint64_t loops;
+    if      (buf_size <=  128ULL * 1024)      loops = 75'000'000;   // L1
+    else if (buf_size <=    8ULL * 1024*1024) loops = 20'000'000;   // L2/SLC
+    else if (buf_size <=   32ULL * 1024*1024) loops =  5'000'000;   // SLC/DRAM edge
+    else                                      loops = kLatLoopsMax; // DRAM
+    return scale_loops(loops);
 }
 
 static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
@@ -633,6 +635,7 @@ static void run_bw_sweep(void* buf, const BenchmarkParams& base, bool is_store) 
         uint64_t num_passes = kBwTargetLines / lines_per_pass;
         if (num_passes < 4)          num_passes = 4;
         if (num_passes > 2'000'000)  num_passes = 2'000'000;
+        num_passes = scale_loops(num_passes);
 
         JitPool::TestFn fn = is_store
             ? build_seq_store_bw(reinterpret_cast<uintptr_t>(buf), buf_size, num_passes)
@@ -812,6 +815,7 @@ static void run_ldnp_bw_sweep(void* buf, const BenchmarkParams& base) {
         uint64_t num_passes = kBwTargetLines / lines_per_pass;
         if (num_passes < 4)          num_passes = 4;
         if (num_passes > 2'000'000)  num_passes = 2'000'000;
+        num_passes = scale_loops(num_passes);
 
         JitPool::TestFn fn = build_seq_ldnp_bw(
             reinterpret_cast<uintptr_t>(buf), buf_size, num_passes);
@@ -856,6 +860,7 @@ static void run_copy_bw_sweep(void* buf, const BenchmarkParams& base) {
         uint64_t num_passes = kBwTargetLines / lines_per_pass;
         if (num_passes < 4)          num_passes = 4;
         if (num_passes > 2'000'000)  num_passes = 2'000'000;
+        num_passes = scale_loops(num_passes);
 
         JitPool::TestFn fn = build_seq_copy_bw(src_base, dst_base, buf_size, num_passes);
         if (!fn) continue;

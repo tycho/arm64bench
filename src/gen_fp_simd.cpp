@@ -27,7 +27,7 @@
 //
 // ── Slow instruction scaling ──────────────────────────────────────────────────
 //
-// FDIV / FSQRT: ~6–12 cycle latency. We use kSlowFpLoops × kSlowFpUnroll
+// FDIV / FSQRT: ~6–12 cycle latency. We use slow_fp_loops() × kSlowFpUnroll
 // to keep each sample at ~100ms.
 
 #include "gen_fp_simd.h"
@@ -75,7 +75,7 @@ static inline Vec        vd2_src()  { return kVRegs[16].d2(); }
 
 // ── Loop count helpers ────────────────────────────────────────────────────────
 
-static constexpr uint64_t kSlowFpLoops  = 4'000'000;
+static uint64_t slow_fp_loops() { return scale_loops(4'000'000); }
 static constexpr uint32_t kSlowFpUnroll = 8;
 
 static BenchmarkParams make_params(const BenchmarkParams& base,
@@ -256,7 +256,7 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
     // Oscillating chain: s0 = 2.0/s0 alternates between 1.0 and 2.0.
     // 2.0 and 1.0 are both exactly representable and directly encodable via FMOV.
     {
-        auto fn = build_fp_loop(kSlowFpLoops, kSlowFpUnroll,
+        auto fn = build_fp_loop(slow_fp_loops(), kSlowFpUnroll,
             [](a64::Assembler& a) {
                 a.fmov(s_src(), 2.0);
                 a.fmov(sr(0),   2.0);
@@ -266,19 +266,19 @@ static void run_scalar_f32_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "FDIV f32 latency      (%ux unroll)", kSlowFpUnroll);
-        run_one(name, fn, make_params(base, kSlowFpLoops, kSlowFpUnroll));
+        run_one(name, fn, make_params(base, slow_fp_loops(), kSlowFpUnroll));
     }
 
     // ── FSQRT f32 latency ─────────────────────────────────────────────────
     // sqrt(2) ≈ 1.414, sqrt(1.414) ≈ 1.189, converges slowly toward 1.0.
     // Genuine dependency chain throughout.
     {
-        auto fn = build_fp_loop(kSlowFpLoops, kSlowFpUnroll,
+        auto fn = build_fp_loop(slow_fp_loops(), kSlowFpUnroll,
             [](a64::Assembler& a) { a.fmov(sr(0), 2.0); },
             [](a64::Assembler& a, uint32_t) { a.fsqrt(sr(0), sr(0)); });
         snprintf(name, sizeof(name),
                  "FSQRT f32 latency     (%ux unroll)", kSlowFpUnroll);
-        run_one(name, fn, make_params(base, kSlowFpLoops, kSlowFpUnroll));
+        run_one(name, fn, make_params(base, slow_fp_loops(), kSlowFpUnroll));
     }
 }
 
@@ -344,7 +344,7 @@ static void run_scalar_f64_tests(const BenchmarkParams& base,
 
     // FDIV f64 latency
     {
-        auto fn = build_fp_loop(kSlowFpLoops, kSlowFpUnroll,
+        auto fn = build_fp_loop(slow_fp_loops(), kSlowFpUnroll,
             [](a64::Assembler& a) {
                 a.fmov(d_src(), 2.0);
                 a.fmov(dr(0),   2.0);
@@ -354,7 +354,7 @@ static void run_scalar_f64_tests(const BenchmarkParams& base,
             });
         snprintf(name, sizeof(name),
                  "FDIV f64 latency      (%ux unroll)", kSlowFpUnroll);
-        run_one(name, fn, make_params(base, kSlowFpLoops, kSlowFpUnroll));
+        run_one(name, fn, make_params(base, slow_fp_loops(), kSlowFpUnroll));
     }
 }
 
