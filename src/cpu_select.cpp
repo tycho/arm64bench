@@ -51,10 +51,15 @@ void format_ids(char* out, size_t cap, const CpuTopology& t, const bool* in) {
     }
 }
 
-// Core name from MIDR_EL1 (implementer[31:24], part[15:4]).
+// Core name from MIDR_EL1 (implementer[31:24], variant[23:20], part[15:4],
+// revision[3:0]), with the variant and revision in Arm's rNpM form: the
+// X2 Elite reports its Performance cores as r2p1 and its Prime cores as
+// r1p1 of the same part.
 const char* core_name(uint64_t midr, char* buf, size_t cap) {
     const unsigned impl = static_cast<unsigned>((midr >> 24) & 0xFF);
+    const unsigned var  = static_cast<unsigned>((midr >> 20) & 0xF);
     const unsigned part = static_cast<unsigned>((midr >> 4) & 0xFFF);
+    const unsigned rev  = static_cast<unsigned>(midr & 0xF);
     const char* name = nullptr;
     if (impl == 0x41) {
         switch (part) {
@@ -75,14 +80,15 @@ const char* core_name(uint64_t midr, char* buf, size_t cap) {
             default: break;
         }
     } else if (impl == 0x51) {
-        if (part == 0x001)      name = "Qualcomm Oryon";
+        if (part == 0x001)      name = "Oryon (X Elite)";
+        else if (part == 0x002) name = "Oryon (X2)";
         else if (part == 0x804) name = "Kryo 4xx Gold";
         else if (part == 0x805) name = "Kryo 4xx Silver";
     } else if (impl == 0xC0 && part == 0xAC3) {
         name = "Ampere-1";
     }
-    if (name) snprintf(buf, cap, "%s", name);
-    else      snprintf(buf, cap, "impl 0x%02x part 0x%03x", impl, part);
+    if (name) snprintf(buf, cap, "%s r%up%u", name, var, rev);
+    else      snprintf(buf, cap, "impl 0x%02x part 0x%03x r%up%u", impl, part, var, rev);
     return buf;
 }
 
@@ -198,7 +204,7 @@ void select_cpus(int mode, bool survey, CpuChoice& out) {
         for (uint32_t i = 0; i < t.count; ++i)
             if (group[i] == g) { if (t.cpus[i].max_khz > khz) khz = t.cpus[i].max_khz; if (!midr) midr = t.cpus[i].midr; }
         char name[40];
-        printf("  cpus %-8s  %-16s", ids, midr ? core_name(midr, name, sizeof(name)) : "");
+        printf("  cpus %-8s  %-22s", ids, midr ? core_name(midr, name, sizeof(name)) : "");
         if (gclass[g] >= 0) printf("  class %d", gclass[g]); else printf("         ");
         if (surveyed && score[g] > 0.0) printf("  measured %.2f GHz", score[g]);
         // The OS figure is the registry's "~MHz" on Windows (wrong on the 8cx
