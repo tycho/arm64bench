@@ -8,7 +8,7 @@ project(arm64bench LANGUAGES CXX)
 if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "arm64bench requires Clang. Use -T ClangCL or the LLVM toolchain.")
 endif()
-if(MSVC)
+if (CMAKE_GENERATOR MATCHES "Visual Studio")
 	# Use multi-processor compilation in MSVC for faster builds
 	add_compile_options(/MP)
 endif()
