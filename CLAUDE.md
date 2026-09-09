@@ -384,8 +384,9 @@ the random permutation defeats the next-line prefetcher either way.
   NOPs on M5 show no limit to 2048 — they are apparently dropped before allocation.
 - **Two dependent misses per chain** double the shadow (~750 clk) so 2 × 2048 fillers stay inside it.
 - **Flags and branches are structures too.** `CMP x2, x3` allocates a flag physical register and
-  nothing else (knee ≈ 170–179 on M5); a not-taken `B.NE` allocates a branch-order-buffer entry
-  (knee ≈ 194–203). Both are smaller than the integer PRF, so a filler that sets flags or branches
+  nothing else (knee ≈ 170–179 on M5); a never-taken `B.EQ` (flags set NE once in setup) allocates a
+  branch-order-buffer entry (knee ≈ 194–203; a taken-to-next-instruction B.NE gave the same knee on M5
+  but 42–51 vs 154–163 on the two Neoverse N2 CI legs, so keep it not taken). Both are smaller than the integer PRF, so a filler that sets flags or branches
   measures those, not the PRF or ROB.
 - **Masked pointers** (`link ^ 0xA5A5…`, unmasked with EOR) defeat any data-dependent prefetcher;
   M5 showed no plain-vs-masked difference (DIT made none either), but the sweeps use masked rings.

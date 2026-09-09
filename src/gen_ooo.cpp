@@ -126,10 +126,12 @@ static void emit_filler(a64::Assembler& a, Filler f, uint32_t k) {
         case Filler::Store:  a.str(x2, ptr(x9, static_cast<int32_t>(8 * (k % 8)))); break;
         // CMP writes NZCV only: a flag physical register and a ROB entry.
         case Filler::Cmp:    a.cmp(x2, x3); break;
-        // Not-taken B.NE (x2 == x3): a branch-order-buffer entry, no register.
+        // B.EQ with flags NE (set once in setup, x2 = 1, x3 = 2, and the CMP
+        // filler reproduces them): never taken, a branch-order-buffer entry
+        // and no register.
         case Filler::Bcond: {
             Label l = a.new_label();
-            a.b(CondCode::kNE, l);
+            a.b(CondCode::kEQ, l);
             a.bind(l);
             break;
         }
@@ -145,6 +147,7 @@ static void emit_setup(a64::Assembler& a, uintptr_t head_a, uintptr_t head_b) {
     a.fmov(d22, 1.0);
     for (uint32_t i = 0; i < kNumFillFp; ++i) a.fmov(kFillFp[i], 1.0);
     a.str(x2, ptr(x9));                              // make the slot resident
+    a.cmp(x2, x3);                                   // NE, and nothing in the loop but the CMP filler writes flags
 }
 
 // One iteration = miss A, N fillers, miss B, N fillers.
