@@ -346,9 +346,15 @@ A fused pair is one micro-op, so pairs/clk should match the cheaper single's rat
 discriminates when the two halves would otherwise compete for the same resource. On M5 the
 branch unit and the ALUs are separate ports, so unfused CMP+B.NE can already reach the branch
 rate; the measured 0.41 clk/pair versus 0.35 for B.NE alone is consistent with either. ADRP+ADD
-at exactly the ADRP-alone rate, well under the sum, is the clearer case. To pin CMP+B.cond down
-you need a rename-width-bound test (pad each pair with enough independent NOPs that 10-wide
-rename is the limit, then see whether the pair counts as one or two).
+at exactly the ADRP-alone rate, well under the sum, is the clearer case.
+
+The width-bound test (pair + 8 or 18 NOPs per group, so the loop runs at the front-end's 10
+slots/clk) asks a different question: does a fused pair save a front-end slot? On M5 the answer
+is no for every pair, including AESE+AESMC, which the crypto latency test shows is fused: every
+10-instruction group costs exactly 1.0 clk and every 20-instruction group 2.0. The 10/clk limit
+is instruction fetch/decode, upstream of fusion; fused pairs are one micro-op downstream but
+still two instructions to the front end. A core that fuses in decode and renames narrower than
+it decodes would show 0.9 there.
 
 ### Pointer-chase stride and L1 set conflicts
 
@@ -477,7 +483,7 @@ no-partner reference line, not to three digits.
 | **FEAT_BF16** | `gen_bf16.cpp` | BFDOT 3 clk, 1/clk (half the SDOT rate); BFMMLA 4.9 clk, 1 per 2 clk — same 8 MAC/clk either way, no matrix-form advantage (as with SMMLA); BFMLALB/T 4 clk, ~1.5/clk |
 | **JSCVT** | `gen_fp_simd.cpp §7` | SCVTF/FJCVTZS round trip 6.0 clk = same as SCVTF/FCVTZS (5.9); JavaScript ToInt32 semantics are free |
 | **Memory-level parallelism** | `gen_mlp.cpp` | Effective MLP (1-chain latency / saturated per-load time): 2 MB ≈ 6.7, 16 MB ≈ 11, DRAM ≈ 18 misses in flight (13 GB/s random lines, floor leaves at 22–24 chains); L1 dependent loads issue at 1/clk |
-| **Front-end / rename** | `gen_frontend.cpp` | 10 NOPs/clk at every body size; GPR MOV eliminated only when consumed by an ALU op (pure MOV chain 0.9 clk); FMOV d,d and ORR v,v 2 clk (executed); **no zero idioms** (EOR/SUB/AND-xzr, vector EOR/SUB all stay dependent); ADRP+ADD pairs = ADRP alone; MOVZ 8.8/clk without an ALU; 2 taken B/clk; ISB 34 clk |
+| **Front-end / rename** | `gen_frontend.cpp` | 10 NOPs/clk at every body size; GPR MOV eliminated only when consumed by an ALU op (pure MOV chain 0.9 clk); FMOV d,d and ORR v,v 2 clk (executed); **no zero idioms** (EOR/SUB/AND-xzr, vector EOR/SUB all stay dependent); ADRP+ADD pairs = ADRP alone; MOVZ 8.8/clk without an ALU; no pair (CMP/SUBS+B.cond, ADD+CBZ, ADRP+ADD, MOVZ+MOVK, AESE+AESMC) saves a front-end slot (10-insn groups all exactly 1.0 clk); 2 taken B/clk; ISB 34 clk |
 | **I-cache / BTB / iTLB** | `gen_icache.cpp` | L1I 192 KB (10 NOP/clk to 192 KB, 3.2/clk from L2, ~2/clk at 16 MB); BTB: zero-bubble taken branches to 48–64 sites, 2–3 clk to ~384, 4.2 clk beyond; L1 iTLB ≥ 192 × 16 KB pages, L2 TLB +9 clk from 256 to ≥ 2048 pages |
 | **FP width conversions** | `gen_fp_simd.cpp §8` | FCVTL/FCVTN (f16↔f32, f32↔f64, low and high halves) and scalar FCVT all 3 clk latency, 4 per clk; FCVTN2's destination merge is free |
 | **Core-to-core** | `gen_c2c.cpp` | Unpinned (QoS-placed) on M5: P↔P round trip ≈ 104 ns (~52 ns one way), P↔E ≈ 320 ns; identical for LDAR/STLR, LDR/STR, 1-line and 2-line; LDADDAL 7 clk alone, ≈ 6.5–9 ns contended (CoV 20–40 %, arbitration is bursty). Pinned core matrices come from Linux/Windows |

@@ -11,6 +11,8 @@
 //                           `eor v0, v0, v0` break the dependency on x0/v0?
 //   macro-op fusion         CMP+B.cond, ADRP+ADD, MOVZ+MOVK: does a pair
 //                           issue as one micro-op (pairs/clk vs singles/clk)?
+//                           and, padded with NOPs to the front-end width,
+//                           does a fused pair save a front-end slot?
 //   branch throughput       taken unconditional and not-taken conditional
 //   ISB                     pipeline flush cost
 //

@@ -244,6 +244,76 @@ static void run_fusion_tests(const BenchmarkParams& base, uint64_t loops, uint32
     }
 }
 
+// ── Macro-op fusion, rename-bound ─────────────────────────────────────────────
+//
+// Each group is one candidate pair followed by `pad` independent NOPs, so a
+// group is pad + 2 instructions. NOPs cost nothing but a front-end slot, so
+// the loop runs at the front-end's width: at 10 slots/clk a 10-instruction
+// group costs 1.0 clk unfused and 0.9 clk if the pair takes one slot at
+// whatever stage sets the width. Both pads are run because a 10 % step is
+// small; the 20-instruction group shows the same absolute saving as a 5 %
+// step, which tells a real fusion from a rounding wobble.
+//
+// A flat 1.0 for every pair, AESE+AESMC included (fused for latency, see
+// gen_crypto), means the width limit is upstream of fusion: pairs fuse into
+// one micro-op but still cost two fetch/decode slots. That is the M5 result.
+
+static void run_fusion_rename_tests(const BenchmarkParams& base, uint64_t loops) {
+    char name[96];
+    static constexpr uint32_t kGroups = 32;
+    static constexpr uint32_t kRot    = 8;
+
+    struct Pair {
+        const char* label;
+        void (*emit)(a64::Assembler&, uint32_t);
+    };
+    static const Pair kPairs[] = {
+        { "NOP+NOP  (control)",
+          [](a64::Assembler& a, uint32_t) { a.nop(); a.nop(); } },
+        { "CMP+B.NE (not taken)",
+          [](a64::Assembler& a, uint32_t) {
+              Label l = a.new_label();
+              a.cmp(x0, x1); a.b(CondCode::kNE, l); a.bind(l); } },
+        { "SUBS+B.NE (not taken)",
+          [](a64::Assembler& a, uint32_t u) {
+              Label l = a.new_label();
+              a.subs(xr(2 + u % 6), xr(2 + u % 6), Imm(0)); a.b(CondCode::kEQ, l); a.bind(l); } },
+        { "ADD+CBZ  (not taken)",
+          [](a64::Assembler& a, uint32_t u) {
+              Label l = a.new_label();
+              a.add(xr(2 + u % 6), xr(2 + u % 6), Imm(0)); a.cbz(xr(2 + u % 6), l); a.bind(l); } },
+        { "ADRP+ADD",
+          [](a64::Assembler& a, uint32_t u) {
+              Label here = a.new_label();
+              a.bind(here);
+              a.adrp(xr(u % kRot), here); a.add(xr(u % kRot), xr(u % kRot), Imm(0x123)); } },
+        { "MOVZ+MOVK",
+          [](a64::Assembler& a, uint32_t u) {
+              a.movz(xr(u % kRot), Imm(0x1234)); a.movk(xr(u % kRot), Imm(0x5678), Imm(16)); } },
+        { "AESE+AESMC",
+          [](a64::Assembler& a, uint32_t u) {
+              a.aese(vr(u % kRot).b16(), vr(8).b16()); a.aesmc(vr(u % kRot).b16(), vr(u % kRot).b16()); } },
+    };
+
+    for (const uint32_t pad : { 8u, 18u }) {
+        for (const Pair& p : kPairs) {
+            auto fn = build_loop(loops, kGroups,
+                [](a64::Assembler& a) {
+                    a.mov(x0, Imm(5)); a.mov(x1, Imm(5));
+                    for (uint32_t i = 2; i < kRot; ++i) a.mov(xr(i), Imm(7));
+                    for (uint32_t i = 0; i <= kRot; ++i) a.movi(vr(i).b16(), Imm(1));
+                },
+                [&p, pad](a64::Assembler& a, uint32_t u) {
+                    p.emit(a, u);
+                    for (uint32_t i = 0; i < pad; ++i) a.nop();
+                });
+            snprintf(name, sizeof(name), "%-22s + %2u NOP (clk per %2u-insn group)",
+                     p.label, pad, pad + 2);
+            run_one(name, fn, params_for(base, loops, kGroups));
+        }
+    }
+}
+
 // ── Branch throughput and ISB ─────────────────────────────────────────────────
 
 static void run_branch_and_isb_tests(const BenchmarkParams& base, uint64_t loops, uint32_t unroll) {
@@ -300,6 +370,9 @@ void run_frontend_tests(const BenchmarkParams& base_params) {
 
     section("Macro-op fusion (pairs/clk vs singles)");
     run_fusion_tests(base_params, loops, unroll);
+
+    section("Macro-op fusion (rename-bound: pair + NOP padding)");
+    run_fusion_rename_tests(base_params, loops);
 
     section("Branch throughput and ISB");
     run_branch_and_isb_tests(base_params, loops, unroll);
