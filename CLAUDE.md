@@ -411,15 +411,18 @@ instruction set (minus a few instructions) on the SME unit at the streaming vect
 
 M5 streaming-mode results (VL 512): ADD z.s 3.1 clk / 1 per clk; FADD/FMUL/FMLA/SDOT z.s 8.3 clk
 latency, one per ~4.2 clk regardless of chain count (≈4 f32 FMLA lanes/clk, about a quarter of the
-NEON pipes); LD1W/LDR z ≈1 clk per 64 B (265 GB/s); stores over a 16 KB window: ST1W 1–1.6 clk
-per 64 B (bimodal), STR z ≈2.8 clk, STNT1W 3.4 clk, versus 0.5 clk for STR q outside streaming
-mode (see the next paragraph for why the window matters);
+NEON pipes); LD1W/LDR z ≈1 clk per 64 B (265 GB/s); stores over a ≥16 KB window: ST1W, STR z and
+STNT1W all 1.0 clk per 64 B store (PMU run; an unprivileged Tier 2 run read STR z/STNT1W at 2.8–3.4,
+bimodally), STR q 3.9 clk, versus 0.5 clk for STR q outside streaming mode (see the next paragraph
+for why the window matters);
 WHILELT/PTRUE ≈1 clk. These numbers are core-clock units (Tier 2 ratio), not SME-unit clocks.
 
 **Streaming-mode store serialization.** In streaming mode every SIMD&FP-register store (ST1W,
 STR z, STNT1W, and plain STR q alike) stalls when it hits a line that a recent SIMD store wrote:
-≈110 clk per store when every store hits one line, ≈55 clk rotating over 4 lines, ≈14 clk over
-16, ≈3.5 clk over 64, and full rate only once ≈256 distinct lines (16 KB) separate rewrites.
+≈104 clk per store when every store hits one line (some runs settle at ≈29 clk instead — the
+same-line case is bimodal run to run, each mode stable to 0.1 %), ≈52 clk rotating over 4 lines,
+≈14 clk over 16, ≈3.4 clk over 64, and full rate only once ≈256 distinct lines (16 KB) separate
+rewrites (PMU-backed run).
 Scalar STR x is unaffected (0.5 clk at every window, in or out of streaming mode), and STR q
 outside streaming mode is 0.5 clk at every window, so it is the mode's SIMD store path, not
 the addresses. The store-rotation sweep in `gen_sve.cpp` shows the whole curve. Any streaming
@@ -497,8 +500,8 @@ pattern in every region. Sweeps that only try powers of two would call this pref
 
 | Category | File | Key Results (Apple M5) |
 |---|---|---|
-| **Integer ALU** | `gen_integer.cpp` | ADD=1 clk, MUL=3 clk, SDIV=10 clk, EXTR=2 clk, UMULH=3 clk |
-| **CSEL/CSINV/CSNEG** | `gen_integer.cpp §9` | CSEL true-arm latency=0 (M5 mux bypass when Xd=Xn); CSINV/CSNEG=1 clk |
+| **Integer ALU** | `gen_integer.cpp` | ADD=1 clk, MUL=3 clk, SDIV/UDIV=7 clk (UDIV 2 per clk with 4 chains), EXTR=2 clk, UMULH=3 clk |
+| **CSEL/CSINV/CSNEG** | `gen_integer.cpp §9` | ADDS+CSEL chain 0.73–0.76 clk/insn (PMU and Tier 2 agree), i.e. CSEL with Xd=Xn on the true arm adds ≈0.5 clk on average, not a full cycle; CSINV/CSNEG add the full 1 clk. An earlier run read 0.53/insn and was recorded as "latency 0" |
 | **Branch prediction** | `gen_branch.cpp` | Various predictor stress tests |
 | **Cache hierarchy** | `gen_memory.cpp` | L1/L2/L3/DRAM latency and bandwidth sweeps |
 | **TLB hierarchy** | `gen_memory.cpp` | L1 DTLB ~32 entries, L2 TLB ~256–512 entries; L1 hit=3 clk, L2 hit=11 clk |
@@ -527,7 +530,7 @@ pattern in every region. Sweeps that only try powers of two would call this pref
 | **FP width conversions** | `gen_fp_simd.cpp §8` | FCVTL/FCVTN (f16↔f32, f32↔f64, low and high halves) and scalar FCVT all 3 clk latency, 4 per clk; FCVTN2's destination merge is free |
 | **Core-to-core** | `gen_c2c.cpp` | Unpinned (QoS-placed) on M5: P↔P round trip ≈ 104 ns (~52 ns one way), P↔E ≈ 320 ns; identical for LDAR/STLR, LDR/STR, 1-line and 2-line; LDADDAL 7 clk alone, ≈ 6.5–9 ns contended (CoV 20–40 %, arbitration is bursty). Pinned core matrices come from Linux/Windows |
 | **Prefetcher** | `gen_prefetch.cpp` | Power-of-two strides 64 B–32 KB and 192 B followed both directions across 16 KB pages (9–27 ns/load vs 88 ns random); 384 B, 768 B, 1536 B are NOT followed (46–76 ns), 512 B half-followed (28 ns): consistent with a short-stride detector up to ~256 B plus a spatial-pattern prefetcher that only matches when the stride tiles the region; PRFM honored, scales as latency/D: 45 ns at D=2, 12.8 at D=8, 5.1 at D=32 (= the MLP floor) |
-| **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W 1–1.6 clk, STR z 2.8, STNT1W 3.4 clk per 64 B store over a 16 KB window but ≈110 clk when rewriting one line (SIMD stores serialize in streaming mode, STR q too; scalar STR x immune); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
+| **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W/STR z/STNT1W 1.0 clk per 64 B store over a ≥16 KB window but 29–104 clk when rewriting one line (SIMD stores serialize in streaming mode, STR q too; scalar STR x immune); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
 
 ## Planned Test Coverage
 
