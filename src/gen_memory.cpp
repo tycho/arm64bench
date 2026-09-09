@@ -13,10 +13,12 @@
 //
 //   The permutation is generated with Fisher-Yates, seeded from a fixed
 //   constant for reproducibility — build_pointer_ring() in gen_common.cpp.
-//   The stride between nodes (kNodeStride=256) is chosen to prevent
-//   set-conflict aliasing in typical 8-way caches: with 256-byte stride,
-//   consecutive nodes never map to the same cache set in a cache whose set
-//   count is not a multiple of 4 pages.
+//   One node per cache line (kNodeStride=64): every set of every level is
+//   in play, so a buffer of B bytes occupies B bytes of cache and the level
+//   boundaries fall at the real capacities. A larger stride touches only
+//   one set in (stride/64), which shrinks every level by that factor (a
+//   256-byte stride made a 128 KB L1D look like 32 KB). The random order
+//   already defeats next-line prefetch, so the finer stride costs nothing.
 //
 // BANDWIDTH MEASUREMENT (sequential LDP/STP)
 //   The inner loop body issues kBwLines=8 cache lines worth of LDP (load-pair)
@@ -80,7 +82,7 @@ static constexpr size_t kCacheLine  = 64;
 // Spacing between pointer-chase nodes. 256 bytes = 4 cache lines.
 // Large enough to avoid set-conflict aliasing in typical 8-way caches
 // while keeping chains long enough for large buffers.
-static constexpr size_t kNodeStride = 256;
+static constexpr size_t kNodeStride = 64;
 
 // Latency test: loop count is now computed per buffer size by lat_loops_for_size()
 // to ensure each sample runs long enough for stable timing. See that function
