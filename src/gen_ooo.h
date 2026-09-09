@@ -22,6 +22,8 @@
 //   FADD dN, dN, dC         ROB + an FP/SIMD physical register each
 //   LDR  xzr, [x9] (L1 hit) ROB + a load-queue entry each (no register written)
 //   STR  x2, [x9, #k]       ROB + a store-queue entry each
+//   CMP  x2, x3             ROB + a flag (NZCV) physical register each
+//   B.NE (not taken)        ROB + a branch-order-buffer entry each
 //
 // The smallest of ROB and the filler's own structure wins, so the ADD/FADD
 // knees only reveal the register files where they are smaller than the ROB

@@ -67,7 +67,7 @@ static const Vec kFillFp[] = { d0, d1, d2, d3, d4, d5, d6, d7,
                                d16, d17, d18, d19, d20, d21 };
 static constexpr uint32_t kNumFillFp = sizeof(kFillFp) / sizeof(kFillFp[0]);
 
-enum class Filler { Nop, IntAdd, FpAdd, Load, Store };
+enum class Filler { Nop, IntAdd, FpAdd, Load, Store, Cmp, Bcond };
 
 struct FillerKind {
     Filler       filler;
@@ -95,6 +95,8 @@ static const FillerKind kKinds[] = {
     { Filler::FpAdd,  "FpPRF (FADD fill) ", "FP/SIMD register file",   kWindowSweep },
     { Filler::Load,   "LoadQ (LDR fill)  ", "load queue",              kQueueSweep  },
     { Filler::Store,  "StoreQ (STR fill) ", "store queue",             kQueueSweep  },
+    { Filler::Cmp,    "FlagPRF (CMP fill)", "flag register file",      kQueueSweep  },
+    { Filler::Bcond,  "BOB   (B.cond fill)", "branch order buffer",    kQueueSweep  },
 };
 
 // ── JIT builders ──────────────────────────────────────────────────────────────
@@ -122,6 +124,15 @@ static void emit_filler(a64::Assembler& a, Filler f, uint32_t k) {
         // allocate, so the knee cannot be the integer PRF in disguise.
         case Filler::Load:   a.ldr(xzr, ptr(x9)); break;
         case Filler::Store:  a.str(x2, ptr(x9, static_cast<int32_t>(8 * (k % 8)))); break;
+        // CMP writes NZCV only: a flag physical register and a ROB entry.
+        case Filler::Cmp:    a.cmp(x2, x3); break;
+        // Not-taken B.NE (x2 == x3): a branch-order-buffer entry, no register.
+        case Filler::Bcond: {
+            Label l = a.new_label();
+            a.b(CondCode::kNE, l);
+            a.bind(l);
+            break;
+        }
     }
 }
 
