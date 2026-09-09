@@ -48,17 +48,20 @@ using namespace asmjit::a64;
 // tables skip them: indices 0–7 map to v0–v7 and 8–16 map to v16–v24, all of
 // which are caller-saved. Chain sweeps index up to nc + 1 = 9, and index 16 is
 // the constant-source register.
-static const Vec kSRegs[17] = {
+static const Vec kSRegs[24] = {
     s0,  s1,  s2,  s3,  s4,  s5,  s6,  s7,
-    s16, s17, s18, s19, s20, s21, s22, s23, s24,
+    s16, s17, s18, s19, s20, s21, s22, s23,
+    s24, s25, s26, s27, s28, s29, s30, s31,
 };
-static const Vec kDRegs[17] = {
+static const Vec kDRegs[24] = {
     d0,  d1,  d2,  d3,  d4,  d5,  d6,  d7,
-    d16, d17, d18, d19, d20, d21, d22, d23, d24,
+    d16, d17, d18, d19, d20, d21, d22, d23,
+    d24, d25, d26, d27, d28, d29, d30, d31,
 };
-static const Vec kVRegs[17] = {
+static const Vec kVRegs[24] = {
     v0,  v1,  v2,  v3,  v4,  v5,  v6,  v7,
-    v16, v17, v18, v19, v20, v21, v22, v23, v24,
+    v16, v17, v18, v19, v20, v21, v22, v23,
+    v24, v25, v26, v27, v28, v29, v30, v31,
 };
 
 static inline const Vec& sr(uint32_t i)   { return kSRegs[i]; }
@@ -375,7 +378,7 @@ static void run_neon_f32_tests(const BenchmarkParams& base,
     // well beyond our register budget. The 6-chain result gives the best
     // achievable throughput within this constraint.
     {
-        chain_sweep(base, loops, unroll, "FMLA v4f32 tput", { 2, 3, 4, 6 },
+        chain_sweep(base, loops, unroll, "FMLA v4f32 tput", { 2, 3, 4, 6, 8, 12, 16 },
             [](a64::Assembler& a, uint32_t nc) {
                 // Multiplier registers sit just above the accumulator range.
                 const uint32_t vm_a = nc, vm_b = nc + 1;
@@ -421,7 +424,7 @@ static void run_neon_f64_tests(const BenchmarkParams& base,
 
     // FADD 2×f64 throughput: 4 chains
     {
-        chain_sweep(base, loops, unroll, "FADD v2f64 tput", { 4 },
+        chain_sweep(base, loops, unroll, "FADD v2f64 tput", { 4, 8, 16 },
             [](a64::Assembler& a, uint32_t nc) {
                 a.fmov(d_src(), 1.0);
                 a.dup(vd2_src(), d16.d(0));
@@ -452,7 +455,7 @@ static void run_neon_f64_tests(const BenchmarkParams& base,
 
     // FMLA 2×f64 throughput: 4 chains
     {
-        chain_sweep(base, loops, unroll, "FMLA v2f64 tput", { 4 },
+        chain_sweep(base, loops, unroll, "FMLA v2f64 tput", { 4, 8, 16 },
             [](a64::Assembler& a, uint32_t nc) {
                 a.fmov(dr(nc),     1.5); a.dup(vd2(nc),     kDRegs[nc].d(0));
                 a.fmov(dr(nc + 1), 2.0); a.dup(vd2(nc + 1), kDRegs[nc+1].d(0));
@@ -525,7 +528,7 @@ static void run_neon_int_tests(const BenchmarkParams& base,
 
     // MLA 4×i32 throughput: 4 chains
     {
-        chain_sweep(base, loops, unroll, "MLA  v4i32 tput", { 4 },
+        chain_sweep(base, loops, unroll, "MLA  v4i32 tput", { 4, 8, 16 },
             [](a64::Assembler& a, uint32_t nc) {
                 a.movi(vs4(nc),     Imm(3));
                 a.movi(vs4(nc + 1), Imm(7));
@@ -809,21 +812,21 @@ static void run_conversion_tests(const BenchmarkParams& base,
     // ── Throughput: independent conversions from one constant source ─────
     // FCVTL and FCVTN write their whole destination, so cycling the
     // destination over nc registers gives nc independent streams.
-    chain_sweep(base, loops, unroll, "FCVTL v4s (f16→f32) tput", { 2, 3, 4, 6 },
+    chain_sweep(base, loops, unroll, "FCVTL v4s (f16→f32) tput", { 2, 3, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) {
             a.movi(kVRegs[nc].h4(), Imm(0x3C), Imm(8));
         },
         [](a64::Assembler& a, uint32_t nc, uint32_t u) {
             a.fcvtl(kVRegs[u % nc].s4(), kVRegs[nc].h4());
         });
-    chain_sweep(base, loops, unroll, "FCVTN v4h (f32→f16) tput", { 2, 3, 4, 6 },
+    chain_sweep(base, loops, unroll, "FCVTN v4h (f32→f16) tput", { 2, 3, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) {
             a.movi(kVRegs[nc].s4(), Imm(0x3F), Imm(24));
         },
         [](a64::Assembler& a, uint32_t nc, uint32_t u) {
             a.fcvtn(kVRegs[u % nc].h4(), kVRegs[nc].s4());
         });
-    chain_sweep(base, loops, unroll, "FCVTL v2d (f32→f64) tput", { 2, 3, 4, 6 },
+    chain_sweep(base, loops, unroll, "FCVTL v2d (f32→f64) tput", { 2, 3, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) {
             a.movi(kVRegs[nc].s4(), Imm(0x3F), Imm(24));
         },
@@ -894,7 +897,7 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
 
         // ── SDOT v4s throughput: sweep 2..6 chains ────────────────────────────
         {
-            chain_sweep(base, loops, unroll, "SDOT v4s tput", { 2, 3, 4, 6 },
+            chain_sweep(base, loops, unroll, "SDOT v4s tput", { 2, 3, 4, 6, 8, 12, 16 },
                 [](a64::Assembler& a, uint32_t nc) {
                     a.movi(kVRegs[nc + 1].b16(), Imm(0x02));
                     a.movi(kVRegs[nc    ].b16(), Imm(0x03));
@@ -962,7 +965,7 @@ static void run_advanced_simd_tests(const BenchmarkParams& base,
 
         // ── FMLA 8×f16 throughput: 4 chains ──────────────────────────────────
         {
-            chain_sweep(base, loops, unroll, "FMLA v8f16 tput", { 4 },
+            chain_sweep(base, loops, unroll, "FMLA v8f16 tput", { 4, 8, 16 },
                 [](a64::Assembler& a, uint32_t nc) {
                     a.movi(kVRegs[nc    ].h8(), Imm(0x3C), Imm(8));
                     a.movi(kVRegs[nc + 1].h8(), Imm(0x3C), Imm(8));

@@ -166,7 +166,7 @@ static void run_arith_tests(SveMode mode, const BenchmarkParams& base,
         snprintf(name, sizeof(name), "SVE ADD z.s latency   (%ux unroll)", unroll);
         run_one(name, fn, params_for(base, loops, unroll));
     }
-    sve_chain_sweep(mode, base, loops, unroll, "SVE ADD z.s tput", { 2, 4, 6, 8 },
+    sve_chain_sweep(mode, base, loops, unroll, "SVE ADD z.s tput", { 2, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) { seed_u32(a, nc, 1); a.mov(w9, Imm(3)); a.dup(zc0.s(), w9); },
         [](a64::Assembler& a, uint32_t nc, uint32_t u) {
             const ZReg& z = kZ[u % nc]; a.add(z.s(), z.s(), zc0.s()); });
@@ -179,7 +179,7 @@ static void run_arith_tests(SveMode mode, const BenchmarkParams& base,
         snprintf(name, sizeof(name), "SVE FADD z.s latency  (%ux unroll)", unroll);
         run_one(name, fn, params_for(base, loops, unroll));
     }
-    sve_chain_sweep(mode, base, loops, unroll, "SVE FADD z.s tput", { 2, 4, 6, 8 },
+    sve_chain_sweep(mode, base, loops, unroll, "SVE FADD z.s tput", { 2, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) { seed_f32(a, nc, 1.0f); set_const_f32(a, zc0, 1.0f); },
         [](a64::Assembler& a, uint32_t nc, uint32_t u) {
             const ZReg& z = kZ[u % nc]; a.fadd(z.s(), z.s(), zc0.s()); });
@@ -202,7 +202,7 @@ static void run_arith_tests(SveMode mode, const BenchmarkParams& base,
         snprintf(name, sizeof(name), "SVE FMLA z.s latency  (%ux unroll)", unroll);
         run_one(name, fn, params_for(base, loops, unroll));
     }
-    sve_chain_sweep(mode, base, loops, unroll, "SVE FMLA z.s tput", { 2, 4, 6, 8 },
+    sve_chain_sweep(mode, base, loops, unroll, "SVE FMLA z.s tput", { 2, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) {
             seed_f32(a, nc, 0.0f); set_const_f32(a, zc0, 1.0f); set_const_f32(a, zc1, 0.5f); },
         [](a64::Assembler& a, uint32_t nc, uint32_t u) {
@@ -218,7 +218,7 @@ static void run_arith_tests(SveMode mode, const BenchmarkParams& base,
         snprintf(name, sizeof(name), "SVE SDOT z.s latency  (%ux unroll)", unroll);
         run_one(name, fn, params_for(base, loops, unroll));
     }
-    sve_chain_sweep(mode, base, loops, unroll, "SVE SDOT z.s tput", { 2, 4, 6, 8 },
+    sve_chain_sweep(mode, base, loops, unroll, "SVE SDOT z.s tput", { 2, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) {
             seed_u32(a, nc, 0); a.mov(w9, Imm(0x02020202)); a.dup(zc0.s(), w9);
             a.mov(w9, Imm(0x03030303)); a.dup(zc1.s(), w9); },

@@ -40,7 +40,7 @@ namespace arm64bench::gen {
 const asmjit::a64::Gp& xr(uint32_t i);
 const asmjit::a64::Gp& wr(uint32_t i);
 
-// Vector registers by index: 0–7 → v0–v7, 8–16 → v16–v24. Skips v8–v15,
+// Vector registers by index: 0–7 → v0–v7, 8–23 → v16–v31. Skips v8–v15,
 // which are callee-saved and which build_loop does not preserve. Apply an
 // element view at the use site: vr(i).s4(), vr(i).b16(), vr(i).d2(), ...
 const asmjit::a64::Vec& vr(uint32_t i);
@@ -166,7 +166,9 @@ JitPool::TestFn build_loop(uint64_t loops, uint32_t unroll,
 // the results "<prefix> (<nc> chains, <unroll>x unroll)". The saturation
 // point reveals the number of execution units for that instruction class.
 
-inline constexpr uint32_t kDefaultChains[] = { 2, 3, 4, 6, 8 };
+// 12 and 16 are there for cores with four SIMD pipes and 3–4 clk latency
+// (Oryon: FADD 3, FMUL 4): with 8 chains those are still latency-bound.
+inline constexpr uint32_t kDefaultChains[] = { 2, 3, 4, 6, 8, 12, 16 };
 inline constexpr uint32_t kWideChains[]    = { 2, 3, 4, 6, 8, 10, 12, 16 };
 
 // Unroll rounded down to a multiple of nc × group so every chain gets the

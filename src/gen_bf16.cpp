@@ -45,7 +45,7 @@ static void run_bf16_section(const BenchmarkParams& base,
         snprintf(name, sizeof(name), "BFDOT v4s latency     (%ux unroll)", unroll);
         run_one(name, fn, params_for(base, loops, unroll));
     }
-    chain_sweep(base, loops, unroll, "BFDOT v4s tput", { 2, 3, 4, 6 },
+    chain_sweep(base, loops, unroll, "BFDOT v4s tput", { 2, 3, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) { seed_bf16(a, nc); },
         [](a64::Assembler& a, uint32_t nc, uint32_t u) {
             a.bfdot(vr(u % nc).s4(), vr(nc).h8(), vr(nc + 1).h8()); });
@@ -60,7 +60,7 @@ static void run_bf16_section(const BenchmarkParams& base,
         snprintf(name, sizeof(name), "BFMMLA v4s latency    (%ux unroll)", unroll);
         run_one(name, fn, params_for(base, loops, unroll));
     }
-    chain_sweep(base, loops, unroll, "BFMMLA v4s tput", { 2, 3, 4, 6 },
+    chain_sweep(base, loops, unroll, "BFMMLA v4s tput", { 2, 3, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) { seed_bf16(a, nc); },
         [](a64::Assembler& a, uint32_t nc, uint32_t u) {
             a.bfmmla(vr(u % nc).s4(), vr(nc).h8(), vr(nc + 1).h8()); });
@@ -83,7 +83,7 @@ static void run_bf16_section(const BenchmarkParams& base,
         snprintf(name, sizeof(name), "BFMLALT v4s latency   (%ux unroll)", unroll);
         run_one(name, fn, params_for(base, loops, unroll));
     }
-    chain_sweep(base, loops, unroll, "BFMLALB v4s tput", { 2, 3, 4, 6 },
+    chain_sweep(base, loops, unroll, "BFMLALB v4s tput", { 2, 3, 4, 6, 8, 12, 16 },
         [](a64::Assembler& a, uint32_t nc) { seed_bf16(a, nc); },
         [](a64::Assembler& a, uint32_t nc, uint32_t u) {
             a.bfmlalb(vr(u % nc).s4(), vr(nc).h8(), vr(nc + 1).h8()); });

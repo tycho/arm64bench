@@ -259,7 +259,7 @@ static void run_sha3_section(const BenchmarkParams& base,
             run_one(name, fn, params_for(base, loops, unroll));
         }
         snprintf(name, sizeof(name), "%s tput", op.label);
-        chain_sweep(base, loops, unroll, name, { 2, 3, 4, 6 },
+        chain_sweep(base, loops, unroll, name, { 2, 3, 4, 6, 8, 12, 16 },
             [seed](a64::Assembler& a, uint32_t nc) { seed(a, nc); },
             [emit](a64::Assembler& a, uint32_t nc, uint32_t u) { emit(a, u % nc, nc, nc + 1); });
     }
