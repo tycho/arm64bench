@@ -107,6 +107,7 @@ function(arm64bench_configure_target tgt)
             NOMINMAX
             WIN32_LEAN_AND_MEAN
             UNICODE
+            _CRT_SECURE_NO_WARNINGS
         )
         # Link against the performance counter API (included in kernel32, but be explicit)
         target_link_libraries(${tgt} PRIVATE kernel32)

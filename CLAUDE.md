@@ -124,9 +124,9 @@ flag between each commit. `ctest` (selftest + smoke) must stay green.
 
 | Runner | Hardware | Toolchain |
 |---|---|---|
-| `macos-15` | Apple Silicon VM | Xcode clang, preset `macos-release` |
-| `ubuntu-24.04-arm` | Azure Cobalt 100 (Neoverse N2) | apt clang, preset `linux-clang-release` |
-| `windows-11-arm` | Azure Cobalt 100 (Neoverse N2) | clang-cl via vcvars, preset `win-clangcl-release` |
+| `macos-15` | Apple Silicon VM (no SME exposed, so `--sve` skips) | Xcode clang, preset `macos-release` |
+| `ubuntu-24.04-arm` | Azure Cobalt 100 (Neoverse N2, native SVE2 at VL 128) | apt clang, preset `linux-clang-release` |
+| `windows-11-arm` | Azure Cobalt 100 (Neoverse N2), PMCCNTR_EL0 readable | clang-cl via vcvars, preset `win-clangcl-release` |
 
 Each job builds, runs `arm64bench_selftest`, then `arm64bench --all --smoke`. A separate
 `workflow_dispatch`-only job runs the full measured suite and uploads the CSV.
@@ -135,13 +135,16 @@ Each job builds, runs `arm64bench_selftest`, then `arm64bench --all --smoke`. A 
 instruction sequence executes on the host core (feature-detection branches included — Neoverse N2
 has I8MM, BF16, LRCPC2, DotProd, so paths Apple Silicon never takes get exercised there).
 
-**What CI cannot verify:** numbers. All three runners are VMs with the PMU hidden (kpc fails even
-under `sudo`, PMCCNTR_EL0 traps), so everything falls to Tier 2 ratio normalization on a shared
-host. Never gate on a measured value. The selftest's PMU section reports SKIP there, and CI runs
-the selftest with `ARM64BENCH_SELFTEST_LENIENT=1`, which turns measurement-quality checks (ADD ≈
-1 clk, sleep upper bounds, calibration range, ...) into WARN lines while correctness checks still
-fail the job. The macOS runner has measured five 10 ms sleeps at 46–50 ms; under that load the
-5 ms reference probes are preempted more than the 2 ms test and a chained ADD reads 0.67 clk~.
+**What CI cannot verify:** numbers. The macOS and Linux runners are VMs with the PMU hidden (kpc
+fails even under `sudo`; `perf_event_open` is refused), so they fall to Tier 2 ratio
+normalization on a shared host. The Windows runner does expose PMCCNTR_EL0 (the selftest's
+PMU-implied clock matched calibration at 3.39 GHz), so that leg is Tier 1, but it is still a
+shared VM. Never gate on a measured value. The selftest's PMU section reports SKIP where the
+counter is hidden, and CI runs the selftest with `ARM64BENCH_SELFTEST_LENIENT=1`, which turns
+measurement-quality checks (ADD ≈ 1 clk, sleep upper bounds, calibration range, ...) into WARN
+lines while correctness checks still fail the job. The macOS runner has measured five 10 ms
+sleeps at 46–50 ms; under that load the 5 ms reference probes are preempted more than the 2 ms
+test and a chained ADD reads 0.67 clk~.
 
 **Running the jobs locally** (`act` is installed via Homebrew, Docker Desktop provides arm64
 containers):
