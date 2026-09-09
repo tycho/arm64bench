@@ -32,7 +32,7 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 ```bash
 ./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp | --frontend | --icache | --prefetch | --c2c]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
-             [--smoke] [--filter <substr>]
+             [--smoke] [--filter <substr>] [--cpu auto|any|<n>]
 ```
 
 Default (no flags): runs integer and memory tests.
@@ -44,6 +44,11 @@ Default (no flags): runs integer and memory tests.
   line of output.
 - `--filter <substr>`: only run tests whose name contains the substring (use it to re-run a single
   test that crashed under `--smoke`).
+- `--cpu auto|any|<n>` (Linux/Windows): which cores the main thread may use. `auto` (default)
+  surveys every CPU with a pinned dependent-ADD chain, groups CPUs by L2 cluster, prints the table
+  and pins to the cluster with the fastest measured clock; `<n>` pins to the cluster holding cpu
+  n; `any` floats. See "Heterogeneous cores" below for why the default is measured rather than
+  "cpu 0".
 
 ```bash
 ./arm64bench_selftest [--verbose]   # timer / PMU / calibration / harness sanity checks; sudo for PMU
@@ -77,7 +82,8 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_icache.h/.cpp` | I-cache size sweep (straight-line NOP bodies), BTB chain (dense), iTLB chain (one branch per 16 KB page) |
 | `src/gen_prefetch.h/.cpp` | Hardware prefetcher stride streams (asc/desc, constant footprint) and PRFM lookahead on a random chase |
 | `src/gen_c2c.h/.cpp` | Core-to-core: 1-line and 2-line cache-line round trips, contended LDADDAL, against a partner thread running a JIT'd responder |
-| `src/affinity.h/.cpp` | Thread placement: pin to a CPU (Linux/Windows), QoS cluster hint (macOS) |
+| `src/affinity.h/.cpp` | Thread placement: pin to a CPU or set (Linux/Windows), QoS cluster hint (macOS); CPU topology query (L2 clusters, efficiency class, max clock, MIDR) |
+| `src/cpu_select.h/.cpp` | `--cpu`: per-CPU clock survey (pinned ADD chain), cluster choice, main-thread pinning and the topology table in the run header |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
 | `.github/workflows/ci.yml` | GitHub Actions: build + selftest + smoke on macOS/Linux/Windows arm64 runners |
 
@@ -297,6 +303,27 @@ a quiet machine the two estimators agree to three digits.
 `min_ns_per_insn * 1e-9 * g_cpu_freq_hz`. Used when neither Tier 1 nor Tier 2 is available.
 Reasonable for stable systems; unreliable under thermal pressure or for instruction-induced
 throttling scenarios.
+
+### Heterogeneous cores: pin before measuring (Linux/Windows)
+
+The first Snapdragon result sets mixed core types test by test. `PriorityGuard` only pins to
+whatever CPU the thread is on when a test starts, so the X2 Elite run alternated between 5 GHz
+Prime and 3.6 GHz Performance cores (0.200 vs 0.277 ns per clk in the ns column; the Performance
+core has 4 ALUs and 1 multiplier, the Prime 6 and 2) and the 8cx Gen 3 between Cortex-X1C and
+A78C. CPU numbering does not help: the X2 Elite enumerates its six Performance cores as cpus 0–5
+and the twelve Prime cores as 6–17, so "pin to cpu 0" picks the small cluster. `cpu_select.cpp`
+therefore measures: every allowed CPU runs a pinned dependent-ADD chain for a few ms (ADD is one
+cycle on every core, so instructions per ns is the clock), CPUs are grouped by L2 cluster (from
+`GetLogicalProcessorInformationEx` / sysfs), and the main thread is pinned to the cluster with the
+highest median clock; it may float within that cluster. The core-to-core matrix is measured from
+the first CPU of that set. When reading an old result file, the ns/clk ratio per row tells you
+which core type ran it.
+
+**Windows 4 KB pages.** macOS uses 16 KB pages, Windows and most Linux distributions 4 KB. On the
+X2 Elite an L2 TLB miss costs 70–90 ns (a DRAM access): the 4 KB-stride TLB chase goes from 30 clk
+at 2048 pages to 96 at 4096 and 260 at 8192. Any test spanning more than ~8 MB is partly TLB-bound
+there, which is why the 16 MB MLP single chain read 57 ns while the 16 MB load-latency sweep read
+9 ns. DRAM-range numbers are not like-for-like across page sizes.
 
 ### Thread migration on macOS
 
@@ -533,7 +560,7 @@ pattern in every region. Sweeps that only try powers of two would call this pref
 | **LDNP bandwidth** | `gen_memory.cpp` | Identical to LDP (Apple Silicon ignores non-temporal hint) |
 | **LSE atomics** | `gen_lse.cpp` | LDADDAL=7 clk, SWPAL=2.5 clk, LDAXR+STLXR=16 clk (earlier "11 clk" was LDAXR alone: asmjit had silently dropped the STLXR) |
 | **Scalar FP** | `gen_fp_simd.cpp §1–2` | FMUL f32/f64=3 clk, FDIV f32=7 clk, FSQRT f32=9 clk |
-| **NEON FP** | `gen_fp_simd.cpp §3–4` | FMLA v4f32=3 clk; throughput saturates at 4 chains (~4 FP units) |
+| **NEON FP** | `gen_fp_simd.cpp §3–4` | FMLA v4f32=3 clk; 4 pipes, but only visible with 16 chains (0.26 clk/insn; 6 chains still read 0.57, latency-bound). Sweeps go to 16 chains since 2026-09-09 |
 | **Cross-domain** | `gen_fp_simd.cpp §7` | FMOV GPR↔FP=5 clk, SCVTF/FCVTZS=6 clk |
 | **Crypto (AES/SHA/CRC)** | `gen_fp_simd.cpp §8` | AESE+AESMC fused=2.1 clk/pair, PMULL=3 clk, SHA256H=4 clk, CRC32=3 clk |
 | **SDOT/UDOT/SMLAL/FP16** | `gen_fp_simd.cpp §9` | SDOT/UDOT=3 clk, FMLA v8f16=3 clk (uniform FMA latency all precisions) |
@@ -563,7 +590,45 @@ pattern in every region. Sweeps that only try powers of two would call this pref
 | **OOO window, ROB itself** | ROB via a non-NOP filler | Every non-NOP filler tried allocates a smaller structure first (int/FP/flag PRF, LQ/SQ, BOB); the ROB knee needs a filler with no other footprint that Apple does not drop |
 | **FEAT_LRCPC3** | LDIAPP / STILP pair instructions | Not present on any current Apple Silicon (M1–M5); available check via `hw.optional.arm.FEAT_LRCPC3` |
 | **SVE2, more** | Gather/scatter, MOVPRFX fusion, BFMMLA z, predicate-heavy loops | Native on CI (N2, 128-bit); streaming on M4/M5. Wide native SVE may need PMU (Tier 1) to be trustworthy — instruction-induced throttling risk |
-| **SDOT/SMMLA cross-platform** | Compare MAC throughput on Snapdragon X | Does Oryon have dedicated SMMLA hardware, or also micro-op fusion like M5? |
+
+## Cross-platform results (Snapdragon, 2026-09-09)
+
+Full result files live in `~/Nextcloud/arm64bench/` (human-readable console output, one per
+machine). Both Snapdragon runs predate `--cpu` pinning and mix core types row by row; the Prime /
+X1C rows are identified by ns per clk (0.200 / 0.334). Headline findings, Prime or X1C core:
+
+| | 8cx Gen 3 (Cortex-X1C, 3.0 GHz) | X2 Elite (Oryon v3 Prime, 5.0 GHz) | M5 |
+|---|---|---|---|
+| Integer ALUs | 4 | 6 (Performance core: 4) | ~7 |
+| MUL lat / units; MADD acc chain | 2 / 2; 1 clk | 3 / 2 (Perf: 1); **3 clk** | 3 / ~3; 1 clk |
+| UDIV | 6 clk, not pipelined | 7 clk, 2 clk tput | 7 clk, 2 clk tput |
+| FADD / FMUL / FMLA latency | 2 / 3 / 2 | 3 / 4 / 3 | 2 / 3 / 3 |
+| SDOT latency, rate | 2, 2/clk | 2, 4/clk | 3, 2/clk |
+| **SMMLA MACs/clk vs SDOT** | skipped (no I8MM) | **2×** (2 clk latency, same issue rate: real matrix hardware) | 1× (two SDOT µops) |
+| BFMMLA | skipped | 8 clk, ~0.75/clk | 4.9 clk, 0.5/clk |
+| L1D latency / size | 4 clk / 64 KB | 3 clk; the 64 B chase stays 3 clk to 512 KB (see below) | 3 clk / 128 KB |
+| DRAM latency (128 MB) | 203 ns | 126 ns | 77 ns |
+| Single-core DRAM read BW | 21 GB/s | 78 GB/s | 81 GB/s |
+| L1 load BW | 16 B/clk (one LDP/clk) | 64 B/clk | 48 B/clk |
+| LDADD relaxed, L1-hot | 13 clk | **18.3 clk, every LSE op and CAS alike; LDAXR+STLXR 16** | 7 clk |
+| ROB / int PRF / FP PRF | ~430 NOPs / 130–160 / 200–220 | 640–700 / 290–380 / 260–380 | >2048 / 386–418 / 834–898 |
+| LQ / SQ / flag / BOB | 120–150 / 56–64 / ~60 / ~224 | 128–136 / 112–120 / 112–120 / 128–136 (suspiciously one band) | 482–515 / 138–146 / 170–179 / 194–203 |
+| RSB | ~16 | ~50 | 64 |
+| Taken branches/clk | 1 | 1 | 2 |
+| BLR, one site cycling N targets | predicted to 256 targets, 6 clk | predicted to 24 targets, 7 clk; 23 clk beyond | mispredicts from 2 targets (18–24 clk): no target history |
+| Indirect fast table (N sites → N targets) | 48 | 32 | ~140 |
+| DMB ISH / DSB ISH / ISB | 7 / 7 / 25 | 2 / 2 / 21 | 1.6 / 18 / 34 |
+| Store→load forwarding | 4.1–4.4 clk; narrow→wide 10.4 | 6.0 clk for every case | 4.1 matched x64; 0.8–1.2 for narrower loads; narrow→wide 2.6 |
+| Non-temporal hints | ignored | honored: STNP to 64 MB at the L1 rate (2.1 vs 4.9 clk), LDNP does not allocate in L2 | STNP partly (3.4 vs 4.7), LDNP ignored |
+| Stride prefetcher | every stride to 32 KB, across pages | ≤ 512 B only | ≤ 256 B plus power-of-two to 32 KB |
+| Core-to-core round trip | 155–165 ns, all pairs (one DSU) | 60 ns in-cluster, 420 ns cross-cluster (measured from a Performance core) | 107 P↔P, 380 P↔E |
+
+Open questions from those runs: the X2 Elite 64 B-stride random chase reads 3 clk through 512 KB
+while its 4 KB-stride TLB chase already pays 18 clk at 32 pages, so something replays the dense
+ring (a pointer-following prefetcher would; the masked-link sweep in `gen_memory` exists to test
+this); its 3.6 GHz Performance core reads dependent ADD-immediate chains at 0.73–0.87 clk while
+register chains read 1.0 (immediate merging, or a PMU quirk); the 8cx's 16 B/clk L1 load
+bandwidth may be LDP X-pair single-issue on X1C or a set conflict in the 32-stream pattern.
 
 ## Feature Detection Reference
 
