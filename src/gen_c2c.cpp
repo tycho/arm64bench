@@ -219,7 +219,6 @@ static void run_probe(const BenchmarkParams& base, Probe p, Placement where,
 }
 
 void run_c2c_tests(const BenchmarkParams& base_params) {
-    static constexpr uint32_t kMaxCpus = 64;
     uint32_t cpus[kMaxCpus];
     uint32_t n = allowed_cpus(cpus, kMaxCpus);
     if (n > kMaxCpus) n = kMaxCpus;
@@ -241,17 +240,26 @@ void run_c2c_tests(const BenchmarkParams& base_params) {
     };
     char label[48], title[96];
 
-    if (affinity_supported() && pin_thread_to_cpu(cpus[0])) {
+    // Home = the first CPU of the set main() pinned this thread to (the chosen
+    // cluster), so the matrix is measured from the core type every other test
+    // ran on. The partner sweeps every other CPU the process may use.
+    uint32_t mine[kMaxCpus];
+    uint32_t nm = thread_cpus(mine, kMaxCpus);
+    if (nm > kMaxCpus) nm = kMaxCpus;
+    const uint32_t home = nm ? mine[0] : cpus[0];
+
+    if (affinity_supported() && pin_thread_to_cpu(home)) {
         for (const Probe p : kProbes) {
             snprintf(title, sizeof(title), "Core-to-core: %s, this thread on cpu %u",
-                     probe_name(p), cpus[0]);
+                     probe_name(p), home);
             section(title);
-            for (uint32_t i = 1; i < n; ++i) {
+            for (uint32_t i = 0; i < n; ++i) {
+                if (cpus[i] == home) continue;
                 snprintf(label, sizeof(label), "partner cpu %2u", cpus[i]);
                 run_probe(base_params, p, Placement{ static_cast<int>(cpus[i]), false }, label);
             }
         }
-        unpin_thread();
+        if (nm) pin_thread_to_cpus(mine, nm); else unpin_thread();
     } else {
         section("Core-to-core: no thread affinity on this OS; partner placed by QoS class");
         printf("  'P' = partner at user-interactive QoS (performance cluster),\n"

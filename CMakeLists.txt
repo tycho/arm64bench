@@ -61,6 +61,7 @@ add_library(arm64bench_core STATIC
     src/gen_prefetch.cpp
     src/gen_c2c.cpp
     src/affinity.cpp
+    src/cpu_select.cpp
 )
 target_include_directories(arm64bench_core PUBLIC src)
 target_link_libraries(arm64bench_core PUBLIC asmjit::asmjit)

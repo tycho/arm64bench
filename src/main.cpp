@@ -27,6 +27,7 @@
 #include "gen_prefetch.h"
 #include "gen_c2c.h"
 #include "gen_lse.h"
+#include "cpu_select.h"
 
 static void print_usage(const char* prog) {
     printf("Usage: %s [options]\n\n", prog);
@@ -34,6 +35,9 @@ static void print_usage(const char* prog) {
     printf("  --MHz <n>       Override CPU frequency estimate (MHz)\n");
     printf("  --samples <n>   Samples per benchmark (default 7)\n");
     printf("  --warmup  <n>   Warm-up calls before timing (default 2)\n");
+    printf("  --cpu <sel>     Pin the main thread: auto (default: the L2 cluster with the\n");
+    printf("                  fastest measured clock), <n> (the cluster holding cpu n),\n");
+    printf("                  any (do not pin). Linux/Windows only.\n");
     printf("  --csv           Machine-readable CSV output\n");
     printf("  --smoke         Execute every test once with tiny loop counts;\n");
     printf("                  report ok/crash, record no measurements (CI)\n");
@@ -74,6 +78,7 @@ int main(int argc, char** argv) {
     bool smoke_mode   = false;
     const char* name_filter = nullptr;
     uint64_t override_mhz = 0;
+    int cpu_mode = arm64bench::kCpuAuto;
 
     arm64bench::BenchmarkParams default_params{};
     default_params.instructions_per_loop = 32;
@@ -113,6 +118,11 @@ int main(int argc, char** argv) {
             default_params.num_samples = static_cast<uint32_t>(atoi(argv[++i]));
         } else if (strcmp(arg, "--warmup") == 0 && i + 1 < argc) {
             default_params.num_warmup = static_cast<uint32_t>(atoi(argv[++i]));
+        } else if (strcmp(arg, "--cpu") == 0 && i + 1 < argc) {
+            if (!arm64bench::parse_cpu_arg(argv[++i], &cpu_mode)) {
+                fprintf(stderr, "--cpu: expected auto, any, or a CPU number, got '%s'\n", argv[i]);
+                return 2;
+            }
         } else {
             fprintf(stderr, "Unknown option: %s\n", arg);
             print_usage(argv[0]);
@@ -148,6 +158,13 @@ int main(int argc, char** argv) {
     if (csv_mode) {
         arm64bench::set_output_mode(arm64bench::OutputMode::CSV);
         arm64bench::print_csv_header();
+    }
+
+    // Pin the main thread to one core cluster before anything is measured:
+    // calibration, the PMU probe and every test then see the same core type.
+    {
+        arm64bench::CpuChoice choice;
+        arm64bench::select_cpus(cpu_mode, !smoke_mode, choice);
     }
 
     // CPU frequency: prefer explicit override, otherwise calibrate.
