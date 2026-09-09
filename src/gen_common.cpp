@@ -177,4 +177,15 @@ void* build_pointer_ring(void* buf, size_t size, size_t stride, size_t offset) {
     return head;
 }
 
+void mask_pointer_ring(void* head, uint64_t mask) {
+    uint8_t* cur = static_cast<uint8_t*>(head);
+    do {
+        uintptr_t next;
+        memcpy(&next, cur, sizeof(next));
+        const uintptr_t masked = next ^ static_cast<uintptr_t>(mask);
+        memcpy(cur, &masked, sizeof(masked));
+        cur = reinterpret_cast<uint8_t*>(next);
+    } while (cur != head);
+}
+
 } // namespace arm64bench::gen

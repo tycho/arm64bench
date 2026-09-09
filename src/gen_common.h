@@ -232,4 +232,14 @@ uint64_t xorshift64(uint64_t& state);
 // two nodes or the index array cannot be allocated.
 void* build_pointer_ring(void* buf, size_t size, size_t stride, size_t offset = 0);
 
+// XOR mask for "masked" rings: applied to every stored link so no line in
+// the ring holds anything that looks like a pointer, which defeats a
+// data-dependent (pointer-following) prefetcher. The chase then needs
+// `eor x0, x0, xM` (xM = kPtrMask) after every load, one extra cycle on
+// the chain. The result is never a canonical address.
+constexpr uint64_t kPtrMask = 0xA5A5A5A5A5A5A5A5ULL;
+
+// Walk a ring from `head` once and XOR every stored link with `mask`.
+void mask_pointer_ring(void* head, uint64_t mask = kPtrMask);
+
 } // namespace arm64bench::gen

@@ -25,7 +25,7 @@
 // 256-byte stride. 64 MB exceeds every cache on the target cores and, at
 // 16 KB pages, exceeds the L2 TLB, so each load is a DRAM miss plus a page
 // walk — the longest shadow available. The rings used for the sweeps store
-// XOR-masked links (see obfuscate_ring) so a data-dependent prefetcher cannot
+// XOR-masked links (mask_pointer_ring) so a data-dependent prefetcher cannot
 // shorten the misses; a plain ring is kept only for the DMP check.
 
 #include "gen_ooo.h"
@@ -42,7 +42,6 @@ using namespace asmjit::a64;
 
 static constexpr size_t   kRingBytes   = 64ULL << 20;      // per chain
 static constexpr size_t   kBufBytes    = 3 * kRingBytes;   // one plain ring + two masked rings
-static constexpr uint64_t kPtrMask     = 0xA5A5A5A5A5A5A5A5ULL;  // XOR mask: result is never a canonical address
 static constexpr size_t   kRingStride  = 256;
 static constexpr uint32_t kScratch     = 64;               // L1-hot slot for LDR/STR fillers
 static constexpr uint64_t kRingNodes   = kRingBytes / kRingStride;
@@ -100,20 +99,6 @@ static const FillerKind kKinds[] = {
 };
 
 // ── JIT builders ──────────────────────────────────────────────────────────────
-
-// Walk the ring once and XOR every stored link with kPtrMask, so no line
-// in the ring holds anything that looks like a pointer. The chase then
-// needs `eor x, x, x20` (x20 = kPtrMask) after every load.
-static void obfuscate_ring(void* head) {
-    uint8_t* cur = static_cast<uint8_t*>(head);
-    do {
-        uintptr_t next;
-        memcpy(&next, cur, sizeof(next));
-        const uintptr_t masked = next ^ kPtrMask;
-        memcpy(cur, &masked, sizeof(masked));
-        cur = reinterpret_cast<uint8_t*>(next);
-    } while (cur != head);
-}
 
 static void emit_filler(a64::Assembler& a, Filler f, uint32_t k) {
     switch (f) {
@@ -245,8 +230,8 @@ void run_ooo_tests(const BenchmarkParams& base_params) {
         free_pages(buf, kBufBytes);
         return;
     }
-    obfuscate_ring(head_a);
-    obfuscate_ring(head_b);
+    mask_pointer_ring(head_a);
+    mask_pointer_ring(head_b);
     const uintptr_t hp = reinterpret_cast<uintptr_t>(head_plain);
     const uintptr_t ha = reinterpret_cast<uintptr_t>(head_a);
     const uintptr_t hb = reinterpret_cast<uintptr_t>(head_b);

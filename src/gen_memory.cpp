@@ -131,17 +131,20 @@ static constexpr size_t kMaxBufSize  = 128ULL << 20;  // 128 MB
 // Instructions per harness "iteration": 1 (the LDR).
 // min_ns_per_insn from the harness = ns/load = cache access latency.
 
-static JitPool::TestFn build_latency_chase(uintptr_t chain_head, uint64_t loops) {
+static JitPool::TestFn build_latency_chase(uintptr_t chain_head, uint64_t loops,
+                                           bool masked = false) {
     return build_loop(loops, 1,
-        [chain_head](a64::Assembler& a) {
+        [chain_head, masked](a64::Assembler& a) {
             // Bake chain_head as a 64-bit immediate. AsmJit emits MOVZ + MOVK
             // as needed (1–4 instructions depending on the value).
             a.mov(x0, Imm(static_cast<uint64_t>(chain_head)));
+            if (masked) a.mov(x20, Imm(kPtrMask));
         },
-        [](a64::Assembler& a, uint32_t) {
+        [masked](a64::Assembler& a, uint32_t) {
             // The measurement: load the next pointer from the current address.
             // x0 depends on the previous x0, strictly serializing execution.
             a.ldr(x0, ptr(x0));
+            if (masked) a.eor(x0, x0, x20);   // unmask: +1 clk on the chain
         });
 }
 
@@ -307,6 +310,10 @@ static uint64_t lat_loops_for_size(size_t buf_size) {
     return scale_loops(loops);
 }
 
+// Plain-chase results, kept for the masked-link comparison below.
+static double s_plain_clk[kNumBufSizes];
+static double s_plain_ns[kNumBufSizes];
+
 static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
     char title[96];
     snprintf(title, sizeof(title),
@@ -348,6 +355,8 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
 
         // Not run_one(): the boundary annotation below needs the result.
         const BenchmarkResult r = run_one(name, fn, p);
+        s_plain_clk[si] = r.min_clocks_per_insn;
+        s_plain_ns[si]  = r.min_ns_per_insn;
 
         // ── Boundary annotation ───────────────────────────────────────────
         // Compare this result against the previous buffer size. Only annotate
@@ -374,6 +383,76 @@ static void run_latency_sweep(void* buf, const BenchmarkParams& base) {
         prev_min_ns   = r.min_ns_per_insn;
         prev_buf_size = buf_size;
     }
+}
+
+// ── Masked-link latency sweep (pointer-prefetch check) ────────────────────────
+//
+// The same random chase with every stored link XOR-masked (mask_pointer_ring)
+// and an EOR after each load to recover the address. A core that follows
+// plain pointers ahead of the program — Apple's data-dependent prefetcher,
+// or the pointer-chase prefetcher suspected on Oryon v3, whose 64 B chase
+// read 3 clk through 512 KB — cannot follow masked ones, so where the plain
+// sweep was being helped the masked one is much slower than plain plus the
+// mask cost. That cost is not just the EOR: on M5 a load whose address comes
+// from an ALU op rather than from the previous load reads 5.5 clk against
+// 3.0, so the cost is measured at the smallest (L1-resident) size, where
+// nothing can be prefetched, and subtracted from every later size. Sizes
+// stop at 16 MB: gen_ooo already does the DRAM-range comparison, and the
+// interesting range is the L2.
+static constexpr size_t kMaskedMaxBufSize = 16ULL << 20;
+
+static void run_masked_latency_sweep(void* buf, const BenchmarkParams& base) {
+    section("Load latency, masked links (pointer-prefetch check)");
+    printf("  plain chase from the sweep above; masked = same ring with XOR-masked links\n"
+           "  plus one EOR per load. The mask's cost is taken from the L1-resident size;\n"
+           "  plain well under masked − cost means a prefetcher followed the plain links.\n");
+
+    uint32_t assisted = 0;
+    double   mask_cost = -1.0;   // measured at the first size; clk or ns as available
+    bool     cost_in_clk = false;
+    for (size_t si = 0; si < kNumBufSizes && kBufSizes[si] <= kMaskedMaxBufSize; ++si) {
+        const size_t   buf_size = kBufSizes[si];
+        const uint64_t loops    = lat_loops_for_size(buf_size);
+
+        void* head = build_pointer_ring(buf, buf_size, kNodeStride);
+        if (!head) {
+            fprintf(stderr, "  [skipped: build_pointer_ring failed]\n");
+            continue;
+        }
+        mask_pointer_ring(head);
+
+        JitPool::TestFn fn = build_latency_chase(
+            reinterpret_cast<uintptr_t>(head), loops, /*masked=*/true);
+
+        char size_str[16];
+        format_buf_size(size_str, sizeof(size_str), buf_size);
+        char name[64];
+        snprintf(name, sizeof(name), "load latency masked %s", size_str);
+
+        const BenchmarkResult r = run_one(name, fn, params_for(base, loops, 1));
+        if (r.min_ns_per_insn <= 0.0 || s_plain_ns[si] <= 0.0) continue;
+
+        // Compare in clocks when both have them, else in ns.
+        const bool have_clk = r.min_clocks_per_insn > 0.0 && s_plain_clk[si] > 0.0;
+        const double plain  = have_clk ? s_plain_clk[si] : s_plain_ns[si];
+        const double masked = have_clk ? r.min_clocks_per_insn : r.min_ns_per_insn;
+        if (mask_cost < 0.0) {
+            mask_cost   = masked - plain;
+            cost_in_clk = have_clk;
+            printf("  mask cost at %s: +%.2f %s per load (EOR, and the load address now comes"
+                   " from an ALU op)\n", size_str, mask_cost, have_clk ? "clk" : "ns");
+            continue;
+        }
+        if (have_clk != cost_in_clk) continue;
+        const double masked_minus_cost = masked - mask_cost;
+        if (masked_minus_cost > 0.0 && plain < 0.7 * masked_minus_cost) {
+            printf("  ↑ plain chase %.1f× faster than masked − cost at %s: prefetcher follows plain links\n",
+                   masked_minus_cost / plain, size_str);
+            ++assisted;
+        }
+    }
+    if (!assisted)
+        printf("  no size where the plain chase beat masked − cost: no pointer-following prefetch seen\n");
 }
 
 // ── TLB hierarchy sweep ───────────────────────────────────────────────────────
@@ -671,6 +750,7 @@ void run_memory_tests(const BenchmarkParams& base_params) {
     commit_pages(buf, kMaxBufSize);
 
     run_latency_sweep(buf, base_params);
+    run_masked_latency_sweep(buf, base_params);
     run_tlb_sweep(buf, base_params);
     run_bw_sweep(buf, base_params, /*is_store=*/false);
     run_bw_sweep(buf, base_params, /*is_store=*/true);
