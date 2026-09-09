@@ -297,6 +297,13 @@ int main(int argc, char** argv) {
         } else {
             printf("OK: %u tests executed, no encoding errors\n", n);
         }
+    } else if (arm64bench::jit_error_count() > 0) {
+        // A measured test whose body lost an instruction reports a number for
+        // code that was not what the generator meant.
+        fprintf(stderr, "WARNING: AsmJit rejected %u instruction(s) during this run; the\n"
+                        "         affected results measure a different loop than intended.\n",
+                arm64bench::jit_error_count());
+        exit_code = 1;
     }
 
     // g_jit_pool goes out of scope here, releasing all compiled functions.
