@@ -359,16 +359,18 @@ is instruction fetch/decode, upstream of fusion; fused pairs are one micro-op do
 still two instructions to the front end. A core that fuses in decode and renames narrower than
 it decodes would show 0.9 there.
 
-### Pointer-chase stride and L1 set conflicts
+### Pointer-chase stride and set conflicts
 
-Every pointer-chase test uses a 256-byte node stride. A 128 KB 8-way L1D has 256 sets of 64 B;
-a 256 B stride touches only every fourth set, so the chase sees an L1 of 32 KB (8 ways × 64
-sets), and the line footprint is buffer/4. That is why the latency sweep in `gen_memory.cpp`
-shows the L1 "boundary" at a 256 KB buffer on a 128 KB cache. It is consistent and the L2/DRAM
-levels are unaffected, but treat buffer sizes below ~1 MB as "quarter-L1" numbers, and if a
-test needs the real L1 capacity use a 64 B or 128 B stride (with a random permutation the
-next-line prefetcher cannot follow it anyway). `gen_mlp.cpp` picks its footprints with this in
-mind (64 KB = L1-resident control, 2 MB = L2).
+`gen_memory.cpp`'s latency sweep chases one node per cache line (64 B stride), so a buffer of B
+bytes occupies B bytes of every level and the boundaries land at the real capacities (M5: 3 clk
+through 128 KB, 12.9 clk at 256 KB). The other chase tests (`gen_ooo`, `gen_mlp`, `gen_prefetch`)
+use a 256 B node stride. That touches only every fourth set, so a buffer of B bytes holds B/4
+bytes of data in the cache; the level a buffer lands in is still decided by lines per set, so
+the boundary in *buffer* bytes is unchanged (a 128 KB buffer fits an 8-way 128 KB L1 at either
+stride), but anything that reasons in bytes of data (footprint, bandwidth, "how much of L2 is
+this") must divide by four. `gen_mlp.cpp` picks its footprints with that in mind (64 KB =
+L1-resident control, 2 MB = L2). If a test needs the full data capacity, use a 64 B stride;
+the random permutation defeats the next-line prefetcher either way.
 
 ### Out-of-order window probe: lessons (gen_ooo.cpp)
 
