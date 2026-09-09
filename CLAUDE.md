@@ -378,6 +378,10 @@ mind (64 KB = L1-resident control, 2 MB = L2).
   physical register, so its knee is the int PRF; `LDR XZR` is a load-queue entry with no register.
   NOPs on M5 show no limit to 2048 — they are apparently dropped before allocation.
 - **Two dependent misses per chain** double the shadow (~750 clk) so 2 × 2048 fillers stay inside it.
+- **Flags and branches are structures too.** `CMP x2, x3` allocates a flag physical register and
+  nothing else (knee ≈ 170–179 on M5); a not-taken `B.NE` allocates a branch-order-buffer entry
+  (knee ≈ 194–203). Both are smaller than the integer PRF, so a filler that sets flags or branches
+  measures those, not the PRF or ROB.
 - **Masked pointers** (`link ^ 0xA5A5…`, unmasked with EOR) defeat any data-dependent prefetcher;
   M5 showed no plain-vs-masked difference (DIT made none either), but the sweeps use masked rings.
 
@@ -444,6 +448,17 @@ The contended-LDADDAL line is inherently noisy (CoV 20–40 % on M5): line owner
 bursts, so the main thread's share of the increments varies sample to sample. Read it against the
 no-partner reference line, not to three digits.
 
+### Prefetcher stride sweep: not every stride is a stride (gen_prefetch.cpp)
+
+On M5 the sweep separates two mechanisms. Strides up to 256 B (including 192 B, three lines) are
+followed at 9–18 ns/load. Power-of-two strides from 1 KB to 32 KB are followed too, across page
+boundaries, at 13–27 ns. The non-power-of-two strides between them are not: 384 B, 768 B and
+1536 B run at 46–76 ns, near the 88 ns unassisted chase, in both directions, and 512 B lands in
+the middle at 28 ns. A classic stride detector has no reason to prefer 1024 over 768; a spatial
+prefetcher that learns which lines of a fixed-size region were touched and replays that pattern
+on the next region does, because only a stride that divides the region size produces the same
+pattern in every region. Sweeps that only try powers of two would call this prefetcher perfect.
+
 ### AsmJit API notes
 
 - `Gp` not `GpX` for general-purpose register arguments in helper functions
@@ -496,7 +511,7 @@ no-partner reference line, not to three digits.
 | **Memory barriers** | `gen_pitfalls.cpp §5` | DMB=1.5 clk standalone; in load chain: 0 added (completes within LDR latency) |
 | **LRCPC (LDAPR/LDAPUR)** | `gen_pitfalls.cpp §6` | LDAPR≈LDAR≈LDR=3 clk; store forwarding unchanged (~4.9 clk all variants) |
 | **BFI dest-dep stress** | `gen_pitfalls.cpp §7` | All three Mihocka variants (independent / overlapping rotation / full-width) report ~1 clk on M5 — no dep-breaking shortcut |
-| **OOO window** | `gen_ooo.cpp` | Two-miss probe: int PRF ≈ 386–418, FP PRF ≈ 834–898, load queue ≈ 482–515, store queue ≈ 138–146; NOP fill shows no limit to 2048 (NOPs are not allocated, or ROB > 2050). Sharp 1×→2× steps. ~2.5 min run |
+| **OOO window** | `gen_ooo.cpp` | Two-miss probe: int PRF ≈ 386–418, FP PRF ≈ 834–898, load queue ≈ 482–515, store queue ≈ 138–146, flag (NZCV) PRF ≈ 170–179 (CMP fill), branch order buffer ≈ 194–203 (not-taken B.cond fill); NOP fill shows no limit to 2048 (NOPs are not allocated, or ROB > 2050). Sharp 1×→2× steps. ~3.5 min run |
 | **SHA3 / SHA512** | `gen_crypto.cpp` | EOR3, BCAX, RAX1, XAR all 2 clk, saturate at 6 chains ≈0.33 clk (3 units); SHA512H/H2/SU0/SU1 all 2 clk |
 | **FEAT_BF16** | `gen_bf16.cpp` | BFDOT 3 clk, 1/clk (half the SDOT rate); BFMMLA 4.9 clk, 1 per 2 clk — same 8 MAC/clk either way, no matrix-form advantage (as with SMMLA); BFMLALB/T 4 clk, ~1.5/clk |
 | **JSCVT** | `gen_fp_simd.cpp §7` | SCVTF/FJCVTZS round trip 6.0 clk = same as SCVTF/FCVTZS (5.9); JavaScript ToInt32 semantics are free |
@@ -505,14 +520,14 @@ no-partner reference line, not to three digits.
 | **I-cache / BTB / iTLB** | `gen_icache.cpp` | L1I 192 KB (10 NOP/clk to 192 KB, 3.2/clk from L2, ~2/clk at 16 MB); BTB: zero-bubble taken branches to 48–64 sites, 2–3 clk to ~384, 4.2 clk beyond; L1 iTLB ≥ 192 × 16 KB pages, L2 TLB +9 clk from 256 to ≥ 2048 pages |
 | **FP width conversions** | `gen_fp_simd.cpp §8` | FCVTL/FCVTN (f16↔f32, f32↔f64, low and high halves) and scalar FCVT all 3 clk latency, 4 per clk; FCVTN2's destination merge is free |
 | **Core-to-core** | `gen_c2c.cpp` | Unpinned (QoS-placed) on M5: P↔P round trip ≈ 104 ns (~52 ns one way), P↔E ≈ 320 ns; identical for LDAR/STLR, LDR/STR, 1-line and 2-line; LDADDAL 7 clk alone, ≈ 6.5–9 ns contended (CoV 20–40 %, arbitration is bursty). Pinned core matrices come from Linux/Windows |
-| **Prefetcher** | `gen_prefetch.cpp` | Stride streams followed at every stride 64 B–32 KB, both directions, across 16 KB pages (9–27 ns/load vs 88 ns random; 512 B oddly worst); PRFM honored, scales as latency/D: 45 ns at D=2, 12.8 at D=8, 5.1 at D=32 (= the MLP floor) |
+| **Prefetcher** | `gen_prefetch.cpp` | Power-of-two strides 64 B–32 KB and 192 B followed both directions across 16 KB pages (9–27 ns/load vs 88 ns random); 384 B, 768 B, 1536 B are NOT followed (46–76 ns), 512 B half-followed (28 ns): consistent with a short-stride detector up to ~256 B plus a spatial-pattern prefetcher that only matches when the stride tiles the region; PRFM honored, scales as latency/D: 45 ns at D=2, 12.8 at D=8, 5.1 at D=32 (= the MLP floor) |
 | **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W 1–1.6 clk, STR z 2.8, STNT1W 3.4 clk per 64 B store over a 16 KB window but ≈110 clk when rewriting one line (SIMD stores serialize in streaming mode, STR q too; scalar STR x immune); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
 
 ## Planned Test Coverage
 
 | Category | Tests | Notes |
 |---|---|---|
-| **OOO window, more fillers** | Branch-order buffer, flag PRF, ROB via non-NOP filler | `gen_ooo.cpp` has the machinery; needs a filler with no PRF/queue footprint that Apple does not eliminate |
+| **OOO window, ROB itself** | ROB via a non-NOP filler | Every non-NOP filler tried allocates a smaller structure first (int/FP/flag PRF, LQ/SQ, BOB); the ROB knee needs a filler with no other footprint that Apple does not drop |
 | **FEAT_LRCPC3** | LDIAPP / STILP pair instructions | Not present on any current Apple Silicon (M1–M5); available check via `hw.optional.arm.FEAT_LRCPC3` |
 | **SVE2, more** | Gather/scatter, MOVPRFX fusion, BFMMLA z, predicate-heavy loops | Native on CI (N2, 128-bit); streaming on M4/M5. Wide native SVE may need PMU (Tier 1) to be trustworthy — instruction-induced throttling risk |
 | **SDOT/SMMLA cross-platform** | Compare MAC throughput on Snapdragon X | Does Oryon have dedicated SMMLA hardware, or also micro-op fusion like M5? |
