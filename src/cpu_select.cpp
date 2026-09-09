@@ -51,6 +51,41 @@ void format_ids(char* out, size_t cap, const CpuTopology& t, const bool* in) {
     }
 }
 
+// Core name from MIDR_EL1 (implementer[31:24], part[15:4]).
+const char* core_name(uint64_t midr, char* buf, size_t cap) {
+    const unsigned impl = static_cast<unsigned>((midr >> 24) & 0xFF);
+    const unsigned part = static_cast<unsigned>((midr >> 4) & 0xFFF);
+    const char* name = nullptr;
+    if (impl == 0x41) {
+        switch (part) {
+            case 0xD03: name = "Cortex-A53"; break;  case 0xD05: name = "Cortex-A55"; break;
+            case 0xD07: name = "Cortex-A57"; break;  case 0xD08: name = "Cortex-A72"; break;
+            case 0xD09: name = "Cortex-A73"; break;  case 0xD0A: name = "Cortex-A75"; break;
+            case 0xD0B: name = "Cortex-A76"; break;  case 0xD0C: name = "Neoverse-N1"; break;
+            case 0xD0D: name = "Cortex-A77"; break;  case 0xD40: name = "Neoverse-V1"; break;
+            case 0xD41: name = "Cortex-A78"; break;  case 0xD44: name = "Cortex-X1"; break;
+            case 0xD46: name = "Cortex-A510"; break; case 0xD47: name = "Cortex-A710"; break;
+            case 0xD48: name = "Cortex-X2"; break;   case 0xD49: name = "Neoverse-N2"; break;
+            case 0xD4B: name = "Cortex-A78C"; break; case 0xD4C: name = "Cortex-X1C"; break;
+            case 0xD4D: name = "Cortex-A715"; break; case 0xD4E: name = "Cortex-X3"; break;
+            case 0xD4F: name = "Neoverse-V2"; break; case 0xD80: name = "Cortex-A520"; break;
+            case 0xD81: name = "Cortex-A720"; break; case 0xD82: name = "Cortex-X4"; break;
+            case 0xD84: name = "Neoverse-V3"; break; case 0xD85: name = "Cortex-X925"; break;
+            case 0xD87: name = "Cortex-A725"; break; case 0xD8E: name = "Neoverse-N3"; break;
+            default: break;
+        }
+    } else if (impl == 0x51) {
+        if (part == 0x001)      name = "Qualcomm Oryon";
+        else if (part == 0x804) name = "Kryo 4xx Gold";
+        else if (part == 0x805) name = "Kryo 4xx Silver";
+    } else if (impl == 0xC0 && part == 0xAC3) {
+        name = "Ampere-1";
+    }
+    if (name) snprintf(buf, cap, "%s", name);
+    else      snprintf(buf, cap, "impl 0x%02x part 0x%03x", impl, part);
+    return buf;
+}
+
 } // namespace
 
 bool parse_cpu_arg(const char* s, int* mode) {
@@ -159,13 +194,17 @@ void select_cpus(int mode, bool survey, CpuChoice& out) {
         for (uint32_t i = 0; i < t.count; ++i) in[i] = group[i] == g;
         char ids[128];
         format_ids(ids, sizeof(ids), t, in);
-        printf("  cpus %-12s", ids);
-        if (gclass[g] >= 0) printf("  class %d", gclass[g]); else printf("         ");
-        if (surveyed && score[g] > 0.0) printf("  %.2f GHz measured", score[g]);
         uint32_t khz = 0; uint64_t midr = 0;
         for (uint32_t i = 0; i < t.count; ++i)
             if (group[i] == g) { if (t.cpus[i].max_khz > khz) khz = t.cpus[i].max_khz; if (!midr) midr = t.cpus[i].midr; }
-        if (khz)  printf("  max %.2f GHz", khz / 1e6);
+        char name[40];
+        printf("  cpus %-8s  %-16s", ids, midr ? core_name(midr, name, sizeof(name)) : "");
+        if (gclass[g] >= 0) printf("  class %d", gclass[g]); else printf("         ");
+        if (surveyed && score[g] > 0.0) printf("  measured %.2f GHz", score[g]);
+        // The OS figure is the registry's "~MHz" on Windows (wrong on the 8cx
+        // Gen 3: 1.37 GHz for cores that run at 2.99) or cpufreq's max on
+        // Linux; shown for the record, never used when the survey ran.
+        if (khz)  printf("  (OS says %.2f GHz)", khz / 1e6);
         if (midr) printf("  MIDR 0x%08llx", static_cast<unsigned long long>(midr));
         printf("\n");
     }
