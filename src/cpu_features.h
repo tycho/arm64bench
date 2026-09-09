@@ -8,15 +8,30 @@
 // whose default -march lacks the feature the section silently disappears
 // from the build, and CI cannot tell the difference.
 //
-// Sources, per platform:
-//   macOS    sysctlbyname("hw.optional.arm.FEAT_XXX") — complete and reliable.
-//   Linux    getauxval(AT_HWCAP / AT_HWCAP2) bits.
-//   Windows  IsProcessorFeaturePresent(PF_ARM_*) where a flag exists; the
-//            coverage is patchy, so features with no flag fall back to a
-//            per-feature default (true for anything every Windows-on-Arm
-//            core has shipped with, false otherwise). See cpu_features.cpp.
+// Two sources are combined:
 //
-// Results are cached after the first query.
+//   1. What the OS reports.
+//      macOS    sysctlbyname("hw.optional.arm.FEAT_XXX") — complete and reliable.
+//      Linux    getauxval(AT_HWCAP / AT_HWCAP2) bits.
+//      Windows  the ID_AA64ISAR0/ISAR1/PFR0_EL1 values the kernel mirrors into
+//               the registry (HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0,
+//               values "CP 4030" / "CP 4031" / "CP 4020"), decoded field by
+//               field; IsProcessorFeaturePresent(PF_ARM_*) where that is the
+//               authority (SVE/SVE2, which need OS state save support). A
+//               feature with neither source is Unknown.
+//
+//   2. An instruction probe. For every feature that is a plain instruction
+//      set extension (everything except SVE/SVE2/SME, whose usability is the
+//      OS's call), one representative instruction is JIT'd and executed once
+//      under an illegal-instruction trap (SEH on Windows, a SIGILL handler
+//      with sigsetjmp elsewhere). A feature the OS reports present but whose
+//      instruction faults is treated as absent, with a warning — that is the
+//      case that otherwise kills the process mid-test with SIGILL /
+//      0xC000001D. An Unknown feature is decided by the probe alone.
+//
+// The probe runs for every feature on the first query (one handler install,
+// one pass) and results are cached; call cpu_has() from the main thread
+// before starting any other threads.
 
 #include <cstdint>
 
@@ -46,8 +61,19 @@ enum class CpuFeature : uint8_t {
     Count_
 };
 
-// True iff the running CPU (as reported by the OS) has the feature.
+// True iff the feature can be used by JIT'd code in this process: the OS
+// reports it (or has no opinion) and its probe instruction executes.
 bool cpu_has(CpuFeature f);
+
+// The OS's answer alone, before the instruction probe.
+enum class FeatureReport : uint8_t { Absent, Present, Unknown };
+FeatureReport cpu_os_reports(CpuFeature f);
+
+// Result of executing the feature's probe instruction:
+//   1  executed normally
+//   0  raised an illegal-instruction trap
+//  -1  no probe is defined for this feature (SVE/SVE2/SME)
+int cpu_probe(CpuFeature f);
 
 // Architectural name, e.g. "FEAT_DotProd". For skip messages.
 const char* cpu_feature_name(CpuFeature f);

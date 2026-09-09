@@ -14,7 +14,8 @@
 //                   ADD at ~1 clk with a sane min/median relationship
 //   JIT pool      — compile/release churn does not fail
 //   CPU features  — every feature the generators can gate on is reported,
-//                   so a CI log shows what the runner actually has
+//                   so a CI log shows what the runner actually has, and the
+//                   OS report is cross-checked against the instruction probe
 //
 // Checks that need a resource the host does not grant (a PMU on a VM, say)
 // are reported as SKIP, not FAIL. The process exit code is the number of
@@ -565,6 +566,43 @@ static void test_cpu_features() {
     }
     note("%s", line);
     CHECK(stable, "cpu_has() is stable across repeated queries");
+
+    // OS report versus instruction probe, per feature. "os" is what the OS
+    // says (1/0/? for present/absent/unknown), "probe" is what happened when
+    // one instruction of the feature was executed (ok/ILL/- for executed,
+    // trapped, no probe). The OS claiming a feature whose instruction traps
+    // is the case that kills a benchmark run mid-test, so it is a hard FAIL;
+    // a feature the OS hides is merely noted.
+    n = 0;
+    uint32_t claimed_but_traps = 0, hidden_but_runs = 0, decided_by_probe = 0;
+    for (uint32_t i = 0; i < kCount; ++i) {
+        const CpuFeature f = static_cast<CpuFeature>(i);
+        const FeatureReport os = cpu_os_reports(f);
+        const int p = cpu_probe(f);
+        const char os_c = os == FeatureReport::Present ? '1'
+                        : os == FeatureReport::Absent  ? '0' : '?';
+        const char* p_s = p == 1 ? "ok" : p == 0 ? "ILL" : "-";
+        n += static_cast<size_t>(snprintf(line + n, sizeof(line) - n, "%s%s os=%c probe=%s",
+                                          i ? ", " : "", cpu_feature_name(f), os_c, p_s));
+        if (n >= sizeof(line)) break;
+        if (os == FeatureReport::Present && p == 0) ++claimed_but_traps;
+        if (os == FeatureReport::Absent  && p == 1) ++hidden_but_runs;
+        if (os == FeatureReport::Unknown && p >= 0) ++decided_by_probe;
+        if (os == FeatureReport::Absent && p == 1)
+            note("%s: OS reports absent but the instruction executes (not used)",
+                 cpu_feature_name(f));
+        if (os == FeatureReport::Unknown)
+            note("%s: OS has no report; %s", cpu_feature_name(f),
+                 p >= 0 ? "decided by the probe" : "no probe either, treated as absent");
+    }
+    if (s_verbose) note("%s", line);
+    CHECK(claimed_but_traps == 0,
+          "every feature the OS reports present executes (%u reported but trapped)",
+          claimed_but_traps);
+    CHECK(cpu_probe(CpuFeature::AES) == 1 && cpu_probe(CpuFeature::LSE) == 1,
+          "probe machinery executes instructions every target has (AES, LSE)");
+    (void)hidden_but_runs;
+    (void)decided_by_probe;
 
     // Architectural implications that hold on every real core.
     if (cpu_has(CpuFeature::LRCPC2))

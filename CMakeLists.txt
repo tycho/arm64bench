@@ -109,8 +109,9 @@ function(arm64bench_configure_target tgt)
             UNICODE
             _CRT_SECURE_NO_WARNINGS
         )
-        # Link against the performance counter API (included in kernel32, but be explicit)
-        target_link_libraries(${tgt} PRIVATE kernel32)
+        # kernel32 for the performance counter API; advapi32 for RegGetValueW
+        # (cpu_features.cpp reads the ID_AA64* registers from the registry).
+        target_link_libraries(${tgt} PRIVATE kernel32 advapi32)
 
     else()
         target_compile_definitions(${tgt} PRIVATE BENCH_PLATFORM_LINUX=1)

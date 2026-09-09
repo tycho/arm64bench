@@ -58,7 +58,7 @@ Default (no flags): runs integer and memory tests.
 | `src/harness.h/.cpp` | Benchmark runner and statistical analysis |
 | `src/cycle_counter.h/.cpp` | PMU cycle counter abstraction (macOS kpc, Windows PMCCNTR_EL0) |
 | `src/jit_buffer.h/.cpp` | JIT memory pool with W^X handling |
-| `src/cpu_features.h/.cpp` | Runtime feature detection (`cpu_has(CpuFeature::X)`) for macOS/Linux/Windows |
+| `src/cpu_features.h/.cpp` | Runtime feature detection (`cpu_has(CpuFeature::X)`): OS report (sysctl / hwcap / Windows registry ID registers) confirmed by a one-instruction probe under an illegal-instruction trap |
 | `src/gen_common.h/.cpp` | Shared generator scaffolding: `build_loop`, `chain_sweep`, `run_one`, `params_for`, `section`, page/pointer-ring helpers |
 | `src/calibrate.cpp` | CPU frequency estimation |
 | `src/gen_integer.h/.cpp` | Integer ALU latency/throughput tests |
@@ -98,13 +98,37 @@ Default (no flags): runs integer and memory tests.
 All test code is JIT-emitted via AsmJit. The host compiler only sees C++ method calls like `a.usdot(...)` — it never emits the target instruction itself. Therefore **compile-time feature macros (`__ARM_FEATURE_CRYPTO`, `__ARM_FEATURE_I8MM`, etc.) are never needed** to guard JIT test code. Use only runtime feature detection:
 
 - **macOS**: `sysctlbyname("hw.optional.arm.FEAT_XXX", ...)` — comprehensive, reliable
-- **Windows**: `IsProcessorFeaturePresent(PF_ARM_*)` — limited coverage; see notes per-feature
+- **Windows**: the ID_AA64ISAR0/ISAR1/PFR0_EL1 values the kernel mirrors into the registry
+  (`HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0`, values `CP 4030` / `CP 4031` /
+  `CP 4020`, REG_QWORD), decoded field by field; `IsProcessorFeaturePresent(PF_ARM_*)` only
+  for SVE/SVE2, where OS support for the register state is what matters. The PF_ flags alone
+  have no bit for SHA3/SHA512/FP16/FHM/BF16/LRCPC2, and an earlier "assume present" default
+  for those crashed `--simd` on a Snapdragon 8cx Gen 3 (Cortex-X1C/A78C, no SHA3) with
+  `0xC000001D`.
 - **Linux**: `getauxval(AT_HWCAP)` / `AT_HWCAP2`
+- **Every platform, on top of the OS report**: an instruction probe. Each feature except
+  SVE/SVE2/SME carries one representative encoding (`kFeatures[].probe`, e.g. EOR3 for SHA3)
+  that is JIT'd as `insn; ret` and executed once under an illegal-instruction trap — SEH
+  `__try` on Windows, a SIGILL handler plus `sigsetjmp` elsewhere. A feature the OS reports
+  present whose probe traps is treated as absent with a warning on stderr; a feature the OS
+  has no report for is decided by the probe. All probes run on the first `cpu_has()` call
+  (one handler install, one pass; call it from the main thread before spawning threads).
+  `cpu_os_reports()` / `cpu_probe()` expose the two inputs; the selftest cross-checks them
+  and FAILs on "reported present but trapped", which is the case that would otherwise kill a
+  benchmark run mid-test.
 
 All of this lives behind `cpu_has(CpuFeature::X)` in `cpu_features.h`; add a row to the table
-in `cpu_features.cpp` for a new feature rather than writing another `#ifdef` ladder. The Linux
-CI leg once silently built 425 of 434 tests because three sections were gated on
-`__ARM_FEATURE_*` macros the default `-march` did not define.
+in `cpu_features.cpp` for a new feature (sysctl name, hwcap bit, ID register field, probe
+encoding — get the encoding from `clang -c -x assembler` and `objdump -d`, not by hand) rather
+than writing another `#ifdef` ladder. The Linux CI leg once silently built 425 of 434 tests
+because three sections were gated on `__ARM_FEATURE_*` macros the default `-march` did not
+define.
+
+Trap-and-recover is deliberately limited to the probe. Wrapping a whole JIT'd test in SEH or a
+SIGILL handler would not be sound: the test functions save x19–x22/x30 in a hand-built frame
+with no unwind info, so the Windows unwinder cannot get past them, and on POSIX a `siglongjmp`
+out of one leaves the callee-saved registers as the JIT'd body left them. A SIGILL inside a
+test means the detection table is wrong; fix the table.
 
 ## Commit Discipline
 
@@ -543,14 +567,20 @@ pattern in every region. Sweeps that only try powers of two would call this pref
 
 ## Feature Detection Reference
 
-| Feature | macOS sysctl | Windows |
-|---|---|---|
-| FEAT_I8MM | `hw.optional.arm.FEAT_I8MM` | `PF_ARM_SVE_I8MM_INSTRUCTIONS_AVAILABLE` (proxy; no direct PF_ exists) |
-| FEAT_LRCPC | `hw.optional.arm.FEAT_LRCPC` | assume true (Oryon) |
-| FEAT_LRCPC2 | `hw.optional.arm.FEAT_LRCPC2` | assume true (Oryon) |
-| FEAT_LRCPC3 | `hw.optional.arm.FEAT_LRCPC3` | unknown |
-| FEAT_SHA3 / SHA512 / BF16 / JSCVT | `hw.optional.arm.FEAT_SHA3` etc. | no PF_ flag; assumed present (Oryon, N2 have them) |
-| FEAT_SVE / SVE2 | `hw.optional.arm.FEAT_SVE` (absent on Apple) | `PF_ARM_SVE_INSTRUCTIONS_AVAILABLE` (46) / `PF_ARM_SVE2_…` (47) |
-| FEAT_SME | `hw.optional.arm.FEAT_SME` (M4+) | no PF_ flag; assumed absent |
-| AES/Crypto | universal on all targets | assume true |
-| FEAT_DOTPROD | universal on all targets | assume true |
+Windows column: the ID register field (from the registry mirror) is the authority; the PF_ flag
+is a fallback if the registry value cannot be read; the probe instruction is executed on every
+platform to confirm. See "JIT and compile-time CPU feature macros" above.
+
+| Feature | macOS sysctl | Windows ID register field | Probe |
+|---|---|---|---|
+| AES / PMULL / SHA256 / CRC32 | `hw.optional.arm.FEAT_AES` etc. | ISAR0.AES ≥ 1 / ≥ 2, SHA2 ≥ 1, CRC32 ≥ 1 (PF 30/31 fallback) | AESE / PMULL / SHA256SU0 / CRC32X |
+| FEAT_LSE | `hw.optional.arm.FEAT_LSE` | ISAR0.Atomic ≥ 2 (PF 34) | LDADD |
+| FEAT_DotProd | `hw.optional.arm.FEAT_DotProd` | ISAR0.DP ≥ 1 (PF 43) | SDOT |
+| FEAT_FP16 / FHM | `FEAT_FP16` / `FEAT_FHM` | PFR0.AdvSIMD == 1 / ISAR0.FHM ≥ 1 (no PF flag) | FADD v8h / FMLAL |
+| FEAT_JSCVT | `FEAT_JSCVT` | ISAR1.JSCVT ≥ 1 (PF 44) | FJCVTZS |
+| FEAT_I8MM | `FEAT_I8MM` | ISAR1.I8MM ≥ 1 (the old `PF_ARM_SVE_I8MM` proxy was dropped: Oryon has I8MM without SVE) | USDOT |
+| FEAT_BF16 | `FEAT_BF16` | ISAR1.BF16 ≥ 1 (no PF flag) | BFDOT |
+| FEAT_SHA3 / SHA512 | `FEAT_SHA3` / `FEAT_SHA512` | ISAR0.SHA3 ≥ 1 / ISAR0.SHA2 ≥ 2 (no PF flag; absent on 8cx Gen 3) | EOR3 / SHA512SU0 |
+| FEAT_LRCPC / LRCPC2 / LRCPC3 | `FEAT_LRCPC` / `FEAT_LRCPC2` / `FEAT_LRCPC3` | ISAR1.LRCPC ≥ 1 / ≥ 2 / ≥ 3 (PF 45 for LRCPC) | LDAPR / LDAPUR / LDIAPP |
+| FEAT_SVE / SVE2 | `hw.optional.arm.FEAT_SVE` (absent on Apple) | `PF_ARM_SVE_INSTRUCTIONS_AVAILABLE` (46) / `PF_ARM_SVE2_…` (47) only — OS enablement | none |
+| FEAT_SME | `hw.optional.arm.FEAT_SME` (M4+) | no source; Unknown with no probe → absent | none |
