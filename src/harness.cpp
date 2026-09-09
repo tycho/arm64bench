@@ -234,10 +234,21 @@ void print_csv_header() {
            "total_instructions,bandwidth_gbs\n");
 }
 
+// Test names contain commas ("2 chains, 32x unroll"), so the CSV name field
+// is always quoted, with embedded quotes doubled per RFC 4180.
+static void print_csv_name(const char* name) {
+    putchar('"');
+    for (const char* p = name; *p; ++p) {
+        if (*p == '"') putchar('"');
+        putchar(*p);
+    }
+    putchar('"');
+}
+
 static void print_result(const char* name, const BenchmarkResult& r) {
     if (s_output_mode == OutputMode::CSV) {
-        printf("%s,%.4f,%.4f,%.4f,%d,%.2f,%d,%llu,%.2f\n",
-               name,
+        print_csv_name(name);
+        printf(",%.4f,%.4f,%.4f,%d,%.2f,%d,%llu,%.2f\n",
                r.min_ns_per_insn,
                r.median_ns_per_insn,
                r.min_clocks_per_insn,
@@ -294,10 +305,12 @@ static void print_result(const char* name, const BenchmarkResult& r) {
 // answered is "does this generated code run on this CPU?".
 
 static BenchmarkResult run_smoke(TestFn fn, const char* name) {
-    if (s_output_mode == OutputMode::CSV)
-        printf("%s,", name);
-    else
+    if (s_output_mode == OutputMode::CSV) {
+        print_csv_name(name);
+        putchar(',');
+    } else {
         printf("%-48s: ", name);
+    }
     fflush(stdout);   // must reach the terminal/log before fn() can crash
 
     const RawTick t0 = tick_now();
