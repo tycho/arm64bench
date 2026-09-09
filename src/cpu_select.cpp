@@ -80,8 +80,10 @@ const char* core_name(uint64_t midr, char* buf, size_t cap) {
             default: break;
         }
     } else if (impl == 0x51) {
-        if (part == 0x001)      name = "Oryon (X Elite)";
-        else if (part == 0x002) name = "Oryon (X2)";
+        // 0x001 is QCOM_CPU_PART_ORYON_X1 in the Linux kernel's cputype.h (the
+        // X1E80100 "X Elite" generation); 0x002 was read off an X2E96100.
+        if (part == 0x001)      name = "Oryon (Snapdragon X1)";
+        else if (part == 0x002) name = "Oryon (Snapdragon X2)";
         else if (part == 0x804) name = "Kryo 4xx Gold";
         else if (part == 0x805) name = "Kryo 4xx Silver";
     } else if (impl == 0xC0 && part == 0xAC3) {
