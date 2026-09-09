@@ -16,8 +16,11 @@
 // Skipped entirely, with a note, when neither is present.
 //
 // Tests: vector length; ADD/FADD/FMUL/FMLA/SDOT latency and chain-sweep
-// throughput; FADDV reduction latency; contiguous LD1W/ST1W and LDR/STR z
-// L1 throughput; WHILELT/PTRUE predicate throughput.
+// throughput; FADDV reduction latency; contiguous LD1W/LDR z L1 load
+// throughput; ST1W/STR z/STNT1W store throughput over a 16 KB window; a
+// store address-rotation sweep (64 B to 64 KB windows, with scalar STR x
+// and STR q alongside, and STR q/x outside streaming mode as controls);
+// WHILELT/PTRUE predicate throughput.
 
 #include "harness.h"
 

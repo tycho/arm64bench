@@ -82,7 +82,7 @@ static JitPool::TestFn build_sve_loop(SveMode mode, uint64_t loops, uint32_t unr
     return build_loop_with_teardown(loops, unroll,
         [&](a64::Assembler& a) {
             emit_sm_enter(a, sm);
-            a.ptrue(p0.s());
+            if (mode != SveMode::None) a.ptrue(p0.s());   // None: a NEON-mode control loop
             setup(a);
         },
         body,
@@ -239,13 +239,118 @@ static void run_arith_tests(SveMode mode, const BenchmarkParams& base,
     }
 }
 
+// ── Store loops ──────────────────────────────────────────────────────────────
+//
+// One store per body over a power-of-two window: store u of an iteration
+// goes to (u × size) & (window − 1) from a per-iteration base that advances
+// by unroll × size and wraps with an AND, so the address computation is
+// two scalar ops per iteration, not per store. The window sets how many
+// distinct lines are written before one is revisited. Scalar STR x and
+// STR q are legal in streaming mode and share the loop as controls.
+
+enum class StoreKind { St1w, StrZ, Stnt1w, StrQ, StrX };
+
+struct StoreKindInfo { StoreKind k; const char* label; bool sve; };
+static const StoreKindInfo kStoreKinds[] = {
+    { StoreKind::St1w,   "ST1W z.s", true  },
+    { StoreKind::StrZ,   "STR z   ", true  },
+    { StoreKind::Stnt1w, "STNT1W z", true  },
+    { StoreKind::StrQ,   "STR q   ", false },
+    { StoreKind::StrX,   "STR x   ", false },
+};
+
+static uint32_t store_bytes(StoreKind k, uint32_t vl_bytes) {
+    switch (k) {
+        case StoreKind::StrQ: return 16;
+        case StoreKind::StrX: return 8;
+        default:              return vl_bytes;
+    }
+}
+
+// ST1W/STNT1W immediates reach only -8..7 vectors, so the iteration base is
+// spread over one register per 8 vectors (x1, x4..x7 cover 32 stores).
+static constexpr uint32_t kStoreUnroll = 32;
+
+static JitPool::TestFn build_store_loop(SveMode mode, uint64_t loops,
+                                        StoreKind kind, uint32_t vl_bytes,
+                                        uint64_t buf, size_t window) {
+    const uint32_t size   = store_bytes(kind, vl_bytes);
+    const uint32_t unroll = kStoreUnroll;
+    static const Gp kBases[] = { x1, x4, x5, x6 };
+    return build_sve_loop(mode, loops, unroll,
+        [mode, buf, window](a64::Assembler& a) {
+            a.mov(x21, Imm(buf));
+            a.mov(x22, Imm(window - 1));
+            a.mov(x0,  Imm(0));
+            if (mode != SveMode::None) seed_u32(a, 1, 0x33333333);   // z0 is SVE-only
+            a.mov(x3, Imm(0x4444444444444444ULL));
+            a.fmov(d1, x3);
+        },
+        [kind, size, vl_bytes, window](a64::Assembler& a, uint32_t u) {
+            if (u == 0) {
+                a.add(x1, x21, x0);
+                for (uint32_t k = 1; k < 4; ++k) a.add(kBases[k], x1, Imm(k * 8 * vl_bytes));
+            }
+            const uint32_t off  = static_cast<uint32_t>((static_cast<size_t>(u) * size) & (window - 1));
+            const uint32_t vidx = off / vl_bytes;                 // vector index from x1
+            const Gp&      vb   = kBases[vidx / 8];
+            const int32_t  vimm = static_cast<int32_t>(vidx % 8);
+            switch (kind) {
+                case StoreKind::St1w:   a.st1w(z0.s(), p0, ptr_vl(vb, vimm));   break;
+                case StoreKind::StrZ:   a.str(z0, ptr_vl(vb, vimm));            break;
+                case StoreKind::Stnt1w: a.stnt1w(z0.s(), p0, ptr_vl(vb, vimm)); break;
+                case StoreKind::StrQ:   a.str(q1, ptr(x1, off));                break;
+                case StoreKind::StrX:   a.str(x3, ptr(x1, off));                break;
+            }
+            if (u + 1 == kStoreUnroll) {
+                a.add(x0, x0, Imm(static_cast<uint64_t>(kStoreUnroll) * size));
+                a.and_(x0, x0, x22);
+            }
+        });
+}
+
+static constexpr size_t kStoreWindowMax  = 64ULL << 10;
+static constexpr size_t kStoreWindowBest = 16ULL << 10;   // past the pathology on M5
+
+// ── Store address rotation sweep ─────────────────────────────────────────────
+
+static void run_store_sweep(SveMode mode, const BenchmarkParams& base,
+                            uint32_t vl_bytes, uint64_t buf) {
+    char name[96];
+    // Per-store cost spans 0.2–25 ns across the sweep; scale the call so the
+    // fast windows still run for milliseconds.
+    auto loops_for = [](size_t window) {
+        return scale_loops(window >= 16384 ? 1'600'000 : window >= 4096 ? 800'000
+                         : window >= 1024 ? 400'000 : 200'000);
+    };
+    auto run = [&](SveMode m, const StoreKindInfo& kd, size_t window) {
+        const uint64_t loops = loops_for(window);
+        auto fn = build_store_loop(m, loops, kd.k, vl_bytes, buf, window);
+        if (window >= 1024)
+            snprintf(name, sizeof(name), "%s store, %2zu KB window%s", kd.label, window >> 10,
+                     m == SveMode::None ? " (NEON mode)" : "");
+        else
+            snprintf(name, sizeof(name), "%s store, %3zu B window%s", kd.label, window,
+                     m == SveMode::None ? " (NEON mode)" : "");
+        run_one(name, fn, params_for(base, loops, kStoreUnroll, store_bytes(kd.k, vl_bytes)));
+    };
+    for (const size_t window : { 64ULL, 256ULL, 1024ULL, 4096ULL, 16384ULL, 65536ULL }) {
+        for (const StoreKindInfo& kd : kStoreKinds) run(mode, kd, window);
+        // Outside streaming mode the same STR q / STR x loops say whether
+        // the window or the mode is what costs; the extremes are enough.
+        if (mode == SveMode::Streaming && (window == 64 || window == 65536))
+            for (const StoreKindInfo& kd : kStoreKinds)
+                if (!kd.sve) run(SveMode::None, kd, window);
+    }
+}
+
 alignas(64) static uint8_t g_ldst_buf[4096];
 
 static void run_ldst_tests(SveMode mode, const BenchmarkParams& base,
-                           uint64_t loops, uint32_t unroll, uint32_t vl_bytes) {
+                           uint64_t loops, uint32_t unroll, uint32_t vl_bytes, uint64_t buf) {
     char name[96];
-    // 4 consecutive vectors at [x20 + k*VL]; 4 × 64 B = 256 B at SVL=512,
-    // well inside the 4 KB buffer and L1 either way.
+    // Loads: 4 consecutive vectors at [x20 + k*VL]; 4 × 64 B = 256 B at
+    // SVL=512, well inside the 4 KB buffer and L1 either way.
     static constexpr uint32_t nvec = 4;
 
     // LD1W {z.s}, p0/z, [x20, #k, MUL VL]
@@ -268,29 +373,13 @@ static void run_ldst_tests(SveMode mode, const BenchmarkParams& base,
         snprintf(name, sizeof(name), "SVE LDR z L1 load     (%ux unroll)", unroll);
         run_one(name, fn, params_for(base, loops, unroll, vl_bytes));
     }
-    // ST1W {z.s}, p0, [x20, #k, MUL VL]
-    {
-        auto fn = build_sve_loop(mode, loops, unroll,
-            [](a64::Assembler& a) {
-                a.mov(x20, Imm(reinterpret_cast<uint64_t>(g_ldst_buf)));
-                seed_u32(a, kNumZ, 0x11111111); },
-            [](a64::Assembler& a, uint32_t u) {
-                a.st1w(kZ[u % kNumZ].s(), p0, ptr_vl(x20, static_cast<int32_t>(u % nvec)));
-            });
-        snprintf(name, sizeof(name), "SVE ST1W z.s L1 store (%ux unroll)", unroll);
-        run_one(name, fn, params_for(base, loops, unroll, vl_bytes));
-    }
-    // STR z, [x20, #k, MUL VL]
-    {
-        auto fn = build_sve_loop(mode, loops, unroll,
-            [](a64::Assembler& a) {
-                a.mov(x20, Imm(reinterpret_cast<uint64_t>(g_ldst_buf)));
-                seed_u32(a, kNumZ, 0x22222222); },
-            [](a64::Assembler& a, uint32_t u) {
-                a.str(kZ[u % kNumZ], ptr_vl(x20, static_cast<int32_t>(u % nvec)));
-            });
-        snprintf(name, sizeof(name), "SVE STR z L1 store    (%ux unroll)", unroll);
-        run_one(name, fn, params_for(base, loops, unroll, vl_bytes));
+    // Stores over a 16 KB window (see build_store_loop): the rotation sweep
+    // below shows why a narrower window is not a store-throughput test.
+    for (const StoreKindInfo& kd : kStoreKinds) {
+        if (!kd.sve) continue;
+        auto fn = build_store_loop(mode, loops, kd.k, vl_bytes, buf, kStoreWindowBest);
+        snprintf(name, sizeof(name), "SVE %s L1 store (%ux unroll)", kd.label, kStoreUnroll);
+        run_one(name, fn, params_for(base, loops, kStoreUnroll, vl_bytes));
     }
 }
 
@@ -345,8 +434,17 @@ void run_sve_tests(const BenchmarkParams& base_params) {
     const uint32_t unroll = base_params.instructions_per_loop;
 
     run_arith_tests(mode, base_params, loops, unroll);
-    run_ldst_tests(mode, base_params, loops, unroll, vl_bytes);
+    void* raw = alloc_pages(2 * kStoreWindowMax);
+    if (!raw) { printf("  (could not allocate the store window)\n"); return; }
+    commit_pages(raw, 2 * kStoreWindowMax);
+    const uint64_t store_buf =
+        (reinterpret_cast<uint64_t>(raw) + kStoreWindowMax - 1) & ~(kStoreWindowMax - 1);
+
+    run_ldst_tests(mode, base_params, loops, unroll, vl_bytes, store_buf);
+    section("SVE store address rotation (distinct lines before a line is rewritten)");
+    run_store_sweep(mode, base_params, vl_bytes, store_buf);
     run_predicate_tests(mode, base_params, loops, unroll);
+    free_pages(raw, 2 * kStoreWindowMax);
 }
 
 } // namespace arm64bench::gen
