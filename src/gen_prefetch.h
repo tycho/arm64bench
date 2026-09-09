@@ -9,9 +9,12 @@
 //                     per pass whatever the stride is: the footprint is
 //                     constant and only the pattern changes. Per-load time
 //                     well under the random-chase latency means the hardware
-//                     prefetcher is following the stream; the stride at which
-//                     it climbs back is where the prefetcher gives up (stride
-//                     too large, or a page boundary it will not cross).
+//                     prefetcher is following the stream; the strides at which
+//                     it climbs back are the ones the prefetcher cannot
+//                     follow (too large, a page boundary it will not cross,
+//                     or a stride that does not tile whatever region a
+//                     spatial prefetcher learns — the sweep includes
+//                     non-power-of-two strides to tell those apart).
 //
 //   PRFM lookahead    a random DRAM pointer chase whose nodes also hold the
 //                     address D hops ahead, prefetched with PRFM PLDL1KEEP

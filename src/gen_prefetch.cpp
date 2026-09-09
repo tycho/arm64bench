@@ -32,7 +32,7 @@ static constexpr size_t   kLine       = 64;
 static constexpr size_t   kStreamBuf  = 64ULL << 20;   // 1 M lines: past L2 and SLC
 static constexpr uint32_t kRunLen     = 32;
 static constexpr size_t   kStrides[]  = {
-    64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+    64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 4096, 8192, 16384, 32768,
 };
 
 static constexpr size_t   kChaseBuf    = 128ULL << 20;
@@ -102,10 +102,10 @@ static void run_stride_streams(const BenchmarkParams& base, void* buf, double ra
             auto fn = build_loop(loops, 1,
                 [head](a64::Assembler& a) { a.mov(x0, Imm(reinterpret_cast<uint64_t>(head))); },
                 [](a64::Assembler& a, uint32_t) { a.ldr(x0, ptr(x0)); });
-            if (stride >= 1024)
-                snprintf(name, sizeof(name), "%s stride %3zu KB", backward ? "desc" : "asc ", stride >> 10);
+            if (stride >= 4096)
+                snprintf(name, sizeof(name), "%s stride %4zu KB", backward ? "desc" : "asc ", stride >> 10);
             else
-                snprintf(name, sizeof(name), "%s stride %3zu B ", backward ? "desc" : "asc ", stride);
+                snprintf(name, sizeof(name), "%s stride %4zu B ", backward ? "desc" : "asc ", stride);
             run_one(name, fn, params_for(base, loops, 1, 64));
         }
     }
