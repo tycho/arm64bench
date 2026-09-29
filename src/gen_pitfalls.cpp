@@ -98,6 +98,7 @@ static void run_nontemporal_tests(const BenchmarkParams& base, void* buf, size_t
 static void run_misaligned_tests(const BenchmarkParams& base, void* buf);
 static void run_cas_tests(const BenchmarkParams& base, void* buf);
 static void run_lrcpc_tests(const BenchmarkParams& base);
+static void run_tso_stream_tests(const BenchmarkParams& base, void* buf, size_t bufsz);
 static void run_jit_wx_tests(const BenchmarkParams& base);
 
 // ── STL forwarding loop builder ───────────────────────────────────────────────
@@ -782,6 +783,510 @@ static void run_lrcpc_tests(const BenchmarkParams& base) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Section 6b: Memory ordering in streams (x86-TSO emulation patterns)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// An x86 guest on an arm64 host needs TSO: loads ordered with later loads and
+// stores, stores ordered with earlier stores. Stock QEMU (TCG) gets there with
+// a barrier in front of every guest access:
+//
+//   load:   DMB ISHLD ; LDR
+//   store:  DMB ISH   ; STR
+//
+// The replacement scheme uses FEAT_LRCPC's LDAPR for loads (RCpc acquire: no
+// later access passes it, but it may pass an earlier STLR, which is exactly
+// TSO's store→load relaxation) and STLR for stores. Both take a bare base
+// register, so the guest address must be formed with an ADD first; QEMU pays
+// that ADD, so every variant here pays it too (the "[x,#off] (ref)" rows fold
+// the offset into a plain LDR/STR to show what the ADD itself costs).
+//
+// The "Memory ordering barriers" section times DMB with nothing around it,
+// where it is ~1.5–2 clk on M5 and Oryon. That hides the real cost: a barrier
+// between memory accesses has to wait for the accesses before it (outstanding
+// misses, a store buffer that must drain), and a stream of them throttles the
+// memory-level parallelism a plain loop gets for free. These loops keep
+// several sequential streams in flight, as guest code walking arrays does,
+// at L1, L2 and DRAM working sets.
+//
+// Loop shape (build_tso_stream): four streams, each over a quarter of the
+// working set (starts staggered by 256 B so they don't share DRAM pages or
+// L1 sets in lockstep), four accesses per stream per iteration, the streams
+// interleaved. x1–x4 are the stream cursors, x5/x14–x17/x0 per-access temps,
+// x6–x9 loaded values, x10–x13 per-stream sums, x21 the inner counter. Every
+// variant of a group emits the same address arithmetic, sums and loop
+// overhead; only the ordering differs. Results are per memory access.
+//
+// The dependent-chain group (pointer chase) is the latency-bound contrast:
+// there is only one access in flight, so a barrier has little to wait for.
+//
+// LRCPC3 forms (LDIAPP, STILP, LDAPR post-index, STLR pre-index) are emitted
+// as raw words: AsmJit does not know them. Encodings from clang:
+//   ldiapp x0, x1, [x2] = 0xd9411840      stilp x0, x1, [x2] = 0xd9011840
+//   ldapr  x0, [x1], #8 = 0xd9c00820      stlr  x0, [x1, #-8]! = 0xd9800820
+// Rt is bits [4:0], Rn [9:5], Rt2 [20:16].
+
+static constexpr uint32_t kTsoStreams = 4;
+static constexpr uint32_t kTsoWords   = 4;    // accesses per stream per iteration
+static constexpr uint32_t kTsoSkew    = 256;  // stagger between stream starts
+static constexpr int32_t  kTsoBias    = 8;    // cursors sit this far below the data,
+                                              // so no address ADD is "#0"
+static constexpr uint64_t kTsoTarget  = 8'000'000;  // accesses per timed call
+
+static constexpr uint32_t kLdiappBase     = 0xD9401800u;
+static constexpr uint32_t kStilpBase      = 0xD9001800u;
+static constexpr uint32_t kLdaprPost8Base = 0xD9C00800u;
+static constexpr uint32_t kStlrPreM8Base  = 0xD9800800u;
+
+static void emit_raw(a64::Assembler& a, uint32_t base, uint32_t rt, uint32_t rn,
+                     uint32_t rt2 = 0) {
+    const uint32_t word = base | (rt2 << 16) | (rn << 5) | rt;
+    a.embed(&word, 4);
+}
+
+struct TsoSize { size_t bytes; const char* label; };
+static constexpr TsoSize kTsoSizes[] = {
+    {  32ULL * 1024,        "32K L1"   },
+    {   4ULL * 1024 * 1024, "4M L2"    },
+    {  64ULL * 1024 * 1024, "64M DRAM" },
+};
+
+struct TsoStream {
+    uintptr_t buf;
+    size_t    bytes;                // working set, all four streams together
+    uint32_t  step;                 // bytes between accesses within a stream
+    bool      self_advance = false; // the body moves the cursors (writeback forms)
+    bool      descending   = false; // cursors start at the top of their span (push)
+};
+
+static uint64_t tso_iters(const TsoStream& s) {
+    return s.bytes / kTsoStreams / (uint64_t{kTsoWords} * s.step);
+}
+static uint32_t tso_accesses_per_pass(const TsoStream& s) {
+    return static_cast<uint32_t>(tso_iters(s) * kTsoWords * kTsoStreams);
+}
+static uint64_t tso_passes(const TsoStream& s) {
+    const uint64_t per = tso_accesses_per_pass(s);
+    return scale_loops(per >= kTsoTarget ? 1 : kTsoTarget / per);
+}
+
+// One timed call = `passes` sweeps of the working set. word(a, w, off) emits
+// access w (0..kTsoWords-1) of every stream, at cursor + off (off ignored by
+// self-advancing bodies). The pass loop is build_loop's; the sweep is an
+// inner loop over x21.
+template<class FWord>
+static JitPool::TestFn build_tso_stream(const TsoStream& s, uint64_t passes, FWord&& word) {
+    const uint64_t span  = s.bytes / kTsoStreams;
+    const uint32_t adv   = kTsoWords * s.step;
+    const uint64_t iters = tso_iters(s);
+    return build_loop(passes, 1,
+        [](a64::Assembler& a) {
+            for (uint32_t i = 0; i < kTsoStreams; ++i) a.mov(xr(10 + i), Imm(0));
+            a.mov(x6, Imm(0x0102030405060708ULL));  // store data
+            a.mov(x7, Imm(0x1112131415161718ULL));
+        },
+        [&](a64::Assembler& a, uint32_t) {
+            for (uint32_t st = 0; st < kTsoStreams; ++st) {
+                const uint64_t start = s.buf + st * (span + kTsoSkew);
+                const uint64_t cur   = s.descending   ? start + span
+                                     : s.self_advance ? start
+                                     : start - kTsoBias;
+                a.mov(xr(1 + st), Imm(cur));
+            }
+            a.mov(x21, Imm(iters));
+            Label inner = a.new_label();
+            a.bind(inner);
+            for (uint32_t w = 0; w < kTsoWords; ++w)
+                word(a, w, kTsoBias + static_cast<int32_t>(w * s.step));
+            if (!s.self_advance)
+                for (uint32_t st = 0; st < kTsoStreams; ++st)
+                    a.add(xr(1 + st), xr(1 + st), Imm(adv));
+            a.sub(x21, x21, Imm(1));
+            a.cbnz(x21, inner);
+        });
+}
+
+enum class TsoLd : uint8_t { Folded, Ldr, DmbLd, Ldapr, Ldar };
+enum class TsoSt : uint8_t { Folded, Str, DmbIsh, Stlr, DmbIshSt };
+
+// [barrier] ; ADD tmp, base, #off ; load dst, [tmp]
+static void emit_tso_load(a64::Assembler& a, TsoLd o, const Gp& dst, const Gp& base,
+                          int32_t off, const Gp& tmp) {
+    if (o == TsoLd::Folded) { a.ldr(dst, ptr(base, off)); return; }
+    if (o == TsoLd::DmbLd) a.dmb(Imm(Predicate::DB::kISHLD));
+    a.add(tmp, base, Imm(off));
+    switch (o) {
+        case TsoLd::Ldapr: a.ldapr(dst, ptr(tmp)); break;
+        case TsoLd::Ldar:  a.ldar (dst, ptr(tmp)); break;
+        default:           a.ldr  (dst, ptr(tmp)); break;
+    }
+}
+
+// [barrier] ; ADD tmp, base, #off ; store src, [tmp]
+static void emit_tso_store(a64::Assembler& a, TsoSt o, const Gp& src, const Gp& base,
+                           int32_t off, const Gp& tmp) {
+    if (o == TsoSt::Folded) { a.str(src, ptr(base, off)); return; }
+    if (o == TsoSt::DmbIsh)   a.dmb(Imm(Predicate::DB::kISH));
+    if (o == TsoSt::DmbIshSt) a.dmb(Imm(Predicate::DB::kISHST));
+    a.add(tmp, base, Imm(off));
+    if (o == TsoSt::Stlr) a.stlr(src, ptr(tmp));
+    else                  a.str (src, ptr(tmp));
+}
+
+static void run_tso_one(const char* group, const char* variant, const char* size,
+                        JitPool::TestFn fn, const BenchmarkParams& p) {
+    char name[80];
+    snprintf(name, sizeof(name), "tso %-5s %-24s %s", group, variant, size);
+    run_one(name, fn, p);
+}
+
+static void run_tso_stream_tests(const BenchmarkParams& base, void* buf, size_t bufsz) {
+    const bool lrcpc  = cpu_has(CpuFeature::LRCPC);
+    const bool lrcpc3 = cpu_has(CpuFeature::LRCPC3);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(buf);
+
+    section("Memory ordering in streams (x86-TSO emulation patterns)");
+    printf("  ns/clk per memory access (a copy element is two). Four interleaved\n"
+           "  sequential streams, 16 accesses per loop iteration. Every variant forms\n"
+           "  the address with an ADD, as QEMU must for LDAPR/STLR (base register only).\n"
+           "    LDR / STR           relaxed baseline\n"
+           "    DMB ISHLD; LDR      stock QEMU TSO load     DMB ISH; STR   stock QEMU store\n"
+           "    LDAPR / STLR        FEAT_LRCPC acquire / release (the replacement scheme)\n"
+           "    LDAR, DMB ISHST     for comparison\n"
+           "    ... (ref)           offset folded into LDR/STR, no ADD: the ADD's own cost\n"
+           "  Compare each row with the LDR/STR row of the same size; the difference is\n"
+           "  what the ordering costs per access. Isolated barrier costs are in \"Memory\n"
+           "  ordering barriers\" above; here they meet outstanding misses and a store\n"
+           "  buffer. Filter the whole section with --filter tso.\n");
+    if (!lrcpc) skip_feature(CpuFeature::LRCPC, "LDAPR rows");
+    if (!lrcpc3) skip_feature(CpuFeature::LRCPC3, "LDIAPP/STILP and writeback LDAPR/STLR rows");
+
+    // ── Load stream ──────────────────────────────────────────────────────
+    printf("\n  Load stream: 8-byte loads, summed per stream.\n\n");
+    for (const auto& sz : kTsoSizes) {
+        if (sz.bytes + kTsoStreams * kTsoSkew > bufsz) continue;
+        const TsoStream s{ b, sz.bytes, 8 };
+        const uint64_t passes = tso_passes(s);
+        const BenchmarkParams p = params_for(base, passes, tso_accesses_per_pass(s));
+        const struct { TsoLd o; const char* label; } vs[] = {
+            { TsoLd::Folded, "LDR [x,#off] (ref)" },
+            { TsoLd::Ldr,    "LDR"                },
+            { TsoLd::DmbLd,  "DMB ISHLD; LDR"     },
+            { TsoLd::Ldapr,  "LDAPR"              },
+            { TsoLd::Ldar,   "LDAR"               },
+        };
+        for (const auto& v : vs) {
+            if (v.o == TsoLd::Ldapr && !lrcpc) continue;
+            auto fn = build_tso_stream(s, passes,
+                [&](a64::Assembler& a, uint32_t, int32_t off) {
+                    for (uint32_t st = 0; st < kTsoStreams; ++st) {
+                        emit_tso_load(a, v.o, xr(6 + st), xr(1 + st), off, x5);
+                        a.add(xr(10 + st), xr(10 + st), xr(6 + st));
+                    }
+                });
+            run_tso_one("ld", v.label, sz.label, fn, p);
+        }
+    }
+
+    // ── Dependent load chain ─────────────────────────────────────────────
+    // One random 64 B-stride ring over the working set (see the chase-stride
+    // note in CLAUDE.md). Each link: [barrier] ; ADD x5, x0, x21 (x21 = 0,
+    // standing in for guest_base) ; load x0, [x5]. The ADD sits on the chain,
+    // so the ref row (LDR x0, [x0]) shows what it adds to every variant: on
+    // M5 about 2.5 clk at L1 (5.5 vs 3), more than an ALU op, as if an
+    // ALU-produced address misses the load-to-load fast path. Every timed call walks
+    // the whole ring at least once, so the DRAM ring is not left in L2 by
+    // the per-sample warm-up.
+    printf("\n  Dependent load chain (random 64 B ring; latency-bound, one miss in flight):\n\n");
+    for (const auto& sz : kTsoSizes) {
+        if (sz.bytes > bufsz) continue;
+        void* const head = build_pointer_ring(buf, sz.bytes, 64);
+        if (!head) continue;
+        const uint64_t head_addr = reinterpret_cast<uint64_t>(head);
+        const uint64_t nodes  = sz.bytes / 64;
+        const uint32_t unroll = 8;
+        const uint64_t loops  = scale_loops((nodes > kTsoTarget / 2 ? nodes : kTsoTarget / 2) / unroll);
+        const struct { TsoLd o; const char* label; } vs[] = {
+            { TsoLd::Folded, "LDR [x0] (ref, no ADD)" },
+            { TsoLd::Ldr,    "LDR"                    },
+            { TsoLd::DmbLd,  "DMB ISHLD; LDR"         },
+            { TsoLd::Ldapr, "LDAPR"          },
+            { TsoLd::Ldar,  "LDAR"           },
+        };
+        for (const auto& v : vs) {
+            if (v.o == TsoLd::Ldapr && !lrcpc) continue;
+            auto fn = build_loop(loops, unroll,
+                [head_addr](a64::Assembler& a) {
+                    a.mov(x0, Imm(head_addr));
+                    a.mov(x21, Imm(0));
+                },
+                [&](a64::Assembler& a, uint32_t) {
+                    if (v.o == TsoLd::Folded) { a.ldr(x0, ptr(x0)); return; }
+                    if (v.o == TsoLd::DmbLd) a.dmb(Imm(Predicate::DB::kISHLD));
+                    a.add(x5, x0, x21);
+                    switch (v.o) {
+                        case TsoLd::Ldapr: a.ldapr(x0, ptr(x5)); break;
+                        case TsoLd::Ldar:  a.ldar (x0, ptr(x5)); break;
+                        default:           a.ldr  (x0, ptr(x5)); break;
+                    }
+                });
+            run_tso_one("chase", v.label, sz.label, fn, params_for(base, loops, unroll));
+        }
+    }
+
+    // ── Store stream ─────────────────────────────────────────────────────
+    printf("\n  Store stream: 8-byte stores.\n\n");
+    for (const auto& sz : kTsoSizes) {
+        if (sz.bytes + kTsoStreams * kTsoSkew > bufsz) continue;
+        const TsoStream s{ b, sz.bytes, 8 };
+        const uint64_t passes = tso_passes(s);
+        const BenchmarkParams p = params_for(base, passes, tso_accesses_per_pass(s));
+        const struct { TsoSt o; const char* label; } vs[] = {
+            { TsoSt::Folded,   "STR [x,#off] (ref)" },
+            { TsoSt::Str,      "STR"                },
+            { TsoSt::DmbIsh,   "DMB ISH; STR"       },
+            { TsoSt::Stlr,     "STLR"               },
+            { TsoSt::DmbIshSt, "DMB ISHST; STR"     },
+        };
+        for (const auto& v : vs) {
+            auto fn = build_tso_stream(s, passes,
+                [&](a64::Assembler& a, uint32_t, int32_t off) {
+                    for (uint32_t st = 0; st < kTsoStreams; ++st)
+                        emit_tso_store(a, v.o, x6, xr(1 + st), off, x5);
+                });
+            run_tso_one("st", v.label, sz.label, fn, p);
+        }
+    }
+
+    // ── Copy loop ────────────────────────────────────────────────────────
+    // Two copy streams: streams 0/1 are the sources (first half of the
+    // working set), 2/3 the destinations. Each element loads a word and
+    // stores it; the store depends on the load.
+    printf("\n  Copy loop: load then store per element, 2 copy streams (per access).\n\n");
+    for (const auto& sz : kTsoSizes) {
+        if (sz.bytes + kTsoStreams * kTsoSkew > bufsz) continue;
+        const TsoStream s{ b, sz.bytes, 8 };
+        const uint64_t passes = tso_passes(s);
+        const BenchmarkParams p = params_for(base, passes, tso_accesses_per_pass(s));
+        const struct { TsoLd ld; TsoSt st; const char* label; bool need_lrcpc; } vs[] = {
+            { TsoLd::Folded, TsoSt::Folded, "LDR/STR [x,#off] (ref)", false },
+            { TsoLd::Ldr,    TsoSt::Str,    "LDR / STR",              false },
+            { TsoLd::DmbLd,  TsoSt::DmbIsh, "ISHLD;LDR / ISH;STR",    false },
+            { TsoLd::Ldapr,  TsoSt::Stlr,   "LDAPR / STLR",           true  },
+            { TsoLd::Ldapr,  TsoSt::Str,    "LDAPR / STR",            true  },
+        };
+        for (const auto& v : vs) {
+            if (v.need_lrcpc && !lrcpc) continue;
+            auto fn = build_tso_stream(s, passes,
+                [&](a64::Assembler& a, uint32_t, int32_t off) {
+                    for (uint32_t c = 0; c < 2; ++c) {
+                        emit_tso_load (a, v.ld, xr(6 + c), xr(1 + c), off, x5);
+                        emit_tso_store(a, v.st, xr(6 + c), xr(3 + c), off, x14);
+                    }
+                });
+            run_tso_one("copy", v.label, sz.label, fn, p);
+        }
+    }
+
+    // ── Unaligned loads crossing 16 bytes ────────────────────────────────
+    // Accesses at 32n + 12: bytes 12..19 of a 32-byte slot, across the
+    // 16-byte boundary but never across a cache line (16n + 12 would also
+    // cross a line on every fourth access and fold that cost into the LDR
+    // rows). The aligned reference reads 32n + 8.
+    //
+    // LDR is legal at any alignment on normal memory. LDAPR/LDAPUR are not:
+    // with FEAT_LSE2 they may be unaligned only within 16 bytes, so an
+    // acquire load crossing 16 is emulated as two aligned LDAPRs:
+    //   and x14, a, #~7 ; add x15, x14, #8 ; ldapr lo, [x14] ; ldapr hi, [x15]
+    //   lsl x16, a, #3  ; lsrv lo, lo, x16 ; neg x16, x16 ; lslv hi, hi, x16
+    //   orr v, lo, hi
+    // (the shift is (a & 7) * 8, taken mod 64 by LSRV/LSLV; never 0 here,
+    // since a crossing address is never 8-aligned.)
+    printf("\n  Unaligned 8-byte loads at 32n+12 (crossing 16 B, not a line):\n\n");
+    for (const auto& sz : kTsoSizes) {
+        if (sz.bytes + kTsoStreams * kTsoSkew > bufsz) continue;
+        const TsoStream s{ b, sz.bytes, 32 };
+        const uint64_t passes = tso_passes(s);
+        const BenchmarkParams p = params_for(base, passes, tso_accesses_per_pass(s));
+        enum class U : uint8_t { Aligned, Ldr, DmbLd, LdaprPair };
+        const struct { U o; const char* label; } vs[] = {
+            { U::Aligned,   "LDR @32n+8 (aligned ref)" },
+            { U::Ldr,       "LDR"                      },
+            { U::DmbLd,     "DMB ISHLD; LDR"           },
+            { U::LdaprPair, "2x LDAPR + shift merge"   },
+        };
+        for (const auto& v : vs) {
+            if (v.o == U::LdaprPair && !lrcpc) continue;
+            auto fn = build_tso_stream(s, passes,
+                [&](a64::Assembler& a, uint32_t, int32_t off) {
+                    for (uint32_t st = 0; st < kTsoStreams; ++st) {
+                        const Gp& val = xr(6 + st);
+                        if (v.o == U::Aligned) {
+                            emit_tso_load(a, TsoLd::Ldr, val, xr(1 + st), off + 8, x5);
+                        } else if (v.o == U::LdaprPair) {
+                            a.add(x5, xr(1 + st), Imm(off + 12));
+                            a.and_(x14, x5, Imm(~uint64_t{7}));
+                            a.add(x15, x14, Imm(8));
+                            a.ldapr(val, ptr(x14));
+                            a.ldapr(x0, ptr(x15));
+                            a.lsl(x16, x5, Imm(3));
+                            a.lsr(val, val, x16);
+                            a.neg(x16, x16);
+                            a.lsl(x0, x0, x16);
+                            a.orr(val, val, x0);
+                        } else {
+                            emit_tso_load(a, v.o == U::DmbLd ? TsoLd::DmbLd : TsoLd::Ldr,
+                                          val, xr(1 + st), off + 12, x5);
+                        }
+                        a.add(xr(10 + st), xr(10 + st), val);
+                    }
+                });
+            run_tso_one("unal", v.label, sz.label, fn, p);
+        }
+    }
+
+    // ── 128-bit loads (SSE MOVDQA/MOVDQU-sized) ──────────────────────────
+    // Per 16-byte access. In a stream "LDP; DMB ISHLD" and "DMB ISHLD; LDP"
+    // are the same instruction sequence. Without LRCPC3 an ordered 16-byte
+    // load is two LDAPRs (a second ADD for the +8 half).
+    printf("\n  128-bit loads (16-byte aligned, per 16-byte access):\n\n");
+    for (const auto& sz : kTsoSizes) {
+        if (sz.bytes + kTsoStreams * kTsoSkew > bufsz) continue;
+        const TsoStream s{ b, sz.bytes, 16 };
+        const uint64_t passes = tso_passes(s);
+        const BenchmarkParams p = params_for(base, passes, tso_accesses_per_pass(s));
+        enum class Q : uint8_t { Ldp, LdpDmb, LdaprPair, Ldiapp };
+        const struct { Q o; const char* label; } vs[] = {
+            { Q::Ldp,       "LDP"               },
+            { Q::LdpDmb,    "LDP; DMB ISHLD"    },
+            { Q::LdaprPair, "2x LDAPR (ADD +8)" },
+            { Q::Ldiapp,    "LDIAPP"            },
+        };
+        for (const auto& v : vs) {
+            if (v.o == Q::LdaprPair && !lrcpc)  continue;
+            if (v.o == Q::Ldiapp    && !lrcpc3) continue;
+            auto fn = build_tso_stream(s, passes,
+                [&](a64::Assembler& a, uint32_t, int32_t off) {
+                    for (uint32_t st = 0; st < kTsoStreams; ++st) {
+                        const Gp& val = xr(6 + st);
+                        a.add(x5, xr(1 + st), Imm(off));
+                        switch (v.o) {
+                            case Q::Ldp:
+                                a.ldp(val, x0, ptr(x5));
+                                break;
+                            case Q::LdpDmb:
+                                a.ldp(val, x0, ptr(x5));
+                                a.dmb(Imm(Predicate::DB::kISHLD));
+                                break;
+                            case Q::LdaprPair:
+                                a.add(x14, x5, Imm(8));
+                                a.ldapr(val, ptr(x5));
+                                a.ldapr(x0, ptr(x14));
+                                break;
+                            case Q::Ldiapp:  // ldiapp val, x0, [x5]
+                                emit_raw(a, kLdiappBase, 6 + st, 5, 0);
+                                break;
+                        }
+                        a.add(xr(10 + st), xr(10 + st), val);
+                        a.add(xr(10 + st), xr(10 + st), x0);
+                    }
+                });
+            run_tso_one("ld128", v.label, sz.label, fn, p);
+        }
+    }
+
+    // ── 128-bit stores ───────────────────────────────────────────────────
+    printf("\n  128-bit stores (16-byte aligned, per 16-byte access):\n\n");
+    for (const auto& sz : kTsoSizes) {
+        if (sz.bytes + kTsoStreams * kTsoSkew > bufsz) continue;
+        const TsoStream s{ b, sz.bytes, 16 };
+        const uint64_t passes = tso_passes(s);
+        const BenchmarkParams p = params_for(base, passes, tso_accesses_per_pass(s));
+        enum class Q : uint8_t { Stp, DmbStp, DmbStStp, StlrPair, Stilp };
+        const struct { Q o; const char* label; } vs[] = {
+            { Q::Stp,      "STP"              },
+            { Q::DmbStp,   "DMB ISH; STP"     },
+            { Q::DmbStStp, "DMB ISHST; STP"   },
+            { Q::StlrPair, "2x STLR (ADD +8)" },
+            { Q::Stilp,    "STILP"            },
+        };
+        for (const auto& v : vs) {
+            if (v.o == Q::Stilp && !lrcpc3) continue;
+            auto fn = build_tso_stream(s, passes,
+                [&](a64::Assembler& a, uint32_t, int32_t off) {
+                    for (uint32_t st = 0; st < kTsoStreams; ++st) {
+                        if (v.o == Q::DmbStp)   a.dmb(Imm(Predicate::DB::kISH));
+                        if (v.o == Q::DmbStStp) a.dmb(Imm(Predicate::DB::kISHST));
+                        a.add(x5, xr(1 + st), Imm(off));
+                        switch (v.o) {
+                            case Q::StlrPair:
+                                a.add(x14, x5, Imm(8));
+                                a.stlr(x6, ptr(x5));
+                                a.stlr(x7, ptr(x14));
+                                break;
+                            case Q::Stilp:  // stilp x6, x7, [x5]
+                                emit_raw(a, kStilpBase, 6, 5, 7);
+                                break;
+                            default:
+                                a.stp(x6, x7, ptr(x5));
+                                break;
+                        }
+                    }
+                });
+            run_tso_one("st128", v.label, sz.label, fn, p);
+        }
+    }
+
+    // ── Writeback forms (FEAT_LRCPC3): pop / push ────────────────────────
+    // x86 POP / PUSH and pointer walks: an ordered access that also moves
+    // its base. LRCPC3's LDAPR post-index (+8) and STLR pre-index (-8) save
+    // the separate ADD/SUB. The cursor update is a dependency chain per
+    // stream in every variant (four chains in flight). L1 only: a stack is
+    // L1-resident. Plain LDR/STR writeback rows are the unordered reference.
+    printf("\n  Writeback forms, 32K L1 (x86 POP / PUSH, per access):\n\n");
+    {
+        const TsoSize& sz = kTsoSizes[0];
+        const TsoStream pop { b, sz.bytes, 8, /*self_advance=*/true, /*descending=*/false };
+        const TsoStream push{ b, sz.bytes, 8, /*self_advance=*/true, /*descending=*/true  };
+        const uint64_t passes = tso_passes(pop);
+        const BenchmarkParams p = params_for(base, passes, tso_accesses_per_pass(pop));
+
+        enum class W : uint8_t { LdrPost, LdaprAdd, LdaprPost, StrPre, SubStlr, StlrPre };
+        const struct { W o; const char* label; bool need_lrcpc; bool need_lrcpc3; } vs[] = {
+            { W::LdrPost,   "LDR [x],#8 (ref)",   false, false },
+            { W::LdaprAdd,  "LDAPR; ADD x,#8",    true,  false },
+            { W::LdaprPost, "LDAPR [x],#8",       true,  true  },
+            { W::StrPre,    "STR [x,#-8]! (ref)", false, false },
+            { W::SubStlr,   "SUB x,#8; STLR",     false, false },
+            { W::StlrPre,   "STLR [x,#-8]!",      false, true  },
+        };
+        for (const auto& v : vs) {
+            if (v.need_lrcpc && !lrcpc)   continue;
+            if (v.need_lrcpc3 && !lrcpc3) continue;
+            const bool is_pop = v.o == W::LdrPost || v.o == W::LdaprAdd || v.o == W::LdaprPost;
+            auto fn = build_tso_stream(is_pop ? pop : push, passes,
+                [&](a64::Assembler& a, uint32_t, int32_t) {
+                    for (uint32_t st = 0; st < kTsoStreams; ++st) {
+                        const Gp& cur = xr(1 + st);
+                        const Gp& val = xr(6 + st);
+                        switch (v.o) {
+                            case W::LdrPost:   a.ldr(val, ptr_post(cur, 8)); break;
+                            case W::LdaprAdd:  a.ldapr(val, ptr(cur));
+                                               a.add(cur, cur, Imm(8));      break;
+                            case W::LdaprPost: emit_raw(a, kLdaprPost8Base, 6 + st, 1 + st); break;
+                            case W::StrPre:    a.str(x6, ptr_pre(cur, -8));  break;
+                            case W::SubStlr:   a.sub(cur, cur, Imm(8));
+                                               a.stlr(x6, ptr(cur));         break;
+                            case W::StlrPre:   emit_raw(a, kStlrPreM8Base, 6, 1 + st); break;
+                        }
+                        if (is_pop) a.add(xr(10 + st), xr(10 + st), val);
+                    }
+                });
+            run_tso_one(is_pop ? "pop" : "push", v.label, sz.label, fn, p);
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Section 7: BFI destination dependency (Mihocka stress)
 // ════════════════════════════════════════════════════════════════════════════
 //
@@ -997,6 +1502,7 @@ void run_pitfall_tests(const BenchmarkParams& base_params) {
     run_store_forwarding_tests(base_params);
     run_barrier_tests(base_params);
     run_lrcpc_tests(base_params);
+    run_tso_stream_tests(base_params, buf, kBufSize);
     run_nontemporal_tests(base_params, buf, kBufSize);
     run_misaligned_tests(base_params, buf);
     run_cas_tests(base_params, buf);

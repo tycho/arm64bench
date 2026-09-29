@@ -74,7 +74,7 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_i8mm.h/.cpp` | FEAT_I8MM USDOT/SMMLA/UMMLA/USMMLA tests (run by `--simd`) |
 | `src/gen_bf16.h/.cpp` | FEAT_BF16 BFDOT/BFMMLA/BFMLALB/BFMLALT tests (run by `--simd`) |
 | `src/gen_lse.h/.cpp` | LSE atomics latency/throughput tests |
-| `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding) |
+| `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding, x86-TSO ordering schemes in streaming loops) |
 | `src/gen_ooo.h/.cpp` | Out-of-order window sizing: ROB, int/FP register files, load/store queues (two-miss probe) |
 | `src/gen_sve.h/.cpp` | SVE/SVE2 tests: native with FEAT_SVE, else streaming mode via SME (Apple M4/M5) |
 | `src/gen_mlp.h/.cpp` | Memory-level parallelism: K interleaved pointer chases per cache level (outstanding-miss capacity) |
@@ -523,7 +523,8 @@ pattern in every region. Sweeps that only try powers of two would call this pref
 
 - `Gp` not `GpX` for general-purpose register arguments in helper functions
 - `a.embed(&word, 4)` to hand-encode instructions not exposed in AsmJit's C++ API
-  (used for LDAPR, LDAPUR, STLUR in `gen_pitfalls.cpp`)
+  (LRCPC3 LDIAPP/STILP and the writeback LDAPR/STLR forms in `gen_pitfalls.cpp`, via
+  `emit_raw`; LDAPR, LDAPUR, STLUR, LDAR, STLR are in the API)
 - `a.ldr(xzr, ptr(xN))` encodes (LDR to XZR: load and discard, no register written)
 - `a.fmov(sN, 0.0)` is NOT encodable (FMOV immediate has no zero); use `movi(vs4(N), Imm(0))`.
   AsmJit rejects it, and before the JIT pool had an error handler the instruction vanished silently.
@@ -570,6 +571,7 @@ pattern in every region. Sweeps that only try powers of two would call this pref
 | **POPCNT idiom** | `gen_fp_simd.cpp §11` | NEON CNT v16b=2 clk; full FMOV+CNT+ADDV+FMOV scalar-POPCNT idiom ≈14.8 clk per emulated POPCNT |
 | **Memory barriers** | `gen_pitfalls.cpp §5` | DMB=1.5 clk standalone; in load chain: 0 added (completes within LDR latency) |
 | **LRCPC (LDAPR/LDAPUR)** | `gen_pitfalls.cpp §6` | LDAPR≈LDAR≈LDR=3 clk; store forwarding unchanged (~4.9 clk all variants) |
+| **TSO ordering in streams** | `gen_pitfalls.cpp §6b` (`--filter tso`) | Per access, 4 sequential streams, Tier 2: load stream LDR 0.38–0.47 clk, DMB ISHLD+LDR 1.5–1.8, LDAPR = LDAR 1.13–1.22 at every size; store stream STR 0.54–0.71, DMB ISH+STR = DMB ISHST+STR ≈ 6.0–6.3 at every size, STLR 1.0–1.3; copy (per access) LDR/STR 0.28 (L1) / 1.51 (L2, DRAM), stock QEMU 3.8–4.0, LDAPR/STLR 0.66–0.91; chase: ordering adds nothing, but the address ADD adds 2.5 clk at L1 (5.5 vs 3.0); unaligned crossing 16 B: 2×LDAPR+merge 2.2–2.5 vs DMB+LDR 1.5–2.7; 128-bit: LDP+DMB 1.5–2.1, 2×LDAPR 2.2, DMB+STP 6.0–6.5, 2×STLR 2.0–2.7. LRCPC3 rows (LDIAPP/STILP/writeback) not run on M5 (absent) |
 | **BFI dest-dep stress** | `gen_pitfalls.cpp §7` | All three Mihocka variants (independent / overlapping rotation / full-width) report ~1 clk on M5 — no dep-breaking shortcut |
 | **OOO window** | `gen_ooo.cpp` | Two-miss probe: int PRF ≈ 386–418, FP PRF ≈ 834–898, load queue ≈ 482–515, store queue ≈ 138–146, flag (NZCV) PRF ≈ 170–179 (CMP fill), branch order buffer ≈ 194–203 (not-taken B.cond fill); NOP fill shows no limit to 2048 (NOPs are not allocated, or ROB > 2050). Sharp 1×→2× steps. ~3.5 min run |
 | **SHA3 / SHA512** | `gen_crypto.cpp` | EOR3, BCAX, RAX1, XAR all 2 clk, saturate at 6 chains ≈0.33 clk (3 units); SHA512H/H2/SU0/SU1 all 2 clk |
@@ -588,7 +590,7 @@ pattern in every region. Sweeps that only try powers of two would call this pref
 | Category | Tests | Notes |
 |---|---|---|
 | **OOO window, ROB itself** | ROB via a non-NOP filler | Every non-NOP filler tried allocates a smaller structure first (int/FP/flag PRF, LQ/SQ, BOB); the ROB knee needs a filler with no other footprint that Apple does not drop |
-| **FEAT_LRCPC3** | LDIAPP / STILP pair instructions | Not present on any current Apple Silicon (M1–M5); available check via `hw.optional.arm.FEAT_LRCPC3` |
+| **FEAT_LRCPC3** | LDIAPP / STILP pair instructions | Streaming rows exist in the TSO section (§6b: LDIAPP, STILP, LDAPR post-index, STLR pre-index, emitted as raw words checked against clang), but no LRCPC3 hardware has run them yet. Not present on any current Apple Silicon (M1–M5); available check via `hw.optional.arm.FEAT_LRCPC3` |
 | **SVE2, more** | Gather/scatter, MOVPRFX fusion, BFMMLA z, predicate-heavy loops | Native on CI (N2, 128-bit); streaming on M4/M5. Wide native SVE may need PMU (Tier 1) to be trustworthy — instruction-induced throttling risk |
 
 ## Cross-platform results (Snapdragon, 2026-09-09)
