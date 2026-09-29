@@ -42,6 +42,11 @@
 #include <asmjit/a64.h>
 #include <cstdio>
 
+#ifdef __APPLE__
+#include <pthread.h>
+#include <sys/mman.h>
+#endif
+
 namespace arm64bench::gen {
 
 using namespace asmjit;
@@ -93,6 +98,7 @@ static void run_nontemporal_tests(const BenchmarkParams& base, void* buf, size_t
 static void run_misaligned_tests(const BenchmarkParams& base, void* buf);
 static void run_cas_tests(const BenchmarkParams& base, void* buf);
 static void run_lrcpc_tests(const BenchmarkParams& base);
+static void run_jit_wx_tests(const BenchmarkParams& base);
 
 // ── STL forwarding loop builder ───────────────────────────────────────────────
 //
@@ -896,6 +902,87 @@ static void run_bfi_dependency_tests(const BenchmarkParams& base) {
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
+// ── MAP_JIT W^X toggles (macOS) ──────────────────────────────────────────────
+//
+// On Apple Silicon, MAP_JIT pages are writable or executable per thread, and
+// pthread_jit_write_protect_np(1|0) switches the calling thread between the
+// two. JITs call it around every code write; QEMU calls it before every entry
+// into generated code, and many of those calls don't change the mode (the
+// thread is already executable). This section prices a redundant call and a
+// real switch.
+//
+// These are plain C loops, not JIT'd: a thread in write mode can't execute
+// MAP_JIT code, and the JIT pool is MAP_JIT. Each loop leaves the thread in
+// execute mode, the state the JIT pool expects. clk is per toggle call (a
+// flip pair counts as two).
+
+#ifdef __APPLE__
+static uint64_t g_wx_loops;
+static volatile uint64_t* g_wx_page;
+
+__attribute__((noinline)) static void wx_empty_call(int) { __asm__ volatile(""); }
+
+static void wx_call_baseline() {
+    for (uint64_t i = 0; i < g_wx_loops; i++) wx_empty_call(1);
+}
+static void wx_redundant_exec() {
+    for (uint64_t i = 0; i < g_wx_loops; i++) pthread_jit_write_protect_np(1);
+}
+static void wx_redundant_write() {
+    pthread_jit_write_protect_np(0);
+    for (uint64_t i = 0; i < g_wx_loops; i++) pthread_jit_write_protect_np(0);
+    pthread_jit_write_protect_np(1);
+}
+static void wx_flip_pair() {
+    for (uint64_t i = 0; i < g_wx_loops; i++) {
+        pthread_jit_write_protect_np(0);
+        pthread_jit_write_protect_np(1);
+    }
+}
+static void wx_flip_pair_store() {
+    for (uint64_t i = 0; i < g_wx_loops; i++) {
+        pthread_jit_write_protect_np(0);
+        g_wx_page[i & 63] = i;
+        pthread_jit_write_protect_np(1);
+    }
+}
+#endif
+
+static void run_jit_wx_tests(const BenchmarkParams& base) {
+#ifdef __APPLE__
+    section("MAP_JIT W^X toggles (pthread_jit_write_protect_np)");
+    printf("  clk per call; a flip pair (write, then exec) counts as 2 calls.\n\n");
+    if (!pthread_jit_write_protect_supported_np()) {
+        printf("  (per-thread JIT write protection not supported — skipping)\n");
+        return;
+    }
+    constexpr size_t kPage = 16384;
+    void* page = mmap(nullptr, kPage, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    if (page == MAP_FAILED) {
+        printf("  (mmap MAP_JIT failed — skipping)\n");
+        return;
+    }
+    g_wx_page = static_cast<volatile uint64_t*>(page);
+    g_wx_loops = scale_loops(2'000'000);
+
+    // benchmark(), not run_one(): these are C functions, not JIT pool code.
+    benchmark(wx_call_baseline, "W^X ref: empty C call", params_for(base, g_wx_loops, 1));
+    benchmark(wx_redundant_exec, "W^X toggle exec, already exec (redundant)",
+              params_for(base, g_wx_loops, 1));
+    benchmark(wx_redundant_write, "W^X toggle write, already write (redundant)",
+              params_for(base, g_wx_loops, 1));
+    benchmark(wx_flip_pair, "W^X toggle write+exec (flip pair)", params_for(base, g_wx_loops, 2));
+    benchmark(wx_flip_pair_store, "W^X toggle write, store, exec",
+              params_for(base, g_wx_loops, 2));
+
+    pthread_jit_write_protect_np(1);
+    munmap(page, kPage);
+#else
+    (void)base;
+#endif
+}
+
 void run_pitfall_tests(const BenchmarkParams& base_params) {
     // Allocate a shared buffer for STNP, misaligned, and CAS tests.
     // 128MB covers all buffer sizes needed.
@@ -914,6 +1001,7 @@ void run_pitfall_tests(const BenchmarkParams& base_params) {
     run_misaligned_tests(base_params, buf);
     run_cas_tests(base_params, buf);
     run_bfi_dependency_tests(base_params);
+    run_jit_wx_tests(base_params);
 
     free_pages(buf, kBufSize);
 }
