@@ -21,6 +21,7 @@
 #include <asmjit/core.h>
 #include <asmjit/a64.h>
 #include <cstdio>
+#include <cstring>
 
 namespace arm64bench::gen {
 
@@ -188,10 +189,215 @@ static void run_fpcr_access_tests(const BenchmarkParams& base) {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// FP operations the remaining sections interleave with system-register access
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Chain registers are vr(0..15) (v0–v7, v16–v23), the constant lives in
+// vr(16) (v24). The constants make every operation inexact without ever
+// leaving the normal range, so rounding-mode changes do real work and FPSR
+// accumulates IXC the way ordinary code does:
+//   FADD  acc += 0.1            (f32 lanes stop growing at 2^21; still inexact)
+//   FMUL  acc *= 1 + ulp-ish    (e^20 at most over one call)
+
+struct FpOp {
+    const char* label;
+    bool        vec;       // 4×f32 vector, else f64 scalar
+    bool        mul;
+};
+static constexpr FpOp kFaddD{ "FADD f64",   false, false };
+static constexpr FpOp kFmulD{ "FMUL f64",   false, true  };
+static constexpr FpOp kFaddV{ "FADD v4f32", true,  false };
+static constexpr FpOp kFmulV{ "FMUL v4f32", true,  true  };
+
+static constexpr uint32_t kFpConst = 16;   // vr(16) = v24
+
+static void fp_load(a64::Assembler& a, const FpOp& op, uint32_t reg, double f64v, float f32v) {
+    if (op.vec) {
+        uint32_t bits;
+        memcpy(&bits, &f32v, sizeof(bits));
+        a.mov(w9, Imm(bits));
+        a.dup(vr(reg).s4(), w9);
+    } else {
+        uint64_t bits;
+        memcpy(&bits, &f64v, sizeof(bits));
+        a.mov(x9, Imm(bits));
+        a.fmov(vr(reg).d(), x9);
+    }
+}
+
+// Seeds chain registers 0..nregs-1 and the constant. Clobbers x9.
+static void fp_seed(a64::Assembler& a, const FpOp& op, uint32_t nregs) {
+    if (op.mul) fp_load(a, op, kFpConst, 1.0000001, 1.0000001f);
+    else        fp_load(a, op, kFpConst, 0.1, 0.1f);
+    for (uint32_t i = 0; i < nregs; ++i) fp_load(a, op, i, 1.5, 1.5f);
+}
+
+// reg = reg OP constant.
+static void fp_emit(a64::Assembler& a, const FpOp& op, uint32_t reg) {
+    if (op.vec) {
+        const Vec d = vr(reg).s4(), c = vr(kFpConst).s4();
+        if (op.mul) a.fmul(d, d, c); else a.fadd(d, d, c);
+    } else {
+        const Vec d = vr(reg).d(), c = vr(kFpConst).d();
+        if (op.mul) a.fmul(d, d, c); else a.fadd(d, d, c);
+    }
+}
+
+// ── FP code with something every N operations ─────────────────────────────────
+//
+// One loop iteration is `groups` groups of (N FP ops, then between(a, g)).
+// The FP ops rotate over `chains` registers: 1 makes one dependency chain
+// (latency-bound, the FP unit mostly idle), 16 makes the loop throughput-
+// bound (M5's 2-clk FADD still reads 0.38 clk with 8 chains, 0.25 with 16). Results are per FP operation, so the row without the system-
+// register access is the baseline and (row − baseline) × N is what one
+// access costs the surrounding code. groups is even so a between() that
+// alternates two values ends each iteration where it started.
+
+// FP ops per timed call: fewer when nearly every other instruction is a
+// system-register access that may cost tens of cycles.
+static constexpr uint64_t kInterleaveOps      = 64'000'000;
+static constexpr uint64_t kInterleaveOpsDense = 16'000'000;   // N <= 4
+
+template<class FBetween>
+static void run_interleaved(const BenchmarkParams& base, const FpOp& op, uint32_t chains,
+                            uint32_t every, const char* what, uint64_t guest_bits,
+                            FBetween&& between)
+{
+    const uint32_t n      = every ? every : 64;
+    const uint32_t groups = n >= 32 ? 2 : 64 / n;
+    const uint32_t ops    = groups * n;
+    uint64_t loops = scale_loops(every && every <= 4 ? kInterleaveOpsDense : kInterleaveOps) / ops;
+    if (loops == 0) loops = 1;
+
+    auto fn = build_fpenv_loop(loops, groups,
+        [&](a64::Assembler& a) {
+            set_guest(a, guest_bits);
+            fp_seed(a, op, chains);
+        },
+        [&](a64::Assembler& a, uint32_t g) {
+            for (uint32_t i = 0; i < n; ++i) fp_emit(a, op, (g * n + i) % chains);
+            if (every) between(a, g);
+        });
+
+    char shape[24], name[96];
+    if (chains == 1) snprintf(shape, sizeof(shape), "chain");
+    else             snprintf(shape, sizeof(shape), "%u chains", chains);
+    if (every) snprintf(name, sizeof(name), "%s %s, %s every %u", op.label, shape, what, every);
+    else       snprintf(name, sizeof(name), "%s %s, %s", op.label, shape, what);
+    run_one(name, fn, params_for(base, loops, ops));
+}
+
+static constexpr uint32_t kEvery[] = { 1, 4, 16, 64 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// Section 2: MSR FPCR inside FP code
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Does a write stall the FP instructions around it? Two shapes:
+//
+//   chain      one FADD/FMUL dependency chain with an MSR FPCR every N ops.
+//              If FPCR were renamed and the FP ops simply took the new value
+//              as an input, the chain would not notice.
+//   16 chains  sixteen independent chains, MSR every N ops. This is the
+//              shape that shows a drain: the out-of-order overlap is lost at
+//              every write.
+//
+// "same" rewrites the value already there; "toggle" flips FZ on every
+// write, host value and host^FZ alternately.
+//
+// Then the translator's pattern itself, per trip:
+//     MSR FPCR, guest ; k × FADD v4f32 ; MSR FPCR, host
+// with the k ops on one chain ("chained") or on k separate registers
+// ("indep"), against the same k ops with no writes. "same" writes the host
+// value both times (a guest whose mode equals the host's).
+//
+// M5: a write that changes FPCR costs the surrounding code 32–36 clk in
+// either shape (+0.5 clk per op at N = 64), so a bracket is 67–71 clk per
+// trip on top of its FP ops, for FZ, RZ and AH|NEP alike. A write of the
+// unchanged value limits the loop to one write per 11 clk but does not stop
+// FP ops issuing around it: 16 chains with one every 64 FADDs, or one chain
+// with one every 16, read the same as with none, and a "same" bracket
+// around 16 chained FADDs costs 0.6 clk.
+
+static void run_fpcr_interleave(const BenchmarkParams& base, const FpOp& op, uint32_t chains) {
+    run_interleaved(base, op, chains, 0, "no MSR", 0, [](a64::Assembler&, uint32_t) {});
+    for (const uint32_t n : kEvery)
+        run_interleaved(base, op, chains, n, "MSR FPCR same", 0,
+            [](a64::Assembler& a, uint32_t) { msr_fpcr(a, x20); });
+    for (const uint32_t n : kEvery)
+        run_interleaved(base, op, chains, n, "MSR FPCR toggle", kFpcrFZ,
+            [](a64::Assembler& a, uint32_t g) { msr_fpcr(a, (g & 1) ? x20 : x21); });
+}
+
+static constexpr uint64_t kBracketTrips = 4'000'000;   // trips per timed call
+
+// guest == nullptr: no writes at all.
+static void run_fpcr_bracket(const BenchmarkParams& base, const char* guest, uint64_t guest_bits,
+                             uint32_t k, bool chained)
+{
+    const uint32_t trips = k >= 16 ? 2 : 32 / k / 2;          // per iteration
+    uint64_t loops = scale_loops(kBracketTrips) / trips;
+    if (loops == 0) loops = 1;
+    const uint32_t nregs = chained ? 1 : k;
+
+    auto fn = build_fpenv_loop(loops, trips,
+        [&](a64::Assembler& a) {
+            set_guest(a, guest_bits);
+            fp_seed(a, kFaddV, nregs);
+        },
+        [&](a64::Assembler& a, uint32_t) {
+            if (guest) msr_fpcr(a, x21);
+            for (uint32_t i = 0; i < k; ++i) fp_emit(a, kFaddV, i % nregs);
+            if (guest) msr_fpcr(a, x20);
+        });
+
+    char name[96];
+    if (guest)
+        snprintf(name, sizeof(name), "FPCR bracket (%s), %u FADD v4f32 %s",
+                 guest, k, chained ? "chained" : "indep");
+    else
+        snprintf(name, sizeof(name), "no bracket, %u FADD v4f32 %s",
+                 k, chained ? "chained" : "indep");
+    run_one(name, fn, params_for(base, loops, trips));
+}
+
+static void run_fpcr_in_fp_code_tests(const BenchmarkParams& base) {
+    section("FPCR writes inside FP code");
+    const bool afp = cpu_has(CpuFeature::AFP);
+    printf("  clk per FP operation, with an MSR FPCR after every N of them. (row - the\n"
+           "  \"no MSR\" row) x N is what one write costs the code around it. \"chain\" is\n"
+           "  one dependency chain, \"16 chains\" is throughput-bound. \"same\" rewrites the\n"
+           "  current value, \"toggle\" flips FZ on every write.\n\n");
+
+    for (const FpOp* op : { &kFaddD, &kFmulD, &kFaddV, &kFmulV })
+        run_fpcr_interleave(base, *op, 1);
+    for (const FpOp* op : { &kFaddD, &kFaddV })
+        run_fpcr_interleave(base, *op, 16);
+
+    printf("\n  Per trip: MSR FPCR, guest; k x FADD v4f32; MSR FPCR, host. \"chained\" puts\n"
+           "  the k ops on one dependency chain, \"indep\" on k registers. \"same\" writes\n"
+           "  the host value both times.\n");
+    if (!afp) skip_feature(CpuFeature::AFP, "the AH|NEP bracket");
+    printf("\n");
+
+    for (const bool chained : { true, false }) {
+        for (const uint32_t k : { 1u, 4u, 16u }) {
+            run_fpcr_bracket(base, nullptr, 0, k, chained);
+            run_fpcr_bracket(base, "same",  0, k, chained);
+            run_fpcr_bracket(base, "FZ",    kFpcrFZ, k, chained);
+            run_fpcr_bracket(base, "RZ",    kFpcrRZ, k, chained);
+            if (afp)
+                run_fpcr_bracket(base, "AH|NEP", kFpcrAH | kFpcrNEP, k, chained);
+        }
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 void run_fpenv_tests(const BenchmarkParams& base_params) {
     run_fpcr_access_tests(base_params);
+    run_fpcr_in_fp_code_tests(base_params);
 }
 
 } // namespace arm64bench::gen
