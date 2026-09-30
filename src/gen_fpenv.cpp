@@ -721,6 +721,120 @@ static void run_denormal_tests(const BenchmarkParams& base) {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Section 5: FEAT_AFP scalar merging (NEP) and alternate FMAX/FMIN (AH)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// x86 scalar SSE writes the low element and keeps the rest of the
+// destination; AArch64 scalar ops zero it. With FPCR.NEP = 1 they merge
+// instead: two-operand arithmetic takes the upper bits from the first source
+// (Vn), FMADD from the addend, and one-source ops (FSQRT, FCVT, SCVTF,
+// FRINT*) from the destination itself, which makes the destination an
+// input, x86's CVTSI2SD false dependency included. The alternative without
+// NEP is the operation into a scratch register plus INS.
+//
+//   [default] OP same dest        16 results into d0, nothing fed back: rate
+//   [NEP]     OP same dest        the same code; each op now needs the last
+//   [default] OP; INS v0.d[0]     the explicit merge, per pair
+//
+// For FADD the accumulator is the first source in all three, so the rows
+// compare the chain latency of FADD, merging FADD, and FADD + INS.
+//
+// AH changes what FMAX/FMIN return for NaNs and signed zeros to the x86
+// MAXPS/MINPS rule; the last rows check that it does not change their speed.
+//
+// M5: merging is free where the merge source is already an input (FADD
+// chain 2.08 clk with and without NEP; FADD + INS is 5.03). Where the
+// destination becomes an input the rate turns into the op's latency: FSQRT
+// 2.0 -> 13.0 clk, FCVT 0.25 -> 3.0, SCVTF 0.34 -> 3.0, against 2.0 per
+// pair for op + INS (the chain is then the INS alone). FMAX/FMIN 1.6 clk
+// with and without AH.
+
+enum class MergeOp  { Fadd, Fsqrt, Scvtf, Fcvt };
+enum class MergeHow { Plain, Nep, Ins };
+
+static void run_merge_row(const BenchmarkParams& base, MergeOp op, MergeHow how) {
+    const uint64_t loops  = scale_loops(kSysregLoops);
+    const uint32_t unroll = kSysregUnroll;
+
+    auto fn = build_fpenv_loop(loops, unroll,
+        [=](a64::Assembler& a) {
+            fp_load(a, kFaddV, 0, 0, 1.5f);           // v0: every bit defined
+            fp_load(a, kFaddD, 0, 1.5, 0);            // d0 = 1.5 (zeroes the top, NEP not set yet)
+            if (op == MergeOp::Fcvt) fp_load(a, kFaddV, 1, 0, 2.0f);
+            else                     fp_load(a, kFaddD, 1, 2.0, 0);
+            fp_load(a, kFaddD, 3, 0.1, 0);
+            a.mov(x1, Imm(3));
+            set_guest(a, how == MergeHow::Nep ? kFpcrNEP : 0);
+            msr_fpcr(a, x21);
+        },
+        [=](a64::Assembler& a, uint32_t) {
+            const Vec dst = how == MergeHow::Ins ? d2 : d0;
+            switch (op) {
+            case MergeOp::Fadd:  a.fadd(dst, d0, d3); break;
+            case MergeOp::Fsqrt: a.fsqrt(dst, d1);    break;
+            case MergeOp::Scvtf: a.scvtf(dst, x1);    break;
+            case MergeOp::Fcvt:  a.fcvt(dst, s1);     break;
+            }
+            if (how == MergeHow::Ins) a.ins(v0.d(0), v2.d(0));
+        });
+
+    static const char* const kNames[4][2] = {
+        { "FADD d0,d0,d3 chain",    "FADD d2,d0,d3; INS v0.d[0] (per pair)" },
+        { "FSQRT d0,d1 same dest",  "FSQRT d2,d1; INS v0.d[0] (per pair)"   },
+        { "SCVTF d0,x1 same dest",  "SCVTF d2,x1; INS v0.d[0] (per pair)"   },
+        { "FCVT d0,s1 same dest",   "FCVT d2,s1; INS v0.d[0] (per pair)"    },
+    };
+    char name[96];
+    snprintf(name, sizeof(name), "[%s] %s", how == MergeHow::Nep ? "NEP" : "default",
+             kNames[static_cast<int>(op)][how == MergeHow::Ins]);
+    run_one(name, fn, params_for(base, loops, unroll));
+}
+
+static void run_minmax_row(const BenchmarkParams& base, const char* what, bool vec, bool fmin, bool ah) {
+    const FpOp     kind{ "", vec, false };
+    const uint64_t loops  = scale_loops(kSysregLoops);
+    const uint32_t unroll = kSysregUnroll;
+    auto fn = build_fpenv_loop(loops, unroll,
+        [&](a64::Assembler& a) {
+            fp_load(a, kind, 0, 1.5, 1.5f);
+            fp_load(a, kind, kFpConst, fmin ? 2.5 : 0.1, fmin ? 2.5f : 0.1f);
+            set_guest(a, ah ? kFpcrAH : 0);
+            msr_fpcr(a, x21);
+        },
+        [&](a64::Assembler& a, uint32_t) {
+            const Vec d = vec ? vr(0).s4() : vr(0).d();
+            const Vec c = vec ? vr(kFpConst).s4() : vr(kFpConst).d();
+            if (fmin) a.fmin(d, d, c); else a.fmax(d, d, c);
+        });
+    char name[96];
+    snprintf(name, sizeof(name), "[%s] %s lat", ah ? "AH" : "default", what);
+    run_one(name, fn, params_for(base, loops, unroll));
+}
+
+static void run_afp_tests(const BenchmarkParams& base) {
+    section("FEAT_AFP: scalar merging (NEP), FMAX/FMIN under AH");
+    if (!cpu_has(CpuFeature::AFP)) {
+        skip_feature(CpuFeature::AFP, "NEP and AH tests");
+        return;
+    }
+    printf("  clk per operation (per pair where an INS does the merge). With NEP a\n"
+           "  scalar op keeps the rest of its destination: FADD takes it from the first\n"
+           "  source, FSQRT / SCVTF / FCVT from the destination, which becomes an input.\n"
+           "  \"same dest\" writes d0 sixteen times per iteration without reading it.\n\n");
+
+    for (const MergeOp op : { MergeOp::Fadd, MergeOp::Fsqrt, MergeOp::Scvtf, MergeOp::Fcvt })
+        for (const MergeHow how : { MergeHow::Plain, MergeHow::Nep, MergeHow::Ins })
+            run_merge_row(base, op, how);
+
+    printf("\n");
+    for (const bool ah : { false, true }) {
+        run_minmax_row(base, "FMAX v4f32", true,  false, ah);
+        run_minmax_row(base, "FMIN v4f32", true,  true,  ah);
+        run_minmax_row(base, "FMAX f64",   false, false, ah);
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 void run_fpenv_tests(const BenchmarkParams& base_params) {
@@ -728,6 +842,7 @@ void run_fpenv_tests(const BenchmarkParams& base_params) {
     run_fpcr_in_fp_code_tests(base_params);
     run_fpsr_tests(base_params);
     run_denormal_tests(base_params);
+    run_afp_tests(base_params);
 }
 
 } // namespace arm64bench::gen
