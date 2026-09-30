@@ -60,6 +60,7 @@ add_library(arm64bench_core STATIC
     src/gen_icache.cpp
     src/gen_prefetch.cpp
     src/gen_c2c.cpp
+    src/gen_fpenv.cpp
     src/affinity.cpp
     src/cpu_select.cpp
 )

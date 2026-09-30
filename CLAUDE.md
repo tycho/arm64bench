@@ -30,7 +30,7 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 ## Run
 
 ```bash
-./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp | --frontend | --icache | --prefetch | --c2c]
+./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp | --frontend | --icache | --prefetch | --c2c | --fpenv]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
              [--smoke] [--filter <substr>] [--cpu auto|any|<n>]
 ```
@@ -82,6 +82,7 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_icache.h/.cpp` | I-cache size sweep (straight-line NOP bodies), BTB chain (dense), iTLB chain (one branch per 16 KB page) |
 | `src/gen_prefetch.h/.cpp` | Hardware prefetcher stride streams (asc/desc, constant footprint) and PRFM lookahead on a random chase |
 | `src/gen_c2c.h/.cpp` | Core-to-core: 1-line and 2-line cache-line round trips, contended LDADDAL, against a partner thread running a JIT'd responder |
+| `src/gen_fpenv.h/.cpp` | FP environment: MRS/MSR FPCR and FPSR cost, FPCR writes inside FP code, denormals under FZ/FIZ/AH (FEAT_AFP rows gated at run time) |
 | `src/affinity.h/.cpp` | Thread placement: pin to a CPU or set (Linux/Windows), QoS cluster hint (macOS); CPU topology query (L2 clusters, efficiency class, max clock, MIDR) |
 | `src/cpu_select.h/.cpp` | `--cpu`: per-CPU clock survey (pinned ADD chain), cluster choice, main-thread pinning and the topology table in the run header |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |

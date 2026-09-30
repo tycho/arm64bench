@@ -27,6 +27,7 @@
 #include "gen_prefetch.h"
 #include "gen_c2c.h"
 #include "gen_lse.h"
+#include "gen_fpenv.h"
 #include "cpu_select.h"
 
 static void print_usage(const char* prog) {
@@ -56,6 +57,7 @@ static void print_usage(const char* prog) {
     printf("  --icache        Run I-cache size and iTLB reach sweeps\n");
     printf("  --prefetch      Run hardware-prefetcher stride sweeps and PRFM lookahead tests\n");
     printf("  --c2c           Run core-to-core transfer latency and contended-atomic tests\n");
+    printf("  --fpenv         Run FPCR / FPSR access cost and denormal tests\n");
     printf("\n");
 }
 
@@ -74,6 +76,7 @@ int main(int argc, char** argv) {
     bool run_icache   = false;
     bool run_prefetch = false;
     bool run_c2c      = false;
+    bool run_fpenv    = false;
     bool csv_mode     = false;
     bool smoke_mode   = false;
     const char* name_filter = nullptr;
@@ -98,7 +101,7 @@ int main(int argc, char** argv) {
         } else if (strcmp(arg, "--filter") == 0 && i + 1 < argc) {
             name_filter = argv[++i];
         } else if (strcmp(arg, "--all") == 0) {
-            run_integer = run_memory = run_branch = run_simd = run_lse = run_pitfalls = run_ooo = run_sve = run_mlp = run_frontend = run_icache = run_prefetch = run_c2c = true;
+            run_integer = run_memory = run_branch = run_simd = run_lse = run_pitfalls = run_ooo = run_sve = run_mlp = run_frontend = run_icache = run_prefetch = run_c2c = run_fpenv = true;
         } else if (strcmp(arg, "--integer")  == 0) { run_integer  = true; }
         else if   (strcmp(arg, "--memory")   == 0) { run_memory   = true; }
         else if   (strcmp(arg, "--branch")   == 0) { run_branch   = true; }
@@ -112,6 +115,7 @@ int main(int argc, char** argv) {
         else if   (strcmp(arg, "--icache")   == 0) { run_icache   = true; }
         else if   (strcmp(arg, "--prefetch") == 0) { run_prefetch = true; }
         else if   (strcmp(arg, "--c2c")      == 0) { run_c2c      = true; }
+        else if   (strcmp(arg, "--fpenv")    == 0) { run_fpenv    = true; }
         else if (strcmp(arg, "--MHz") == 0 && i + 1 < argc) {
             override_mhz = static_cast<uint64_t>(atoll(argv[++i]));
         } else if (strcmp(arg, "--samples") == 0 && i + 1 < argc) {
@@ -135,7 +139,7 @@ int main(int argc, char** argv) {
 #endif
 
     // Default: run integer and memory tests if nothing specified.
-    if (!run_integer && !run_memory && !run_branch && !run_simd && !run_lse && !run_pitfalls && !run_ooo && !run_sve && !run_mlp && !run_frontend && !run_icache && !run_prefetch && !run_c2c)
+    if (!run_integer && !run_memory && !run_branch && !run_simd && !run_lse && !run_pitfalls && !run_ooo && !run_sve && !run_mlp && !run_frontend && !run_icache && !run_prefetch && !run_c2c && !run_fpenv)
         run_integer = run_memory = true;
 
     // Run mode must be set before any loop count is derived: scale_loops()
@@ -293,6 +297,12 @@ int main(int argc, char** argv) {
     if (run_c2c) {
         printf("── Core-to-core tests ────────────────────────────────────────\n");
         arm64bench::gen::run_c2c_tests(default_params);
+        printf("\n");
+    }
+
+    if (run_fpenv) {
+        printf("── FP environment (FPCR / FPSR) tests ────────────────────────\n");
+        arm64bench::gen::run_fpenv_tests(default_params);
         printf("\n");
     }
 
