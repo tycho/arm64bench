@@ -38,6 +38,10 @@ static constexpr uint64_t kFpcrFZ    = 1ull << 24;   // flush-to-zero
 
 static inline void mrs_fpcr(a64::Assembler& a, const Gp& r) { a.mrs(r, Imm(Predicate::SysReg::kFPCR)); }
 static inline void msr_fpcr(a64::Assembler& a, const Gp& r) { a.msr(Imm(Predicate::SysReg::kFPCR), r); }
+static inline void mrs_fpsr(a64::Assembler& a, const Gp& r) { a.mrs(r, Imm(Predicate::SysReg::kFPSR)); }
+static inline void msr_fpsr(a64::Assembler& a, const Gp& r) { a.msr(Imm(Predicate::SysReg::kFPSR), r); }
+
+static constexpr uint64_t kFpsrIXC = 1ull << 4;      // cumulative inexact
 
 // ── Loop builder ──────────────────────────────────────────────────────────────
 
@@ -200,15 +204,19 @@ static void run_fpcr_access_tests(const BenchmarkParams& base) {
 //   FADD  acc += 0.1            (f32 lanes stop growing at 2^21; still inexact)
 //   FMUL  acc *= 1 + ulp-ish    (e^20 at most over one call)
 
+//   exact FADD  acc += 0.0      (raises nothing: FPSR stays as it was)
+
 struct FpOp {
     const char* label;
     bool        vec;       // 4×f32 vector, else f64 scalar
     bool        mul;
+    bool        exact = false;
 };
 static constexpr FpOp kFaddD{ "FADD f64",   false, false };
 static constexpr FpOp kFmulD{ "FMUL f64",   false, true  };
 static constexpr FpOp kFaddV{ "FADD v4f32", true,  false };
 static constexpr FpOp kFmulV{ "FMUL v4f32", true,  true  };
+static constexpr FpOp kFaddDExact{ "FADD f64 exact", false, false, true };
 
 static constexpr uint32_t kFpConst = 16;   // vr(16) = v24
 
@@ -228,8 +236,9 @@ static void fp_load(a64::Assembler& a, const FpOp& op, uint32_t reg, double f64v
 
 // Seeds chain registers 0..nregs-1 and the constant. Clobbers x9.
 static void fp_seed(a64::Assembler& a, const FpOp& op, uint32_t nregs) {
-    if (op.mul) fp_load(a, op, kFpConst, 1.0000001, 1.0000001f);
-    else        fp_load(a, op, kFpConst, 0.1, 0.1f);
+    if (op.mul)        fp_load(a, op, kFpConst, 1.0000001, 1.0000001f);
+    else if (op.exact) fp_load(a, op, kFpConst, 0.0, 0.0f);
+    else               fp_load(a, op, kFpConst, 0.1, 0.1f);
     for (uint32_t i = 0; i < nregs; ++i) fp_load(a, op, i, 1.5, 1.5f);
 }
 
@@ -393,11 +402,156 @@ static void run_fpcr_in_fp_code_tests(const BenchmarkParams& base) {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Section 3: MRS FPSR / MSR FPSR
+// ════════════════════════════════════════════════════════════════════════════
+//
+// FPSR holds the cumulative exception flags, which every FP instruction may
+// set. A core either renames the flags like NZCV or merges them at
+// retirement; in the second case MRS FPSR has to wait for every FP op ahead
+// of it to retire, and MSR FPSR (clearing the flags) has to be ordered
+// against them too. The interleaved rows show what that does to the FP code:
+// the ops are inexact, so each one raises IXC, and after a clear the next op
+// sets a flag that was not set before. The "exact" rows repeat the clear
+// with operations that raise nothing (acc + 0.0), to tell "the write is
+// slow" from "raising a flag that was clear is slow".
+//
+// The round-trip rows put FPSR on a real dependency chain. One trip is
+//     AND x3, x0, x5 (= 0) ; ADD x3, x3, x4 (= bits of 1.5) ; FMOV d1, x3 ;
+//     FADD d0, d1, d24 ; <x0 from the FADD>
+// where the last step is FMOV x0, d0 in the reference row and MRS x0, FPSR in
+// the FPSR rows (the AND discards the value; only the dependency matters).
+// FPSR row − reference row is what reading the flags of an FP op costs over
+// reading its result. The third row clears FPSR before each FADD: the
+// per-instruction "clear; op; read flags" pattern.
+//
+// M5: MRS FPSR is one per 10 clk (MRS FPCR: one per clk) but, like an
+// unchanged FPCR write, does not hold up FP ops around it: no cost at one
+// read per 16 chained or 64 independent FADDs. Clearing is 12 clk, and the
+// write is not the expensive part: with exact ops a clear every 64 is free,
+// with inexact ops it costs 41 clk (chain) to 65–75 clk (16 chains). The
+// first operation that raises a flag which is currently clear pays a
+// pipeline flush. On the chain, flags cost 10.7 clk more than the result
+// (25.2 vs 14.5 per trip), and clear; op; read is 57.8 clk per trip.
+
+static void run_fpsr_interleave(const BenchmarkParams& base, const FpOp& op, uint32_t chains,
+                                bool mrs, bool msr)
+{
+    run_interleaved(base, op, chains, 0, "no FPSR access", 0, [](a64::Assembler&, uint32_t) {});
+    if (mrs)
+        for (const uint32_t n : kEvery)
+            run_interleaved(base, op, chains, n, "MRS FPSR", 0,
+                [](a64::Assembler& a, uint32_t) { mrs_fpsr(a, x1); });
+    if (msr)
+        for (const uint32_t n : kEvery)
+            run_interleaved(base, op, chains, n, "MSR FPSR", 0,
+                [](a64::Assembler& a, uint32_t) { msr_fpsr(a, xzr); });
+    if (mrs && msr)
+        for (const uint32_t n : kEvery)
+            run_interleaved(base, op, chains, n, "MRS+MSR FPSR", 0,
+                [](a64::Assembler& a, uint32_t) { mrs_fpsr(a, x1); msr_fpsr(a, xzr); });
+}
+
+enum class FpsrTrip { FmovRef, Mrs, ClearThenMrs };
+
+static void run_fpsr_round_trip(const BenchmarkParams& base, const char* name, FpsrTrip t) {
+    const uint32_t unroll = 8;
+    const uint64_t loops  = scale_loops(kSysregLoops);
+    auto fn = build_fpenv_loop(loops, unroll,
+        [](a64::Assembler& a) {
+            fp_seed(a, kFaddD, 1);
+            uint64_t bits;
+            const double v = 1.5;
+            memcpy(&bits, &v, sizeof(bits));
+            a.mov(x4, Imm(bits));
+            a.mov(x5, Imm(0));
+            a.mov(x0, Imm(0));
+        },
+        [=](a64::Assembler& a, uint32_t) {
+            if (t == FpsrTrip::ClearThenMrs) msr_fpsr(a, xzr);
+            a.and_(x3, x0, x5);
+            a.add(x3, x3, x4);
+            a.fmov(d1, x3);
+            a.fadd(d0, d1, vr(kFpConst).d());
+            if (t == FpsrTrip::FmovRef) a.fmov(x0, d0);
+            else                        mrs_fpsr(a, x0);
+        });
+    run_one(name, fn, params_for(base, loops, unroll));
+}
+
+static void run_fpsr_tests(const BenchmarkParams& base) {
+    section("FPSR read / write (MRS FPSR, MSR FPSR)");
+    printf("  clk per MRS or MSR unless the row says otherwise. MSR FPSR writes xzr\n"
+           "  (clears the cumulative flags) except in the toggle row (0 / IXC).\n\n");
+
+    const uint64_t loops  = scale_loops(kSysregLoops);
+    const uint32_t unroll = kSysregUnroll;
+
+    {
+        auto fn = build_fpenv_loop(loops, unroll, no_setup,
+            [](a64::Assembler& a, uint32_t u) { mrs_fpsr(a, xr(u % 8)); });
+        run_one("MRS FPSR tput", fn, params_for(base, loops, unroll));
+    }
+    {
+        auto fn = build_fpenv_loop(loops, unroll,
+            [](a64::Assembler& a) { a.mov(x0, Imm(0)); },
+            [](a64::Assembler& a, uint32_t) {
+                mrs_fpsr(a, x1);
+                a.add(x0, x0, x1);
+            });
+        run_one("MRS FPSR + ADD chain (per pair)", fn, params_for(base, loops, unroll));
+    }
+    {
+        auto fn = build_fpenv_loop(loops, unroll, no_setup,
+            [](a64::Assembler& a, uint32_t) { msr_fpsr(a, xzr); });
+        run_one("MSR FPSR tput, xzr (clear)", fn, params_for(base, loops, unroll));
+    }
+    {
+        auto fn = build_fpenv_loop(loops, unroll,
+            [](a64::Assembler& a) { a.mov(x1, Imm(kFpsrIXC)); },
+            [](a64::Assembler& a, uint32_t u) { msr_fpsr(a, (u & 1) ? xzr : x1); });
+        run_one("MSR FPSR tput, toggle IXC", fn, params_for(base, loops, unroll));
+    }
+    {
+        auto fn = build_fpenv_loop(loops, unroll, no_setup,
+            [](a64::Assembler& a, uint32_t) {
+                mrs_fpsr(a, x0);
+                msr_fpsr(a, x0);
+            });
+        run_one("MRS->MSR FPSR chain (per round trip)", fn, params_for(base, loops, unroll));
+    }
+    {
+        auto fn = build_fpenv_loop(loops, unroll, no_setup,
+            [](a64::Assembler& a, uint32_t u) {
+                msr_fpsr(a, xzr);
+                mrs_fpsr(a, xr(u % 8));
+            });
+        run_one("MSR FPSR,xzr; MRS FPSR (per pair)", fn, params_for(base, loops, unroll));
+    }
+
+    printf("\n  clk per FP operation, with an FPSR access after every N of them, as in the\n"
+           "  FPCR section. The FP ops are inexact (each raises IXC) except in the\n"
+           "  \"exact\" rows, which raise nothing.\n\n");
+    for (const uint32_t chains : { 1u, 16u }) {
+        run_fpsr_interleave(base, kFaddD, chains, true, true);
+        run_fpsr_interleave(base, kFaddV, chains, true, true);
+        run_fpsr_interleave(base, kFaddDExact, chains, false, true);
+    }
+
+    printf("\n  FPSR on a dependency chain, clk per trip: x -> FMOV -> FADD f64 -> x, the\n"
+           "  last step FMOV x,d (ref) or MRS FPSR. FPSR row - ref = reading an FP op's\n"
+           "  flags instead of its result.\n\n");
+    run_fpsr_round_trip(base, "x->FMOV->FADD->FMOV->x (per trip, ref)",  FpsrTrip::FmovRef);
+    run_fpsr_round_trip(base, "x->FMOV->FADD->MRS FPSR->x (per trip)",   FpsrTrip::Mrs);
+    run_fpsr_round_trip(base, "MSR FPSR,xzr; x->FMOV->FADD->MRS FPSR->x", FpsrTrip::ClearThenMrs);
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 void run_fpenv_tests(const BenchmarkParams& base_params) {
     run_fpcr_access_tests(base_params);
     run_fpcr_in_fp_code_tests(base_params);
+    run_fpsr_tests(base_params);
 }
 
 } // namespace arm64bench::gen
