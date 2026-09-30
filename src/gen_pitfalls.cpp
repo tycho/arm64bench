@@ -93,6 +93,7 @@ using namespace asmjit::a64;
 
 // Forward declaration.
 static void run_store_forwarding_tests(const BenchmarkParams& base);
+static void run_stlf_chain_tests(const BenchmarkParams& base);
 static void run_barrier_tests(const BenchmarkParams& base);
 static void run_nontemporal_tests(const BenchmarkParams& base, void* buf, size_t bufsz);
 static void run_misaligned_tests(const BenchmarkParams& base, void* buf);
@@ -158,7 +159,10 @@ static JitPool::TestFn build_stl_forward(uint64_t loops, uint32_t unroll,
 static void run_store_forwarding_tests(const BenchmarkParams& base) {
     section("Store-to-load forwarding");
     printf("  clk/insn = latency of one STORE+LOAD pair (unroll=8).\n"
-           "  M1 penalty for mismatch: ~+8–12 clk vs matched case.\n\n");
+           "  M1 penalty for mismatch: ~+8–12 clk vs matched case.\n"
+           "  These chains carry a constant value: a row near or under 1 clk is\n"
+           "  load value prediction, not a forward. The stlf rows below are the\n"
+           "  ones to read for latency.\n\n");
 
     // Loop counts: forwarding latency ≈ 4–16 cycles → target ~100ms.
     // At 15 cyc × (1/3.2 GHz) × 8 unroll = ~37.5ns/iter → 100ms/37.5ns ≈ 2.7M.
@@ -217,6 +221,135 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
                                     c.load_offset);
         snprintf(name, sizeof(name), "%-46s", c.label);
         run_one(name, fn, params_for(base, loops, unroll));
+    }
+
+    run_stlf_chain_tests(base);
+}
+
+// ── Changing-value chains ─────────────────────────────────────────────────────
+//
+// The chains above carry a constant: x0 is stored, loaded back, stored again.
+// A core that predicts load values does not wait for such a load, and the row
+// then reads about one cycle per pair or less, which is not a store→load
+// latency. On Apple M5 that is six of the seven rows above; the seventh
+// (STR x → LDR x) only escapes because its constant is wider than the 36 bits
+// the predictor holds, and reads 1.2 clk with the value 1.
+//
+// The rows below put one EOR on the chain and run every shape twice with
+// identical code:
+//
+//     <store> ; <load>
+//     add  x1, x1, x20        ; off the chain: a Weyl counter
+//     eor  x0, x0, x1         ; on the chain: +1 clk
+//
+//   var    x20 = 0x9E3779B97F4A7C15 and x0 starts wide, so no two links store
+//          the same value and neither a last-value nor a stride predictor
+//          can guess the next one
+//   const  x20 = 0 and x0 = 1: the value never changes and is as easy to
+//          predict as a value gets
+//
+// "var" is the latency of the shape plus the EOR (the "(no memory)" row is the
+// EOR alone). "const" far below "var" means the dependency through memory was
+// broken for a repeating value; "const" equal to "var" means the load waited
+// (or, where both are near the EOR alone, that the load was renamed to the
+// store's data register, which does not depend on the value: M5 does that for
+// STR x → LDR x). Only the data differs between the two.
+//
+// The slot is the 16-byte scratch area at sp (16-byte aligned, so no access
+// crosses a line) and is zeroed in setup: a load wider than the store reads
+// defined bytes.
+
+enum class Value { Const, Var };
+
+constexpr uint64_t kWeylStep = 0x9E3779B97F4A7C15ULL;
+
+using LinkEmitter = void (*)(a64::Assembler&);
+
+struct StlfCase {
+    const char* shape;      // ASCII, at most 36 bytes: the name is 48 wide
+    LinkEmitter link;
+};
+
+// x0 → link → x0, then the counter and the EOR.
+static JitPool::TestFn build_stlf_chain(uint64_t loops, uint32_t unroll,
+                                        Value mode, LinkEmitter link) {
+    return build_loop(loops, unroll,
+        [mode](a64::Assembler& a) {
+            a.mov(x9, sp);
+            a.stp(xzr, xzr, ptr(x9));
+            a.mov(x0, Imm(mode == Value::Const ? 1 : 0x0102030405060708ULL));
+            a.mov(x1, Imm(0));
+            a.mov(x20, Imm(mode == Value::Var ? kWeylStep : 0));
+        },
+        [link](a64::Assembler& a, uint32_t) {
+            link(a);
+            a.add(x1, x1, x20);
+            a.eor(x0, x0, x1);
+        },
+        /*scratch_bytes=*/16);
+}
+
+static void run_stlf_cases(const BenchmarkParams& base, uint64_t loops,
+                           uint32_t unroll, std::span<const StlfCase> cases) {
+    static constexpr struct { Value mode; const char* tag; } kModes[] = {
+        { Value::Const, "const" }, { Value::Var, "var" },
+    };
+    char name[80];
+    for (const auto& c : cases) {
+        for (const auto& m : kModes) {
+            auto fn = build_stlf_chain(loops, unroll, m.mode, c.link);
+            snprintf(name, sizeof(name), "stlf %-36s %s", c.shape, m.tag);
+            run_one(name, fn, params_for(base, loops, unroll));
+        }
+    }
+}
+
+static void run_stlf_chain_tests(const BenchmarkParams& base) {
+    using A = a64::Assembler;
+
+    const uint64_t loops  = scale_loops(1'500'000);
+    const uint32_t unroll = 8;
+
+    printf("\n  Changing-value chains (--filter stlf). A constant chain, as above,\n"
+           "  can be short-circuited by load value prediction. Here each link is\n"
+           "  the shape, an off-chain counter ADD and one EOR with the counter on\n"
+           "  the chain: clk = latency of the shape + 1 for the EOR, the loaded\n"
+           "  value consumed by an ALU op.\n"
+           "    var    the counter steps by an odd 64-bit constant: no two links\n"
+           "           store the same value. This is the latency.\n"
+           "    const  the same code with a step of 0 and the value 1\n"
+           "  const far below var: the dependency through memory was broken for a\n"
+           "  repeating value. Both near the EOR alone: the load was renamed to\n"
+           "  the store's data (zero-cycle load), whatever the value.\n");
+
+    printf("\n  The scalar shapes above:\n\n");
+    static const StlfCase scalar[] = {
+        { "EOR x (no memory)",    [](A&) {} },
+        { "STR x -> LDR x",       [](A& a) { a.str (x0, ptr(x9)); a.ldr (x0, ptr(x9)); } },
+        { "STR w -> LDR w",       [](A& a) { a.str (w0, ptr(x9)); a.ldr (w0, ptr(x9)); } },
+        { "STR x -> LDR w",       [](A& a) { a.str (x0, ptr(x9)); a.ldr (w0, ptr(x9)); } },
+        { "STR x -> LDR w [+4]",  [](A& a) { a.str (x0, ptr(x9)); a.ldr (w0, ptr(x9, 4)); } },
+        { "STR w -> LDR x",       [](A& a) { a.str (w0, ptr(x9)); a.ldr (x0, ptr(x9)); } },
+        { "STR x -> LDRB",        [](A& a) { a.str (x0, ptr(x9)); a.ldrb(w0, ptr(x9)); } },
+        { "STRB -> LDRB",         [](A& a) { a.strb(w0, ptr(x9)); a.ldrb(w0, ptr(x9)); } },
+    };
+    run_stlf_cases(base, loops, unroll, scalar);
+
+    // The x86-TSO scheme of section 6b: does an ordered load or store still
+    // get what the plain matched pair gets?
+    printf("\n  Matched 64-bit pair with ordered forms (x86-TSO scheme):\n\n");
+    static const StlfCase stlr[] = {
+        { "STLR x -> LDR x",      [](A& a) { a.stlr(x0, ptr(x9)); a.ldr  (x0, ptr(x9)); } },
+    };
+    run_stlf_cases(base, loops, unroll, stlr);
+    if (cpu_has(CpuFeature::LRCPC)) {
+        static const StlfCase ldapr[] = {
+            { "STR x -> LDAPR x",  [](A& a) { a.str (x0, ptr(x9)); a.ldapr(x0, ptr(x9)); } },
+            { "STLR x -> LDAPR x", [](A& a) { a.stlr(x0, ptr(x9)); a.ldapr(x0, ptr(x9)); } },
+        };
+        run_stlf_cases(base, loops, unroll, ldapr);
+    } else {
+        skip_feature(CpuFeature::LRCPC, "LDAPR rows");
     }
 }
 
