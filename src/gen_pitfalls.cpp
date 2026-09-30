@@ -226,7 +226,7 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
     run_stlf_chain_tests(base);
 }
 
-// ── Changing-value chains ─────────────────────────────────────────────────────
+// ── Changing-value chains, wider loads, vector registers ─────────────────────
 //
 // The chains above carry a constant: x0 is stored, loaded back, stored again.
 // A core that predicts load values does not wait for such a load, and the row
@@ -238,7 +238,7 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
 // The rows below put one EOR on the chain and run every shape twice with
 // identical code:
 //
-//     <store> ; <load>
+//     <store(s)> ; <load> [; transfer back to x0]
 //     add  x1, x1, x20        ; off the chain: a Weyl counter
 //     eor  x0, x0, x1         ; on the chain: +1 clk
 //
@@ -254,6 +254,18 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
 // (or, where both are near the EOR alone, that the load was renamed to the
 // store's data register, which does not depend on the value: M5 does that for
 // STR x → LDR x). Only the data differs between the two.
+//
+// The shapes beyond the scalar ones are those a translator produces when it
+// moves guest vector values through a scratch slot: QEMU's x86 front end loads
+// a 128-bit guest operand into two general registers, stores both to a slot in
+// env and reloads the slot as a vector (STR x, STR x → LDR q), and spills a
+// vector with STR q before reading the halves back with LDR x. In those the
+// load is wider than the store (or stores) it reads from, or crosses between
+// the integer and SIMD&FP register files.
+//
+// Rows that end in the SIMD&FP file come back through FMOV x,d so the chain
+// closes in x0; the "(no memory)" register-only rows give the cost of those
+// transfers (which on M5 is most of the row).
 //
 // The slot is the 16-byte scratch area at sp (16-byte aligned, so no access
 // crosses a line) and is zeroed in setup: a load wider than the store reads
@@ -351,6 +363,65 @@ static void run_stlf_chain_tests(const BenchmarkParams& base) {
     } else {
         skip_feature(CpuFeature::LRCPC, "LDAPR rows");
     }
+
+    printf("\n  Register-only transfers, for reference:\n\n");
+    static const StlfCase transfers[] = {
+        { "FMOV d,x; FMOV x,d (no memory)",
+          [](A& a) { a.fmov(d0, x0); a.fmov(x0, d0); } },
+        { "FMOV d,x; INS d[1],x; FMOV x,d",
+          [](A& a) { a.fmov(d0, x0); a.ins(v0.d(1), x0); a.fmov(x0, d0); } },
+        { "DUP 2d,x; UMOV x,d[1] (no memory)",
+          [](A& a) { a.dup(v0.d2(), x0); a.umov(x0, v0.d(1)); } },
+    };
+    run_stlf_cases(base, loops, unroll, transfers);
+
+    printf("\n  General store(s), vector load (wider than the store, or LD1R):\n\n");
+    static const StlfCase wide[] = {
+        { "STR x, STR x -> LDR q; FMOV x,d",
+          [](A& a) { a.str(x0, ptr(x9)); a.str(x0, ptr(x9, 8));
+                     a.ldr(q0, ptr(x9)); a.fmov(x0, d0); } },
+        { "STP x,x -> LDR q; FMOV x,d",
+          [](A& a) { a.stp(x0, x0, ptr(x9));
+                     a.ldr(q0, ptr(x9)); a.fmov(x0, d0); } },
+        { "STR x -> LDR q; FMOV x,d",
+          [](A& a) { a.str(x0, ptr(x9));
+                     a.ldr(q0, ptr(x9)); a.fmov(x0, d0); } },
+        { "STR w -> LDR q; FMOV x,d",
+          [](A& a) { a.str(w0, ptr(x9));
+                     a.ldr(q0, ptr(x9)); a.fmov(x0, d0); } },
+        { "STR w -> LD1R 4s; FMOV x,d",
+          [](A& a) { a.str(w0, ptr(x9));
+                     a.ld1r(v0.s4(), ptr(x9)); a.fmov(x0, d0); } },
+        { "STR x -> LD1R 2d; FMOV x,d",
+          [](A& a) { a.str(x0, ptr(x9));
+                     a.ld1r(v0.d2(), ptr(x9)); a.fmov(x0, d0); } },
+    };
+    run_stlf_cases(base, loops, unroll, wide);
+
+    printf("\n  Vector store, general load of a half; vector store and load:\n\n");
+    static const StlfCase vec_store[] = {
+        { "FMOV d,x; STR q -> LDR x",
+          [](A& a) { a.fmov(d0, x0); a.str(q0, ptr(x9)); a.ldr(x0, ptr(x9)); } },
+        { "DUP 2d,x; STR q -> LDR x [+8]",
+          [](A& a) { a.dup(v0.d2(), x0); a.str(q0, ptr(x9)); a.ldr(x0, ptr(x9, 8)); } },
+        { "FMOV d,x; STR q -> LDR q; FMOV x,d",
+          [](A& a) { a.fmov(d0, x0); a.str(q0, ptr(x9));
+                     a.ldr(q1, ptr(x9)); a.fmov(x0, d1); } },
+    };
+    run_stlf_cases(base, loops, unroll, vec_store);
+
+    printf("\n  Same size, other register file:\n\n");
+    static const StlfCase cross[] = {
+        { "FMOV d,x; STR d -> LDR x",
+          [](A& a) { a.fmov(d0, x0); a.str(d0, ptr(x9)); a.ldr(x0, ptr(x9)); } },
+        { "STR x -> LDR d; FMOV x,d",
+          [](A& a) { a.str(x0, ptr(x9)); a.ldr(d0, ptr(x9)); a.fmov(x0, d0); } },
+        // Both directions through memory, no FMOV: two forwards per link.
+        { "STR x -> LDR d; STR d -> LDR x",
+          [](A& a) { a.str(x0, ptr(x9));    a.ldr(d0, ptr(x9));
+                     a.str(d0, ptr(x9, 8)); a.ldr(x0, ptr(x9, 8)); } },
+    };
+    run_stlf_cases(base, loops, unroll, cross);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
