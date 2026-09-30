@@ -173,7 +173,9 @@ struct BenchmarkResult {
     double      min_ns_per_insn;
     double      median_ns_per_insn;
 
-    // Coefficient of variation (std_dev / mean * 100) across retained samples.
+    // Coefficient of variation (std_dev / mean * 100) across retained samples:
+    // of the PMU cycle counts when cycle_source is PMU, of the wall times
+    // otherwise (wall time also varies with the clock, cycle counts do not).
     // Low CoV = stable, reproducible measurement.
     // High CoV = noisy; consider increasing num_samples or num_warmup.
     double      coeff_variation_pct;

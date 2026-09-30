@@ -215,7 +215,11 @@ int main(int argc, char** argv) {
         printf("CPU cycle source: %s (unused in smoke mode)\n\n",
                pmu_ok ? "hardware PMU available" : "hardware PMU unavailable");
     } else if (pmu_ok) {
-        printf("CPU cycle source: hardware PMU (Tier 1 — P-state immune)\n\n");
+        printf("CPU cycle source: hardware PMU (Tier 1 — P-state immune)\n");
+        if (arm64bench::thread_prefers_efficiency())
+            printf("  Note: the efficiency cluster's clock is not steady at background QoS;\n"
+                   "  the ns columns follow it, clk and CoV do not.\n");
+        printf("\n");
     } else {
         printf("CPU cycle source: ratio normalization vs ADD reference"
                " (Tier 2 — drift-resistant)\n");

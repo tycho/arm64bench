@@ -239,7 +239,7 @@ section; use the shared pieces:
 5. Tick-aligned sampling (`wait_for_tick()`) before each measurement
 6. 20ms inter-sample sleep for scheduler stability
 7. Discard slowest sample(s) to remove outlier preemptions
-8. Report min/median ns/insn, CV%, cycles/insn (direct from PMU if available, else ratio-normalized or derived from calibrated frequency)
+8. Report min/median ns/insn, cycles/insn (direct from PMU if available, else ratio-normalized or derived from calibrated frequency), and CoV% with a `!` above 5 %: the spread of the PMU cycle counts when the PMU is the cycle source, of the wall times otherwise
 
 Console output cycle source indicators: `clk ` = PMU hardware, `clk~` = Tier 2 ratio, `clk*` = calibrated frequency, `clk?` = unknown.
 
@@ -362,9 +362,10 @@ timed call on 2026-09-30):
   `sudo` for PMU cycle counts. Under `sudo` the clk column is sound: chained ADD 1.005, two
   chains 0.503, three 0.352, then a 0.259–0.264 plateau from four chains up (about 4 ADDs per
   clk, register and immediate forms alike, against 0.21 / 0.14 on the P-core), MADD 1.006
-  through the accumulator and 3.022 through the multiplier. The ns column and the CoV computed
-  from it still follow the clock (0.12 to 0.23 ns on rows whose clk agrees to 1 %), so the `!`
-  flag means nothing on such a run.
+  through the accumulator and 3.022 through the multiplier. The ns columns still follow the
+  clock (0.12 to 0.23 ns on rows whose clk agrees to 1 %). CoV used to be computed from them
+  and flagged eight of those rows; with the PMU as the cycle source it is now the spread of the
+  cycle counts.
 - **Per-sample mini warm-up** (step 4 above): one untimed call to the test function immediately
   before each timed measurement re-primes L1 after a migration between samples. P-cores share
   L2, so a P→P move costs only L1. This is why warm-up must happen *per sample*, not only at

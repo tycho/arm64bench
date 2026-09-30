@@ -485,10 +485,21 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
     // Minimum cycle count (PMU): per-thread counts are immune to migration, so
     // we take the global minimum across all samples.
     uint64_t min_cycles = UINT64_MAX;
+    // Spread of the cycle samples, same discard rule as the wall times;
+    // negative when any sample has no count.
+    double cyc_cov_pct = -1.0;
     if (use_pmu) {
-        for (uint32_t s = 0; s < num_samples; ++s)
-            if (sample_cyc[s] > 0 && sample_cyc[s] < min_cycles)
+        double cyc[kMaxSamples];
+        bool   all_counted = true;
+        for (uint32_t s = 0; s < num_samples; ++s) {
+            cyc[s] = static_cast<double>(sample_cyc[s]);
+            if (sample_cyc[s] == 0)
+                all_counted = false;
+            else if (sample_cyc[s] < min_cycles)
                 min_cycles = sample_cyc[s];
+        }
+        if (all_counted)
+            cyc_cov_pct = compute_stats(cyc, num_samples, discard_highest).coeff_variation_pct;
     }
 
     // Tier 2 ratio: fastest test sample over fastest reference probe.
@@ -516,6 +527,15 @@ BenchmarkResult benchmark(TestFn fn, const char* name, const BenchmarkParams& pa
         // Tier 1: direct PMU measurement — P-state immune.
         result.min_clocks_per_insn = static_cast<double>(min_cycles) * inv_insns;
         result.cycle_source        = CycleSource::PMU;
+
+        // CoV and the noisy flag then describe the cycle samples, since that
+        // is the number reported. Wall time also moves with the clock: on a
+        // macOS efficiency-cluster run, rows whose cycle counts agreed to
+        // 1 % had wall times from 0.12 to 0.23 ns and were flagged noisy.
+        if (cyc_cov_pct >= 0.0) {
+            result.coeff_variation_pct = cyc_cov_pct;
+            result.noisy               = (cyc_cov_pct > params.noise_threshold_pct);
+        }
     } else if (use_ref && min_ratio > 0.0) {
         // Tier 2: ratio normalization vs 1-cycle reference — drift-resistant.
         result.min_clocks_per_insn = min_ratio;
