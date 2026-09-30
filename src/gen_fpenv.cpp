@@ -98,6 +98,8 @@ static uint64_t read_fpcr() {
 // M5: MRS 1 per clk; MSR of the value already there 11 clk (zero or not);
 // MSR of any different value 34 clk, whichever bit changes, which is what
 // an ISB costs on this core. The check idiom is 1 clk.
+// Oryon (X2, 5 GHz core): MRS 1.25, unchanged 9.0, changed 24.6 (ISB 20.3),
+// check 1.25. Same two-level shape.
 
 static constexpr uint64_t kSysregLoops  = 1'000'000;
 static constexpr uint32_t kSysregUnroll = 16;
@@ -328,6 +330,8 @@ static constexpr uint32_t kEvery[] = { 1, 4, 16, 64 };
 // FP ops issuing around it: 16 chains with one every 64 FADDs, or one chain
 // with one every 16, read the same as with none, and a "same" bracket
 // around 16 chained FADDs costs 0.6 clk.
+// Oryon (X2): 31.5–34 clk per changing write, 56–62 clk per bracket; an
+// unchanged write is free on a chain from N = 4.
 
 static void run_fpcr_interleave(const BenchmarkParams& base, const FpOp& op, uint32_t chains) {
     run_interleaved(base, op, chains, 0, "no MSR", 0, [](a64::Assembler&, uint32_t) {});
@@ -434,6 +438,10 @@ static void run_fpcr_in_fp_code_tests(const BenchmarkParams& base) {
 // first operation that raises a flag which is currently clear pays a
 // pipeline flush. On the chain, flags cost 10.7 clk more than the result
 // (25.2 vs 14.5 per trip), and clear; op; read is 57.8 clk per trip.
+// Oryon (X2): MRS 9.0, clear 9.0; a clear ahead of inexact ops costs
+// 31.5–34 clk, to the digit what a changing FPCR write costs there, and
+// nothing ahead of exact ops; flags 8 clk after the result (20.0 vs 12.0),
+// clear; op; read 48.0.
 
 static void run_fpsr_interleave(const BenchmarkParams& base, const FpOp& op, uint32_t chains,
                                 bool mrs, bool msr)
@@ -590,6 +598,7 @@ static void run_fpsr_tests(const BenchmarkParams& base) {
 // M5: no denormal penalty in any mode. The only movement is FMUL reading
 // 3.06 clk instead of 3.00 when denormals are in play (default mode) and
 // always under AH; FADD and FMLA read the same in every row.
+// Oryon (X2): FADD 3.000, FMUL 4.000, FMLA 3.000, tput 0.250 in all 110 rows.
 
 struct FpMode { const char* tag; uint64_t bits; bool afp; };
 static constexpr FpMode kFpModes[] = {
@@ -752,6 +761,8 @@ static void run_denormal_tests(const BenchmarkParams& base) {
 // 2.0 -> 13.0 clk, FCVT 0.25 -> 3.0, SCVTF 0.34 -> 3.0, against 2.0 per
 // pair for op + INS (the chain is then the INS alone). FMAX/FMIN 1.6 clk
 // with and without AH.
+// Oryon (X2): the same picture: FADD 3.0 either way (5.0 with INS), FSQRT
+// 2.0 -> 13.0, SCVTF 0.5 -> 3.0, FCVT 0.25 -> 3.0, op + INS 2.0; FMAX/FMIN 2.0.
 
 enum class MergeOp  { Fadd, Fsqrt, Scvtf, Fcvt };
 enum class MergeHow { Plain, Nep, Ins };

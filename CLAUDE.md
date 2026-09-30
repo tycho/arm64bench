@@ -522,6 +522,56 @@ prefetcher that learns which lines of a fixed-size region were touched and repla
 on the next region does, because only a stride that divides the region size produces the same
 pattern in every region. Sweeps that only try powers of two would call this prefetcher perfect.
 
+### FP environment: FPCR / FPSR cost (gen_fpenv.cpp)
+
+Written for a translator that wants guest MXCSR in the host FPCR (RMode, FZ, and with FEAT_AFP
+FIZ/AH/NEP) and guest exception flags from FPSR. M5 (Tier 2) and Oryon X2 Prime (Tier 1, run
+under WSL2 on 2026-09-29) agree on the shape, which is not "FPCR is renamed":
+
+| clk (ns) | M5 | X2 |
+|---|---|---|
+| MRS FPCR | 1.0 (0.22) | 1.25 (0.25) |
+| MSR FPCR, value unchanged | 11.0 (2.5) | 9.0 (1.8) |
+| MSR FPCR, any bit changed (FZ, RMode, FIZ, AH, NEP alike) | 34.2 (7.7) | 24.6 (5.0) |
+| ISB, for scale | 34.0 | 20.3 |
+| Cost to surrounding FP code per changing write (chain / 16 chains) | 32–36 | 31.5–34 |
+| Bracket `MSR guest; k FP ops; MSR host`, over the k ops | 66–71 (15–16) | 56–62 (11–12.5) |
+| MRS FPSR | 10.0 (2.2) | 9.0 (1.8) |
+| MSR FPSR, xzr | 12.0 (2.7) | 9.0 (1.8) |
+| Cost of a clear ahead of inexact FP ops (chain / 16 chains) | 41 / 72 | 31.5 / 34 |
+| … ahead of exact FP ops | 0 | 0–0.6 |
+| FADD flags via MRS FPSR vs FADD result via FMOV (chain) | +10.7 | +8.0 |
+| `MSR FPSR,xzr; FADD; MRS FPSR` per trip, over the FMOV chain | +43 | +36 |
+| Denormal operand or result, any of default / FZ / FIZ / AH / AH+FZ+FIZ | none (FMUL +0.06) | none |
+
+- **A write that does not change FPCR is a different thing from one that does.** Unchanged: one
+  per 9–11 clk, and FP ops keep issuing around it (no cost at one write per 16 chained or 64
+  independent FADDs). Changed: ISB-class (M5: equal to its ISB; X2: 4 clk more), and the FP code
+  around it loses that much. A test that only rewrites the current value reports a third of
+  the real cost. The cheapest scheme by far is
+  `MRS; CMP; B.EQ` over the MSR (1.0–1.25 clk when the value already matches).
+- **MRS FPSR is 7–10× MRS FPCR** but does not stall FP code either.
+- **The expensive FPSR event is not the clear, it is the first FP op after it that raises a flag.**
+  Exact ops after a clear cost nothing; inexact ones cost a flush (on Oryon exactly the
+  changed-FPCR number). Sticky flags that are already set are free, so "leave FPSR alone and
+  read it late" is cheap and "clear; op; read" per instruction is 48–58 clk per trip. Any test of FPSR
+  access needs operands that actually raise flags: `acc += 1.0` on doubles is exact for 2^53
+  iterations and would have shown the clear as free.
+- **No denormal penalty on either core**, so FZ/FIZ buy nothing in speed. M5 FMUL reads 3.06
+  instead of 3.00 clk with denormals present and always under AH; everything else is identical.
+- **NEP** (scalar ops merge into the destination, as x86 scalar SSE) is free for two-operand
+  arithmetic (the merge source is the first operand) and turns FSQRT/FCVT/SCVTF's rate into
+  their latency (the destination becomes an input, the same false dependency x86 has):
+  FSQRT 2 → 13 clk, FCVT 0.25 → 3, SCVTF 0.33–0.5 → 3 on both cores. Op into a scratch
+  register + `INS v.d[0]` chains through the INS alone (2 clk) but costs 3 clk on top of a
+  FADD chain. AH does not change FMAX/FMIN speed.
+- Semantics seen on M5 while building the operands (not measured for speed): with AH=1 FPSR.IDC
+  is set by a denormal operand that is not flushed (x86 DE); AH+FZ flushes an exact denormal
+  result (D+D) to zero and raises UFC|IXC; FIZ flushes inputs without raising IDC.
+- The X2 numbers come from a Hyper-V guest (WSL2) pinned to one vCPU; every row ran at
+  0.200–0.203 ns per clk, i.e. on a 5 GHz Prime core. The M5 run was unprivileged (Tier 2);
+  `sudo ./arm64bench --fpenv` gives the PMU version.
+
 ### AsmJit API notes
 
 - `Gp` not `GpX` for general-purpose register arguments in helper functions
@@ -545,6 +595,8 @@ pattern in every region. Sweeps that only try powers of two would call this pref
   ptr_vl(x20, k))` / `st1w(z0.s(), p0, ptr_vl(...))` / `ldr(z0, ptr_vl(...))`; `whilelt(p1.s(), w2, w3)`;
   `rdvl(x0, 1)`; `smstart_sm()`/`smstop_sm()`. Every encoding checked so far matched the ARM ARM.
 - `MSR DIT, #imm` = `0xD503405F | (imm << 8)` if ever needed (FEAT_DIT; no effect seen on M5)
+- System registers: `a.mrs(x0, Imm(Predicate::SysReg::kFPCR))`, `a.msr(Imm(Predicate::SysReg::kFPSR), x0)`
+  (`xzr` works as the source); element insert `a.ins(v0.d(0), v2.d(0))`; scalar views `vr(i).d()` / `.s()`
 - AESE/AESMC: `.b16()` element type
 - PMULL poly64: `.q()` result, `.d()` inputs
 - SHA256H: `.q()` first two args, `.s4()` third
@@ -586,6 +638,7 @@ pattern in every region. Sweeps that only try powers of two would call this pref
 | **FP width conversions** | `gen_fp_simd.cpp §8` | FCVTL/FCVTN (f16↔f32, f32↔f64, low and high halves) and scalar FCVT all 3 clk latency, 4 per clk; FCVTN2's destination merge is free |
 | **Core-to-core** | `gen_c2c.cpp` | Unpinned (QoS-placed) on M5: P↔P round trip ≈ 104 ns (~52 ns one way), P↔E ≈ 320 ns; identical for LDAR/STLR, LDR/STR, 1-line and 2-line; LDADDAL 7 clk alone, ≈ 6.5–9 ns contended (CoV 20–40 %, arbitration is bursty). Pinned core matrices come from Linux/Windows |
 | **Prefetcher** | `gen_prefetch.cpp` | Power-of-two strides 64 B–32 KB and 192 B followed both directions across 16 KB pages (9–27 ns/load vs 88 ns random); 384 B, 768 B, 1536 B are NOT followed (46–76 ns), 512 B half-followed (28 ns): consistent with a short-stride detector up to ~256 B plus a spatial-pattern prefetcher that only matches when the stride tiles the region; PRFM honored, scales as latency/D: 45 ns at D=2, 12.8 at D=8, 5.1 at D=32 (= the MLP floor) |
+| **FP environment (FPCR/FPSR)** | `gen_fpenv.cpp` (`--fpenv`) | Tier 2: MRS FPCR 1.0 clk; MSR FPCR 11.0 unchanged, 34.2 changed (= ISB), costing surrounding FP code 32–36 clk; guest/host bracket 66–71 clk per trip; MRS FPSR 10.0, MSR FPSR 12.0; first flag raised after a clear costs a flush (41–72 clk), sticky flags free; clear+FADD+read 57.8 clk per trip; no denormal penalty under default/FZ/FIZ/AH (FMUL 3.06 vs 3.00); NEP free for FADD, FSQRT 2 → 13 / FCVT 0.25 → 3 / SCVTF 0.33 → 3 via the destination dependency. X2 numbers in "FP environment" above |
 | **SVE (streaming via SME)** | `gen_sve.cpp` | VL 512: FADD/FMLA/SDOT z.s 8.3 clk, 1 per 4.2 clk; ADD z.s 3.1 clk; LD1W 265 GB/s; ST1W/STR z/STNT1W 1.0 clk per 64 B store over a ≥16 KB window but 29–104 clk when rewriting one line (SIMD stores serialize in streaming mode, STR q too; scalar STR x immune); WHILELT/PTRUE 1 clk. Native SVE numbers (Neoverse N2) come from CI |
 
 ## Planned Test Coverage
