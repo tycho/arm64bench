@@ -346,7 +346,8 @@ static void run_fpcr_bracket(const BenchmarkParams& base, const char* guest, uin
                              uint32_t k, bool chained)
 {
     const uint32_t trips = k >= 16 ? 2 : 32 / k / 2;          // per iteration
-    uint64_t loops = scale_loops(kBracketTrips) / trips;
+    // The rows without writes are an order of magnitude faster per trip.
+    uint64_t loops = scale_loops(guest ? kBracketTrips : 4 * kBracketTrips) / trips;
     if (loops == 0) loops = 1;
     const uint32_t nregs = chained ? 1 : k;
 
@@ -630,7 +631,9 @@ static void run_denormal_row(const BenchmarkParams& base, const FpMode& mode,
                              const DenPattern& pat, bool vec)
 {
     const FpOp     kind{ "", vec, false };
-    const uint64_t loops = scale_loops(kDenLoops);
+    // Four ops per cycle on the fast path: the tput rows need more of them
+    // for a call to last a few milliseconds.
+    const uint64_t loops = scale_loops(pat.tput ? 4 * kDenLoops : kDenLoops);
 
     auto fn = build_fpenv_loop(loops, kDenUnroll,
         [&](a64::Assembler& a) {
@@ -754,7 +757,7 @@ enum class MergeOp  { Fadd, Fsqrt, Scvtf, Fcvt };
 enum class MergeHow { Plain, Nep, Ins };
 
 static void run_merge_row(const BenchmarkParams& base, MergeOp op, MergeHow how) {
-    const uint64_t loops  = scale_loops(kSysregLoops);
+    const uint64_t loops  = scale_loops(4 * kSysregLoops);    // FCVT runs at 4 per clk
     const uint32_t unroll = kSysregUnroll;
 
     auto fn = build_fpenv_loop(loops, unroll,
