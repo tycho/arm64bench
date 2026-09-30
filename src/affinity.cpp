@@ -94,7 +94,8 @@ void unpin_thread() {
         SetThreadAffinityMask(GetCurrentThread(), proc);
 }
 
-void set_thread_cluster_hint(bool) {}
+bool set_thread_cluster_hint(bool) { return false; }
+bool thread_prefers_efficiency() { return false; }
 
 // Windows publishes the core/cache relationships from the firmware's PPTT
 // table, with EfficiencyClass distinguishing big and little cores (higher
@@ -213,7 +214,8 @@ void unpin_thread() {
     pin_thread_to_cpus(ids, n);
 }
 
-void set_thread_cluster_hint(bool) {}
+bool set_thread_cluster_hint(bool) { return false; }
+bool thread_prefers_efficiency() { return false; }
 
 // sysfs: cache/indexN/{level,type,shared_cpu_list} for the L2 group,
 // cpu_capacity (the scheduler's relative capacity, 1024 = biggest core),
@@ -333,12 +335,24 @@ bool pin_thread_to_cpu(uint32_t) { return false; }
 bool pin_thread_to_cpus(const uint32_t*, uint32_t) { return false; }
 void unpin_thread() {}
 
-void set_thread_cluster_hint(bool efficiency) {
+bool set_thread_cluster_hint(bool efficiency) {
 #if defined(__APPLE__)
-    pthread_set_qos_class_self_np(efficiency ? QOS_CLASS_BACKGROUND
-                                             : QOS_CLASS_USER_INTERACTIVE, 0);
+    return pthread_set_qos_class_self_np(efficiency ? QOS_CLASS_BACKGROUND
+                                                    : QOS_CLASS_USER_INTERACTIVE, 0) == 0;
 #else
     (void)efficiency;
+    return false;
+#endif
+}
+
+bool thread_prefers_efficiency() {
+#if defined(__APPLE__)
+    qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+    int rel = 0;
+    return pthread_get_qos_class_np(pthread_self(), &qos, &rel) == 0 &&
+           qos == QOS_CLASS_BACKGROUND;
+#else
+    return false;
 #endif
 }
 

@@ -65,7 +65,13 @@ void unpin_thread();
 
 // Ask the scheduler to keep the calling thread on the performance cluster
 // (`efficiency == false`) or the efficiency cluster (`efficiency == true`).
-// macOS QoS classes; a no-op elsewhere.
-void set_thread_cluster_hint(bool efficiency);
+// macOS QoS classes; returns false elsewhere, and on macOS for a thread that
+// has ever called pthread_setschedparam(), which opts it out of QoS for good
+// (so: not for a thread that has been through PriorityGuard).
+bool set_thread_cluster_hint(bool efficiency);
+
+// True when the calling thread was sent to the efficiency cluster with
+// set_thread_cluster_hint(true) (macOS: it is at background QoS).
+bool thread_prefers_efficiency();
 
 } // namespace arm64bench

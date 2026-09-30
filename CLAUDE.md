@@ -32,7 +32,7 @@ Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU
 ```bash
 ./arm64bench [--all | --integer | --memory | --branch | --simd | --lse | --pitfalls | --ooo | --sve | --mlp | --frontend | --icache | --prefetch | --c2c | --fpenv]
              [--MHz <freq>] [--samples <n>] [--warmup <n>] [--csv]
-             [--smoke] [--filter <substr>] [--cpu auto|any|<n>]
+             [--smoke] [--filter <substr>] [--cpu auto|p|e|any|<n>]
 ```
 
 Default (no flags): runs integer and memory tests.
@@ -44,11 +44,14 @@ Default (no flags): runs integer and memory tests.
   line of output.
 - `--filter <substr>`: only run tests whose name contains the substring (use it to re-run a single
   test that crashed under `--smoke`).
-- `--cpu auto|any|<n>` (Linux/Windows): which cores the main thread may use. `auto` (default)
-  surveys every CPU with a pinned dependent-ADD chain, groups CPUs by L2 cluster, prints the table
-  and pins to the cluster with the fastest measured clock; `<n>` pins to the cluster holding cpu
-  n; `any` floats. See "Heterogeneous cores" below for why the default is measured rather than
-  "cpu 0".
+- `--cpu auto|p|e|any|<n>`: which cores the main thread may use. On Linux/Windows `auto`
+  (default; `p` is the same) surveys every CPU with a pinned dependent-ADD chain, groups CPUs by
+  L2 cluster, prints the table and pins to the cluster with the fastest measured clock; `e` pins
+  to the slowest; `<n>` pins to the cluster holding cpu n; `any` floats. See "Heterogeneous
+  cores" below for why the default is measured rather than "cpu 0". macOS cannot pin: `auto`/`p`
+  run the timed samples at fixed priority (performance cluster), `e` puts the main thread at
+  background QoS (efficiency cluster; needs `sudo` for usable cycle counts), and `any`/`<n>` do
+  nothing. See "Core placement on macOS".
 
 ```bash
 ./arm64bench_selftest [--verbose]   # timer / PMU / calibration / harness sanity checks; sudo for PMU
@@ -231,7 +234,7 @@ section; use the shared pieces:
 
 1. Warm-up calls (default 2) to prime I-cache and prefetchers
 2. Brief sleep after warm-up to stabilize CPU frequency
-3. Elevate thread priority (`PriorityGuard`: `SCHED_FIFO` on POSIX, which on macOS is also what keeps the samples on P-cores)
+3. Elevate thread priority (`PriorityGuard`: `SCHED_FIFO` on POSIX, which on macOS is also what keeps the samples on P-cores; skipped for a `--cpu e` run on macOS)
 4. Per-sample mini warm-up (1 call) immediately before each timed sample, to re-prime L1 I/D-cache after any thread migration during the inter-sample sleep
 5. Tick-aligned sampling (`wait_for_tick()`) before each measurement
 6. 20ms inter-sample sleep for scheduler stability
@@ -332,23 +335,36 @@ there, which is why the 16 MB MLP single chain read 57 ns while the 16 MB load-l
 
 macOS has no affinity API that Apple Silicon honours and migrates threads between cores
 constantly: on M5, 55–65 % of timed samples end on a different core than they started on. What
-can be influenced is the cluster (numbers from an instrumented build that read `TPIDR_EL0`,
-where XNU keeps the logical CPU number, around every timed call on 2026-09-30):
+can be chosen is the cluster, and the two clusters need two different mechanisms (numbers from an
+instrumented build that read `TPIDR_EL0`, where XNU keeps the logical CPU number, around every
+timed call on 2026-09-30):
 
-- **Fixed priority keeps the samples on the performance cluster.** `PriorityGuard` sets
-  `SCHED_FIFO` at priority 47, which macOS grants without root. 0 of 3522 timed samples ran on
-  an E-core on an idle machine, and 0 of 1203 with ten other busy foreground processes (one
-  migration, mean CoV 1.3 %). User-interactive QoS instead gave 4 of 3792 on E when idle, and
-  under that load 43 % of samples on E, 80 % migrated, mean CoV 9 %: a QoS thread competes with
-  other foreground work as an equal and decays, a fixed priority does not. With utility-QoS
-  background load the two tie. Placement is still the scheduler's preference: a 3 ms burst
-  every 23 ms lands on E-cores ~95 % of the time under either mechanism, and it is the ~14 ms
-  of work per sample (warm-up, reference sandwich) that gets the thread onto P.
+- **Performance cluster (default, `--cpu p`): fixed priority.** `PriorityGuard` sets `SCHED_FIFO`
+  at priority 47, which macOS grants without root. 0 of 3522 timed samples ran on an E-core on an
+  idle machine, and 0 of 1203 with ten other busy foreground processes (one migration, mean CoV
+  1.3 %). User-interactive QoS instead gave 4 of 3792 on E when idle, and under that load 43 % of
+  samples on E, 80 % migrated, mean CoV 9 %: a QoS thread competes with other foreground work as
+  an equal and decays, a fixed priority does not. With utility-QoS background load the two tie.
+  Placement is still the scheduler's preference: a 3 ms burst every 23 ms lands on E-cores ~95 %
+  of the time under either mechanism, and it is the ~14 ms of work per sample (warm-up, reference
+  sandwich) that gets the thread onto P.
 - **The two cannot be combined.** `pthread_setschedparam()` opts a thread out of the QoS system
   permanently; every later `pthread_set_qos_class_self_np()` returns EPERM (documented in
   `<pthread/qos.h>`), and setting QoS first just has it cleared. Until 2026-09-30 `PriorityGuard`
   did both and the QoS call was dead. It would have added nothing anyway: a command-line
   process's main thread already starts at user-interactive QoS.
+- **Efficiency cluster (`--cpu e`): background QoS.** `QOS_CLASS_BACKGROUND` is a hard
+  confinement (522 of 522 timed samples on E), set once on the main thread before calibration;
+  `PriorityGuard` sees it (`thread_prefers_efficiency()`) and leaves the thread alone. The catch
+  is the clock: the E cluster is clocked for whatever else is running on it, and a background
+  thread saw 1.1 to 2.9 GHz from one sample to the next. Tier 2 cannot follow that (chained ADD
+  read 1.0 to 2.0 clk~, CoV 10–40 % on most rows), so the run header warns and `--cpu e` wants
+  `sudo` for PMU cycle counts. Under `sudo` the clk column is sound: chained ADD 1.005, two
+  chains 0.503, three 0.352, then a 0.259–0.264 plateau from four chains up (about 4 ADDs per
+  clk, register and immediate forms alike, against 0.21 / 0.14 on the P-core), MADD 1.006
+  through the accumulator and 3.022 through the multiplier. The ns column and the CoV computed
+  from it still follow the clock (0.12 to 0.23 ns on rows whose clk agrees to 1 %), so the `!`
+  flag means nothing on such a run.
 - **Per-sample mini warm-up** (step 4 above): one untimed call to the test function immediately
   before each timed measurement re-primes L1 after a migration between samples. P-cores share
   L2, so a P→P move costs only L1. This is why warm-up must happen *per sample*, not only at
@@ -523,7 +539,8 @@ keep that honest:
   (`thread_affinity_policy` is a hint Apple Silicon ignores), so the partner is placed by QoS
   class instead: user-interactive lands on the performance cluster, background on the efficiency
   cluster. That gives P↔P and P↔E, with the exact cores the scheduler's choice. The main thread
-  is on the performance cluster at fixed priority; see "Core placement on macOS".
+  is on the performance cluster at fixed priority, or on the efficiency cluster with `--cpu e`
+  (E↔P and E↔E); see "Core placement on macOS".
 - **A single available CPU skips the section.** A spinning partner sharing the main thread's
   core turns every hop into a timeslice.
 

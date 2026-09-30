@@ -14,12 +14,17 @@
 // warm-up covers.
 //
 //   --cpu auto   (default) fastest cluster by measured clock
+//   --cpu p      the same, spelled out
+//   --cpu e      slowest cluster by measured clock
 //   --cpu N      the cluster containing logical CPU N
 //   --cpu any    no pinning (the pre-2026-09 behaviour)
 //
-// macOS has no affinity API; PriorityGuard runs the timed samples at fixed
-// priority (SCHED_FIFO), which the scheduler keeps on the performance
-// cluster, and this module only prints that.
+// macOS has no affinity API, so there the choice is between two scheduler
+// mechanisms rather than two CPU sets. auto/p: nothing is done here, and
+// PriorityGuard runs the timed samples at fixed priority (SCHED_FIFO), which
+// the scheduler keeps on the performance cluster. e: the main thread is put
+// at background QoS, which confines it to the efficiency cluster, and
+// PriorityGuard then leaves it alone. N and any have no meaning there.
 
 #include "affinity.h"
 
@@ -27,6 +32,8 @@
 
 namespace arm64bench {
 
+constexpr int kCpuEff  = -4;
+constexpr int kCpuPerf = -3;
 constexpr int kCpuAuto = -2;
 constexpr int kCpuAny  = -1;
 
@@ -36,8 +43,8 @@ struct CpuChoice {
     bool     pinned;
 };
 
-// Parse "auto" / "any" / "<n>" into kCpuAuto / kCpuAny / n. Returns false
-// for anything else.
+// Parse "auto" / "p" / "e" / "any" / "<n>" into kCpuAuto / kCpuPerf /
+// kCpuEff / kCpuAny / n. Returns false for anything else.
 bool parse_cpu_arg(const char* s, int* mode);
 
 // Query the topology, survey the clocks (unless `survey` is false, e.g. in

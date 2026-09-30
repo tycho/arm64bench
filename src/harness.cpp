@@ -3,6 +3,7 @@
 // statistics, and formatted output.
 
 #include "harness.h"
+#include "affinity.h"
 #include "timer.h"
 #include "cycle_counter.h"
 #include <cstdio>
@@ -140,6 +141,11 @@ struct PriorityGuard {
     bool                elevated;
 
     PriorityGuard() : elevated(false) {
+        // A thread sent to the efficiency cluster (--cpu e on macOS) stays as
+        // it is: background QoS is the placement, and pthread_setschedparam()
+        // would opt the thread out of the QoS system for good.
+        if (thread_prefers_efficiency()) return;
+
         pthread_getschedparam(pthread_self(), &old_policy, &old_param);
 
         // SCHED_FIFO requires CAP_SYS_NICE or root on Linux; failure there is

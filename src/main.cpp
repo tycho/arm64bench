@@ -36,9 +36,11 @@ static void print_usage(const char* prog) {
     printf("  --MHz <n>       Override CPU frequency estimate (MHz)\n");
     printf("  --samples <n>   Samples per benchmark (default 7)\n");
     printf("  --warmup  <n>   Warm-up calls before timing (default 2)\n");
-    printf("  --cpu <sel>     Pin the main thread: auto (default: the L2 cluster with the\n");
-    printf("                  fastest measured clock), <n> (the cluster holding cpu n),\n");
-    printf("                  any (do not pin). Linux/Windows only.\n");
+    printf("  --cpu <sel>     Pin the main thread: auto or p (default: the L2 cluster with\n");
+    printf("                  the fastest measured clock), e (the slowest), <n> (the cluster\n");
+    printf("                  holding cpu n), any (do not pin). macOS cannot pin: p runs\n");
+    printf("                  at fixed priority (performance cluster), e at background\n");
+    printf("                  QoS (efficiency cluster); <n> and any do nothing there.\n");
     printf("  --csv           Machine-readable CSV output\n");
     printf("  --smoke         Execute every test once with tiny loop counts;\n");
     printf("                  report ok/crash, record no measurements (CI)\n");
@@ -124,7 +126,7 @@ int main(int argc, char** argv) {
             default_params.num_warmup = static_cast<uint32_t>(atoi(argv[++i]));
         } else if (strcmp(arg, "--cpu") == 0 && i + 1 < argc) {
             if (!arm64bench::parse_cpu_arg(argv[++i], &cpu_mode)) {
-                fprintf(stderr, "--cpu: expected auto, any, or a CPU number, got '%s'\n", argv[i]);
+                fprintf(stderr, "--cpu: expected auto, p, e, any, or a CPU number, got '%s'\n", argv[i]);
                 return 2;
             }
         } else {
@@ -216,7 +218,14 @@ int main(int argc, char** argv) {
         printf("CPU cycle source: hardware PMU (Tier 1 — P-state immune)\n\n");
     } else {
         printf("CPU cycle source: ratio normalization vs ADD reference"
-               " (Tier 2 — drift-resistant)\n\n");
+               " (Tier 2 — drift-resistant)\n");
+        // macOS clocks the efficiency cluster for whatever else is running on
+        // it: a background-QoS thread on M5 saw 1.1 to 2.9 GHz from one sample
+        // to the next, which min(test)/min(reference) cannot follow.
+        if (arm64bench::thread_prefers_efficiency())
+            printf("  Warning: the efficiency cluster's clock is not steady at background QoS;\n"
+                   "  clk~ values are unreliable. Run under sudo for PMU cycle counts.\n");
+        printf("\n");
     }
 
     // ── Run selected test categories ────────────────────────────────────────

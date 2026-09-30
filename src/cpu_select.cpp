@@ -99,6 +99,8 @@ const char* core_name(uint64_t midr, char* buf, size_t cap) {
 bool parse_cpu_arg(const char* s, int* mode) {
     if (strcmp(s, "auto") == 0) { *mode = kCpuAuto; return true; }
     if (strcmp(s, "any") == 0)  { *mode = kCpuAny;  return true; }
+    if (strcmp(s, "p") == 0)    { *mode = kCpuPerf; return true; }
+    if (strcmp(s, "e") == 0)    { *mode = kCpuEff;  return true; }
     char* end = nullptr;
     const long v = strtol(s, &end, 10);
     if (end == s || *end || v < 0 || v >= static_cast<long>(kMaxCpus)) return false;
@@ -119,8 +121,18 @@ void select_cpus(int mode, bool survey, CpuChoice& out) {
 
     if (!affinity_supported()) {
         printf("CPU topology: %u CPUs; no thread affinity on this OS\n", t.count);
-        printf("Main thread: timed samples run at fixed priority (SCHED_FIFO), which the scheduler\n"
-               "  keeps on the performance cluster\n");
+        if (mode == kCpuEff) {
+            if (set_thread_cluster_hint(true))
+                printf("Main thread: background QoS, which confines it to the efficiency cluster (--cpu e)\n");
+            else
+                printf("Main thread: --cpu e needs QoS classes, which this OS or thread does not have;\n"
+                       "  timed samples run at fixed priority instead\n");
+        } else {
+            printf("Main thread: timed samples run at fixed priority (SCHED_FIFO), which the scheduler\n"
+                   "  keeps on the performance cluster (--cpu e selects the efficiency cluster)\n");
+            if (mode >= 0 || mode == kCpuAny)
+                printf("  (--cpu any and --cpu <n> have no effect here)\n");
+        }
         return;
     }
 
@@ -234,6 +246,16 @@ void select_cpus(int mode, bool survey, CpuChoice& out) {
             return;
         }
         why = "requested with --cpu";
+    } else if (mode == kCpuEff) {
+        for (int32_t g = 0; g < ngroups; ++g) {
+            if (pick < 0) { pick = g; continue; }
+            const bool slower = score[g] < score[pick] * 0.97;
+            const bool tie    = !slower && score[g] < score[pick] * 1.03;
+            if (slower || (tie && (gclass[g] < gclass[pick] ||
+                                   (gclass[g] == gclass[pick] && gfirst[g] < gfirst[pick]))))
+                pick = g;
+        }
+        why = surveyed ? "slowest measured clock" : (t.have_classes ? "lowest OS class" : "first group");
     } else {
         for (int32_t g = 0; g < ngroups; ++g) {
             if (pick < 0) { pick = g; continue; }
@@ -256,8 +278,8 @@ void select_cpus(int mode, bool survey, CpuChoice& out) {
     format_ids(ids, sizeof(ids), t, in);
     out.pinned = pin_thread_to_cpus(out.cpus, out.n);
     if (out.pinned)
-        printf("Main thread: pinned to cpus %s (%s; --cpu N picks the cluster holding cpu N, --cpu any floats)\n",
-               ids, why);
+        printf("Main thread: pinned to cpus %s (%s; --cpu N picks the cluster holding cpu N,\n"
+               "  --cpu e the slowest cluster, --cpu any floats)\n", ids, why);
     else
         printf("Main thread: pinning to cpus %s failed; not pinned\n", ids);
 }
