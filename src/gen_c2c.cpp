@@ -264,7 +264,8 @@ void run_c2c_tests(const BenchmarkParams& base_params) {
         section("Core-to-core: no thread affinity on this OS; partner placed by QoS class");
         printf("  'P' = partner at user-interactive QoS (performance cluster),\n"
                "  'E' = partner at background QoS (efficiency cluster). This thread\n"
-               "  runs at user-interactive QoS. Exact cores are the scheduler's choice.\n");
+               "  runs at fixed priority (performance cluster). Exact cores are the\n"
+               "  scheduler's choice.\n");
         for (const Probe p : kProbes) {
             run_probe(base_params, p, Placement{ -1, false }, "partner P");
             run_probe(base_params, p, Placement{ -1, true  }, "partner E");

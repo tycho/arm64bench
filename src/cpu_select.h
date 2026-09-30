@@ -17,8 +17,9 @@
 //   --cpu N      the cluster containing logical CPU N
 //   --cpu any    no pinning (the pre-2026-09 behaviour)
 //
-// macOS has no affinity API; the QoS class already keeps the thread on the
-// performance cluster and this module only prints that.
+// macOS has no affinity API; PriorityGuard runs the timed samples at fixed
+// priority (SCHED_FIFO), which the scheduler keeps on the performance
+// cluster, and this module only prints that.
 
 #include "affinity.h"
 

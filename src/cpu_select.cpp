@@ -118,8 +118,9 @@ void select_cpus(int mode, bool survey, CpuChoice& out) {
     }
 
     if (!affinity_supported()) {
-        printf("CPU topology: %u CPUs; no thread affinity on this OS, the main thread runs at\n"
-               "  user-interactive QoS, which keeps it on the performance cluster\n", t.count);
+        printf("CPU topology: %u CPUs; no thread affinity on this OS\n", t.count);
+        printf("Main thread: timed samples run at fixed priority (SCHED_FIFO), which the scheduler\n"
+               "  keeps on the performance cluster\n");
         return;
     }
 

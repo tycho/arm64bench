@@ -142,16 +142,19 @@ struct PriorityGuard {
     PriorityGuard() : elevated(false) {
         pthread_getschedparam(pthread_self(), &old_policy, &old_param);
 
-        // SCHED_FIFO requires CAP_SYS_NICE on Linux, or running as root.
-        // On macOS it requires root or specific entitlements.
-        // Failure here is expected for normal users and is benign.
+        // SCHED_FIFO requires CAP_SYS_NICE or root on Linux; failure there is
+        // expected for normal users and is benign.
+        //
+        // macOS grants it to any user (priority 47), and there it is also the
+        // placement: on M5, 0 of 3522 timed samples ran on an E-core with it,
+        // idle or loaded, against 43 % at user-interactive QoS once ten other
+        // foreground threads were busy (a fixed priority does not decay; a
+        // QoS thread competes as an equal). The two cannot be combined: a
+        // thread that has called pthread_setschedparam() gets EPERM from
+        // pthread_set_qos_class_self_np() from then on (see <pthread/qos.h>).
         struct sched_param p{};
         p.sched_priority = sched_get_priority_max(SCHED_FIFO);
         elevated = (pthread_setschedparam(pthread_self(), SCHED_FIFO, &p) == 0);
-
-#if defined(__APPLE__)
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
     }
 
     ~PriorityGuard() {

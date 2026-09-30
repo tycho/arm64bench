@@ -231,7 +231,7 @@ section; use the shared pieces:
 
 1. Warm-up calls (default 2) to prime I-cache and prefetchers
 2. Brief sleep after warm-up to stabilize CPU frequency
-3. Elevate thread priority (`PriorityGuard`; on macOS uses `QOS_CLASS_USER_INTERACTIVE` to prefer P-cores)
+3. Elevate thread priority (`PriorityGuard`: `SCHED_FIFO` on POSIX, which on macOS is also what keeps the samples on P-cores)
 4. Per-sample mini warm-up (1 call) immediately before each timed sample, to re-prime L1 I/D-cache after any thread migration during the inter-sample sleep
 5. Tick-aligned sampling (`wait_for_tick()`) before each measurement
 6. 20ms inter-sample sleep for scheduler stability
@@ -328,16 +328,35 @@ at 2048 pages to 96 at 4096 and 260 at 8192. Any test spanning more than ~8 MB i
 there, which is why the 16 MB MLP single chain read 57 ns while the 16 MB load-latency sweep read
 9 ns. DRAM-range numbers are not like-for-like across page sizes.
 
-### Thread migration on macOS
+### Core placement on macOS
 
-macOS aggressively migrates threads between cores for thermal leveling. Migration during the
-20ms inter-sample sleep leaves the L1 I/D-cache cold for the next sample. Mitigations:
+macOS has no affinity API that Apple Silicon honours and migrates threads between cores
+constantly: on M5, 55–65 % of timed samples end on a different core than they started on. What
+can be influenced is the cluster (numbers from an instrumented build that read `TPIDR_EL0`,
+where XNU keeps the logical CPU number, around every timed call on 2026-09-30):
 
-- **`QOS_CLASS_USER_INTERACTIVE`** keeps the thread on P-cores (avoids E-core migration).
-  P-cores on Apple Silicon share L2, so P→P migration only costs L1.
+- **Fixed priority keeps the samples on the performance cluster.** `PriorityGuard` sets
+  `SCHED_FIFO` at priority 47, which macOS grants without root. 0 of 3522 timed samples ran on
+  an E-core on an idle machine, and 0 of 1203 with ten other busy foreground processes (one
+  migration, mean CoV 1.3 %). User-interactive QoS instead gave 4 of 3792 on E when idle, and
+  under that load 43 % of samples on E, 80 % migrated, mean CoV 9 %: a QoS thread competes with
+  other foreground work as an equal and decays, a fixed priority does not. With utility-QoS
+  background load the two tie. Placement is still the scheduler's preference: a 3 ms burst
+  every 23 ms lands on E-cores ~95 % of the time under either mechanism, and it is the ~14 ms
+  of work per sample (warm-up, reference sandwich) that gets the thread onto P.
+- **The two cannot be combined.** `pthread_setschedparam()` opts a thread out of the QoS system
+  permanently; every later `pthread_set_qos_class_self_np()` returns EPERM (documented in
+  `<pthread/qos.h>`), and setting QoS first just has it cleared. Until 2026-09-30 `PriorityGuard`
+  did both and the QoS call was dead. It would have added nothing anyway: a command-line
+  process's main thread already starts at user-interactive QoS.
 - **Per-sample mini warm-up** (step 4 above): one untimed call to the test function immediately
-  before each timed measurement re-primes L1 after any migration. This is why warm-up must
-  happen *per sample*, not only at the start of the session.
+  before each timed measurement re-primes L1 after a migration between samples. P-cores share
+  L2, so a P→P move costs only L1. This is why warm-up must happen *per sample*, not only at
+  the start of the session.
+- Two traps when testing placement: `pthread_join()` from a user-interactive thread boosts a
+  background joinee onto P-cores, and a standalone loop shaped like the harness (12 ms of work,
+  then a 2 ms timed window) showed no migrations where the real harness shows 55–65 %. Instrument
+  the harness itself.
 
 ### Windows ARM64 recommendations
 
@@ -503,7 +522,8 @@ keep that honest:
   first allowed CPU and the partner sweeps the rest. macOS has no affinity API for user threads
   (`thread_affinity_policy` is a hint Apple Silicon ignores), so the partner is placed by QoS
   class instead: user-interactive lands on the performance cluster, background on the efficiency
-  cluster. That gives P↔P and P↔E, with the exact cores the scheduler's choice.
+  cluster. That gives P↔P and P↔E, with the exact cores the scheduler's choice. The main thread
+  is on the performance cluster at fixed priority; see "Core placement on macOS".
 - **A single available CPU skips the section.** A spinning partner sharing the main thread's
   core turns every hop into a timeslice.
 

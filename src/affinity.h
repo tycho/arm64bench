@@ -4,8 +4,11 @@
 //
 // Linux and Windows can pin a thread to a set of logical CPUs; macOS has no
 // affinity API for user threads (thread_affinity_policy is a hint that
-// Apple Silicon ignores), so the only placement control there is QoS class,
-// which steers a thread onto the performance or efficiency cluster.
+// Apple Silicon ignores), so the only placement control there is QoS class:
+// background confines a thread to the efficiency cluster, user-interactive
+// prefers the performance cluster. (The main thread's timed samples use a
+// fixed priority instead, which holds the performance cluster better; see
+// PriorityGuard in harness.cpp.)
 //
 // The topology query exists because every heterogeneous ARM machine puts a
 // different core on cpu 0: the Snapdragon X2 Elite enumerates its six 3.6 GHz
