@@ -271,6 +271,22 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
 // load is wider than the store (or stores) it reads from, or crosses between
 // the integer and SIMD&FP register files.
 //
+// On Apple M5 every row where the load is not contained in a single store
+// (STR w → LDR x, STR x[, STR x] → LDR q, STR w → LDR q, STR d → LDR q) costs
+// 12 clk more in a Linux guest under Docker Desktop than on macOS on the same
+// core, and STP x,x → LDR q does not. The same 12 clk appear on macOS when the
+// chains run as x86-64 code under Rosetta (tools/x86_tso_stlf.c), so the
+// difference is Apple's TSO mode, which a Rosetta-enabled VM runs in, and not
+// Linux. CLAUDE.md, "Store-to-load forwarding: value prediction, wide loads,
+// vector registers", has the numbers and the command that runs this section's
+// Linux build in that VM:
+//
+//   docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash -c '
+//     apt-get update -qq && apt-get install -y -qq clang cmake ninja-build >/dev/null &&
+//     cmake -S /src -B /b -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ >/dev/null &&
+//     cmake --build /b --target arm64bench >/dev/null &&
+//     /b/arm64bench --pitfalls --filter stlf'
+//
 // Rows that end in the SIMD&FP file come back through FMOV x,d so the chain
 // closes in x0; the "(no memory)" register-only rows give the cost of those
 // transfers (which on M5 is most of the row). The v: rows keep the chain in v0
