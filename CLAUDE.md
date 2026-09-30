@@ -81,7 +81,7 @@ Default (no flags): runs integer and memory tests.
 | `src/gen_i8mm.h/.cpp` | FEAT_I8MM USDOT/SMMLA/UMMLA/USMMLA tests (run by `--simd`) |
 | `src/gen_bf16.h/.cpp` | FEAT_BF16 BFDOT/BFMMLA/BFMLALB/BFMLALT tests (run by `--simd`) |
 | `src/gen_lse.h/.cpp` | LSE atomics latency/throughput tests |
-| `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding, x86-TSO ordering schemes in streaming loops) |
+| `src/gen_pitfalls.h/.cpp` | Micro-architectural pathology tests (barriers, LRCPC, store forwarding incl. changing-value chains, wide loads and vector registers, x86-TSO ordering schemes in streaming loops) |
 | `src/gen_ooo.h/.cpp` | Out-of-order window sizing: ROB, int/FP register files, load/store queues (two-miss probe) |
 | `src/gen_sve.h/.cpp` | SVE/SVE2 tests: native with FEAT_SVE, else streaming mode via SME (Apple M4/M5) |
 | `src/gen_mlp.h/.cpp` | Memory-level parallelism: K interleaved pointer chases per cache level (outstanding-miss capacity) |
@@ -93,6 +93,7 @@ Default (no flags): runs integer and memory tests.
 | `src/affinity.h/.cpp` | Thread placement: pin to a CPU or set (Linux/Windows), QoS cluster hint (macOS); CPU topology query (L2 clusters, efficiency class, max clock, MIDR) |
 | `src/cpu_select.h/.cpp` | `--cpu`: per-CPU clock survey (pinned ADD chain), cluster choice, main-thread pinning and the topology table in the run header |
 | `tests/selftest.cpp` | Self-test of the measurement machinery (timer, PMU, calibration, harness accounting) |
+| `tools/x86_tso_stlf.c` | Standalone, not in the CMake build: the store→load chains as x86-64 code, to run under Rosetta (= M-series in TSO mode) |
 | `.github/workflows/ci.yml` | GitHub Actions: build + selftest + smoke on macOS/Linux/Windows arm64 runners |
 
 ## Code Conventions
@@ -415,6 +416,108 @@ ring is built on the stack and fits in L1. See `run_barrier_tests()` in `gen_pit
 barrier semantics require actual memory completion before the result is consumable. Self-referential
 chains are therefore safe for those instructions and correctly show true L1 latency.
 
+The predictor holds 36 bits: a repeating value below 2^36 is predicted, one with 37 significant
+bits is not, nor is all-ones or a sign-extended negative (measured 2026-09-30 on a
+`FMOV d,x; STR d; LDR x` chain: 1.34 clk up to 0xC05060708, 11.0 from 0x1405060708 up). macOS
+stack addresses are 33 bits, which is why the self-pointer chain was caught. It predicts 8-, 32-
+and 64-bit LDR results alike, not vector loads, and `add 1` per link is enough to stop it (no
+stride prediction seen). Any chain through a load needs a changing value; see the next section.
+
+### Store-to-load forwarding: value prediction, wide loads, vector registers (gen_pitfalls.cpp §1)
+
+The seven original rows chain a constant through `STR; LDR`. On M5 six of them measure the value
+predictor, not a forward (0.8–2.6 clk; the true figure is 6), and the seventh (`STR x → LDR x`,
+4.1) escapes only because its constant 0x0102030405060708 is wider than 36 bits: with the value 1
+it reads 1.2. The `stlf` rows (`--pitfalls --filter stlf`) run every shape twice with identical
+code, an off-chain Weyl counter and one EOR with it on the chain: `var` (counter steps by
+0x9E3779B97F4A7C15) and `const` (step 0, value 1). `var` is the latency of the shape plus 1 clk
+for the EOR; `const` far below `var` is value prediction. M5, Tier 2, 2026-09-30, clk per link
+including the EOR (every row at 0.224–0.226 ns per clk); the last column is the same binary's
+Linux build in the Docker Desktop VM, `var`, where it differs:
+
+| Shape | const | var | var, Linux VM |
+|---|---|---|---|
+| EOR x alone | 1.0 | 1.0 | |
+| STR x → LDR x | 1.0 | **1.7** | |
+| STR w → LDR w; STR x → LDR w, LDR w [+4], LDRB; STRB → LDRB | 1.0–1.3 | 7.0 | |
+| STR w → LDR x (wider load) | 1.8 | 7.0 | **19.0** (const 16.7) |
+| STLR x → LDR x | 1.0 | 7.0 | |
+| STR x → LDAPR x; STLR x → LDAPR x | 7.0 | 7.0 | |
+| FMOV d,x; FMOV x,d (no memory) | 10.5 | 10.5 | |
+| FMOV d,x; INS d[1],x; FMOV x,d | 12.6 | 12.6 | |
+| DUP 2d,x; UMOV x,d[1] | 10.5 | 10.5 | |
+| STR x, STR x → LDR q; FMOV x,d | 12.2 | 12.2 | **24.6** |
+| STP x,x → LDR q; FMOV x,d | 12.0 | 12.0 | 12.0 |
+| STR x → LDR q; STR w → LDR q; FMOV x,d | 12.0 | 12.0 | **24.0** |
+| STR w → LD1R 4s; STR x → LD1R 2d; FMOV x,d | 14.0 | 14.0 | 14.0 |
+| FMOV d,x; STR q → LDR x (low); DUP; STR q → LDR x [+8] | 1.0–1.1 | 12.5 | |
+| FMOV d,x; STR q → LDR q; FMOV x,d | 17.0 | 17.0 | |
+| FMOV d,x; STR d → LDR x | 1.0 | 12.5 | |
+| STR x → LDR d; FMOV x,d | 12.0 | 12.0 | |
+| STR x → LDR d; STR d → LDR x (two forwards) | 2.3 | 14.0 | |
+| v: EOR v alone | 2.0 | 2.0 | |
+| v: STR q → LDR q | 12.2 | 12.2 (bare 6.5) | |
+| v: STR d → LDR d; STR q → LDR d | 13.0 | 13.0 (bare 6.5 / 7.0) | |
+| v: STR d → LDR q (wider load) | 13.0 | 13.0 (bare 7.0) | **24.0** (bare 18.0) |
+| v: STR d, STR d → LDR q | 16.6 | 16.6 (bare 7.2) | **24.3** (bare 18.0) |
+
+- **Zero-cycle load.** `STR x; LDR x` with a changing value costs 0.7 clk over the ALU op (2.7
+  with two ALU ops on the chain): the load is renamed to the store's data register, whatever the
+  value. Only the plain matched 64-bit pair gets it. `STR w; LDR w`, `STLR x; LDR x` and
+  `STR x; LDAPR x` are all 6 clk, so the LDAPR/STLR TSO scheme gives up 5.3 clk on every reload
+  of a just-stored 64-bit value (guest push/pop, spill/fill). The old bare row (4.1 clk, nothing
+  between the load and the next store) is neither renamed nor predicted; LDAPR bare is 5.0.
+- **Every other scalar forward is 6 clk to an ALU consumer**, whatever the widths and the offset.
+  On macOS M5 has no mismatch penalty at all, narrower, wider or offset.
+- **Bare chains are shorter than chains with an operation in them by more than the operation.**
+  Nothing between load and store: 5.0 clk integer (LDAPR), 6.5 SIMD&FP. One op in between adds
+  2 clk for a 1-clk EOR x and 5.7 for a 2-clk EOR v; a second op adds only its own latency. The
+  `var` rows are the realistic number (loaded value consumed by an op, stored value produced by
+  one); the v: rows also print `bare`, which is safe there because vector loads are not predicted.
+- **GPR↔SIMD through memory costs about what FMOV does.** With the EOR: FMOV x→d→x 10.5 (10.05
+  without it), one direction through memory and FMOV the other 12.0–12.5, both directions
+  through memory 14.0. Two general registers into a vector: `STR, STR; LDR q` (12.2) and
+  `FMOV; INS` (12.6) tie. LD1R is 2 clk slower than LDR q.
+- **`FMOV d,x; STR q; LDR x` reading 1.06 clk with a constant** (QEMU `tests/host/stlf`) was the
+  value predictor on the LDR x: 12.5 with a changing value.
+
+**TSO mode (the Linux VM difference).** In the Docker Desktop VM every row matches macOS to
+0.05 clk except those where the load is not contained in one store: `STR w → LDR x`,
+`STR x[, STR x] → LDR q`, `STR w → LDR q`, `STR d → LDR q`, each +11 to +12.4 clk (the two-STR d
+vector row, already 16.6 on macOS, +7.7; +10.8 bare). A single STP covering the load, LD1R and every same-size or narrower load are unaffected. It is
+not a vector effect (the scalar `STR w → LDR x` has it; so does the old constant row, 2.6 → 17.0).
+The same numbers appear on macOS itself when the chains run as x86-64 code under Rosetta
+(`tools/x86_tso_stlf.c`): `mov l → mov q` 19.07, `mov b → mov l` 19.07, `mov q, mov q → movdqa`
+24.67, `mov q → movdqa` 24.10, while the contained rows equal native arm64 (7.02, 12.03, 12.48,
+16.98, FMOV-equivalent round trip 10.48). Rosetta runs translated code under Apple's TSO memory
+model, and the Docker VM has Rosetta enabled (amd64 containers map `/run/rosetta/rosetta`), which
+presumably has Virtualization.framework run the whole guest with TSO on. So the working
+explanation: **with TSO enabled, M5 does not forward to a load that needs bytes from outside a
+single store-buffer entry (two stores, or a store plus the cache); the load waits ~12 clk
+instead.** Not confirmed directly (ACTLR_EL1 cannot be read from EL0); the check is to turn off
+"Use Rosetta for x86_64/amd64 emulation on Apple Silicon" in Docker Desktop and rerun. Ruled
+out: PSTATE.SSBS (not implemented; MRS/MSR SSBS trap on macOS and in the VM alike), PSTATE.DIT
+(0 in both; setting it changes nothing in either), the clock (0.224 ns per clk in both).
+Consequences: a translator's scratch slot should be written with one STP (or read with
+same-size loads / LD1R); any arm64 Linux number taken in a Rosetta-enabled VM on Apple Silicon
+is a TSO-mode number for these shapes; the X2 has no such mode.
+
+**Running the Linux build in a VM on Apple Silicon** (Docker Desktop; no settings changed, the
+source tree is mounted read-only and the build lives in the container):
+
+```bash
+docker run --rm -v "$PWD":/src:ro ubuntu:24.04 bash -c '
+  apt-get update -qq && apt-get install -y -qq clang cmake ninja-build >/dev/null &&
+  cmake -S /src -B /b -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ >/dev/null &&
+  cmake --build /b --target arm64bench >/dev/null &&
+  /b/arm64bench --pitfalls --filter stlf'
+```
+
+The container sees 10 identical vCPUs in one cluster, 4 KB pages and no PMU (Tier 2), and the
+ADD survey read 4.3–4.5 GHz, i.e. P-cores; check the ns/clk ratio per row as usual. Compare
+against `./build/arm64bench --pitfalls --filter stlf` on macOS, and against Rosetta with
+`clang -O2 -arch x86_64 tools/x86_tso_stlf.c -o x86_tso_stlf && ./x86_tso_stlf`.
+
 ### LDAPR/LDAPUR: what the test actually measures
 
 In a pointer-chase chain with **no concurrent stores**, LDAPR/LDAPUR should show the same latency
@@ -692,6 +795,7 @@ under WSL2 on 2026-09-29) agree on the shape, which is not "FPCR is renamed":
 | **POPCNT idiom** | `gen_fp_simd.cpp §11` | NEON CNT v16b=2 clk; full FMOV+CNT+ADDV+FMOV scalar-POPCNT idiom ≈14.8 clk per emulated POPCNT |
 | **Memory barriers** | `gen_pitfalls.cpp §5` | DMB=1.5 clk standalone; in load chain: 0 added (completes within LDR latency) |
 | **LRCPC (LDAPR/LDAPUR)** | `gen_pitfalls.cpp §6` | LDAPR≈LDAR≈LDR=3 clk; store forwarding unchanged (~4.9 clk all variants) |
+| **Store→load forwarding, changing value** | `gen_pitfalls.cpp §1` (`--filter stlf`) | Per link incl. a 1-clk EOR, Tier 2: STR x→LDR x 1.7 (zero-cycle load); every other scalar pair 7.0 (narrower, wider, offset, byte, STLR, LDAPR); constant-value chains 1.0–1.8 = value prediction (values < 2^36; not LDAPR, not vector loads); STR x,STR x / STP / STR x / STR w → LDR q + FMOV back 12.0–12.2, LD1R 14.0, FMOV round trip 10.5, FMOV+INS 12.6; STR q → LDR x 12.5, STR q → LDR q via FMOV 17.0; vector chain STR q → LDR q 12.2 with a 2-clk EOR, 6.5 bare. In TSO mode (Linux VM with Rosetta enabled, or x86 under Rosetta) a load not contained in one store costs +12: 19.0 / 24.0–24.6 |
 | **TSO ordering in streams** | `gen_pitfalls.cpp §6b` (`--filter tso`) | Per access, 4 sequential streams, Tier 2: load stream LDR 0.38–0.47 clk, DMB ISHLD+LDR 1.5–1.8, LDAPR = LDAR 1.13–1.22 at every size; store stream STR 0.54–0.71, DMB ISH+STR = DMB ISHST+STR ≈ 6.0–6.3 at every size, STLR 1.0–1.3; copy (per access) LDR/STR 0.28 (L1) / 1.51 (L2, DRAM), stock QEMU 3.8–4.0, LDAPR/STLR 0.66–0.91; chase: ordering adds nothing, but the address ADD adds 2.5 clk at L1 (5.5 vs 3.0); unaligned crossing 16 B: 2×LDAPR+merge 2.2–2.5 vs DMB+LDR 1.5–2.7; 128-bit: LDP+DMB 1.5–2.1, 2×LDAPR 2.2, DMB+STP 6.0–6.5, 2×STLR 2.0–2.7. LRCPC3 rows (LDIAPP/STILP/writeback) not run on M5 (absent) |
 | **BFI dest-dep stress** | `gen_pitfalls.cpp §7` | All three Mihocka variants (independent / overlapping rotation / full-width) report ~1 clk on M5 — no dep-breaking shortcut |
 | **OOO window** | `gen_ooo.cpp` | Two-miss probe: int PRF ≈ 386–418, FP PRF ≈ 834–898, load queue ≈ 482–515, store queue ≈ 138–146, flag (NZCV) PRF ≈ 170–179 (CMP fill), branch order buffer ≈ 194–203 (not-taken B.cond fill); NOP fill shows no limit to 2048 (NOPs are not allocated, or ROB > 2050). Sharp 1×→2× steps. ~3.5 min run |
@@ -742,7 +846,7 @@ X1C rows are identified by ns per clk (0.200 / 0.334). Headline findings, Prime 
 | BLR, one site cycling N targets | predicted to 256 targets, 6 clk | predicted to 24 targets, 7 clk; 23 clk beyond | mispredicts from 2 targets (18–24 clk): no target history |
 | Indirect fast table (N sites → N targets) | 48 | 32 | ~140 |
 | DMB ISH / DSB ISH / ISB | 7 / 7 / 25 | 2 / 2 / 21 | 1.6 / 18 / 34 |
-| Store→load forwarding | 4.1–4.4 clk; narrow→wide 10.4 | 6.0 clk for every case | 4.1 matched x64; 0.8–1.2 for narrower loads; narrow→wide 2.6 |
+| Store→load forwarding (constant-value chains) | 4.1–4.4 clk; narrow→wide 10.4 | 6.0 clk for every case | 4.1 matched x64; 0.8–1.2 for narrower loads and narrow→wide 2.6 are value prediction: with a changing value every case is 6.0 except matched x64, 0.7 (renamed) |
 | Non-temporal hints | ignored | honored: STNP to 64 MB at the L1 rate (2.1 vs 4.9 clk), LDNP does not allocate in L2 | STNP partly (3.4 vs 4.7), LDNP ignored |
 | Stride prefetcher | every stride to 32 KB, across pages | ≤ 512 B only | ≤ 256 B plus power-of-two to 32 KB |
 | Core-to-core round trip | 155–165 ns, all pairs (one DSU) | 60 ns in-cluster, 420 ns cross-cluster (measured from a Performance core) | 107 P↔P, 380 P↔E |
