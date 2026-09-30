@@ -255,6 +255,14 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
 // store's data register, which does not depend on the value: M5 does that for
 // STR x → LDR x). Only the data differs between the two.
 //
+// What "latency of the shape" includes: the loaded value is consumed by an ALU
+// op and the stored value is produced by one. A chain with nothing between the
+// load and the next store ("bare", what the rows above are) never leaves the
+// load/store unit and is shorter than that on M5: by ~2 clk in the integer
+// file and ~4 clk in the SIMD&FP file, on top of the operation's own latency.
+// The v: rows therefore run a third time as "bare", which is safe there
+// because vector loads are not value-predicted (const = var).
+//
 // The shapes beyond the scalar ones are those a translator produces when it
 // moves guest vector values through a scratch slot: QEMU's x86 front end loads
 // a 128-bit guest operand into two general registers, stores both to a slot in
@@ -265,13 +273,15 @@ static void run_store_forwarding_tests(const BenchmarkParams& base) {
 //
 // Rows that end in the SIMD&FP file come back through FMOV x,d so the chain
 // closes in x0; the "(no memory)" register-only rows give the cost of those
-// transfers (which on M5 is most of the row).
+// transfers (which on M5 is most of the row). The v: rows keep the chain in v0
+// instead (vector ADD for the counter, vector EOR on the chain) and hold no
+// GPR↔SIMD transfer at all.
 //
 // The slot is the 16-byte scratch area at sp (16-byte aligned, so no access
 // crosses a line) and is zeroed in setup: a load wider than the store reads
 // defined bytes.
 
-enum class Value { Const, Var };
+enum class Value { Const, Var, Bare };
 
 constexpr uint64_t kWeylStep = 0x9E3779B97F4A7C15ULL;
 
@@ -293,23 +303,49 @@ static JitPool::TestFn build_stlf_chain(uint64_t loops, uint32_t unroll,
             a.mov(x1, Imm(0));
             a.mov(x20, Imm(mode == Value::Var ? kWeylStep : 0));
         },
-        [link](a64::Assembler& a, uint32_t) {
+        [mode, link](a64::Assembler& a, uint32_t) {
             link(a);
+            if (mode == Value::Bare) return;
             a.add(x1, x1, x20);
             a.eor(x0, x0, x1);
         },
         /*scratch_bytes=*/16);
 }
 
+// v0 → link → v0, with the counter in v1 and its step in v2.
+static JitPool::TestFn build_stlf_vec_chain(uint64_t loops, uint32_t unroll,
+                                            Value mode, LinkEmitter link) {
+    return build_loop(loops, unroll,
+        [mode](a64::Assembler& a) {
+            a.mov(x9, sp);
+            a.stp(xzr, xzr, ptr(x9));
+            a.mov(x0, Imm(mode == Value::Const ? 1 : 0x0102030405060708ULL));
+            a.mov(x20, Imm(mode == Value::Var ? kWeylStep : 0));
+            a.dup(v0.d2(), x0);
+            a.movi(v1.d2(), Imm(0));
+            a.dup(v2.d2(), x20);
+        },
+        [mode, link](a64::Assembler& a, uint32_t) {
+            link(a);
+            if (mode == Value::Bare) return;
+            a.add(v1.d2(), v1.d2(), v2.d2());
+            a.eor(v0.b16(), v0.b16(), v1.b16());
+        },
+        /*scratch_bytes=*/16);
+}
+
 static void run_stlf_cases(const BenchmarkParams& base, uint64_t loops,
-                           uint32_t unroll, std::span<const StlfCase> cases) {
+                           uint32_t unroll, std::span<const StlfCase> cases,
+                           bool vec_chain = false, bool with_bare = false) {
     static constexpr struct { Value mode; const char* tag; } kModes[] = {
-        { Value::Const, "const" }, { Value::Var, "var" },
+        { Value::Const, "const" }, { Value::Var, "var" }, { Value::Bare, "bare" },
     };
     char name[80];
     for (const auto& c : cases) {
         for (const auto& m : kModes) {
-            auto fn = build_stlf_chain(loops, unroll, m.mode, c.link);
+            if (m.mode == Value::Bare && !with_bare) continue;
+            auto fn = vec_chain ? build_stlf_vec_chain(loops, unroll, m.mode, c.link)
+                                : build_stlf_chain    (loops, unroll, m.mode, c.link);
             snprintf(name, sizeof(name), "stlf %-36s %s", c.shape, m.tag);
             run_one(name, fn, params_for(base, loops, unroll));
         }
@@ -422,6 +458,27 @@ static void run_stlf_chain_tests(const BenchmarkParams& base) {
                      a.str(d0, ptr(x9, 8)); a.ldr(x0, ptr(x9, 8)); } },
     };
     run_stlf_cases(base, loops, unroll, cross);
+
+    printf("\n  Chain kept in v0, no general register on it (var = shape + a vector\n"
+           "  EOR; bare = store and load only, nothing between them):\n\n");
+    static const StlfCase vec_ref[] = {
+        { "v: EOR v (no memory)", [](A&) {} },
+    };
+    run_stlf_cases(base, loops, unroll, vec_ref, /*vec_chain=*/true);
+    static const StlfCase vec[] = {
+        { "v: STR q -> LDR q",
+          [](A& a) { a.str(q0, ptr(x9)); a.ldr(q0, ptr(x9)); } },
+        { "v: STR d -> LDR d",
+          [](A& a) { a.str(d0, ptr(x9)); a.ldr(d0, ptr(x9)); } },
+        { "v: STR q -> LDR d",
+          [](A& a) { a.str(q0, ptr(x9)); a.ldr(d0, ptr(x9)); } },
+        { "v: STR d -> LDR q",
+          [](A& a) { a.str(d0, ptr(x9)); a.ldr(q0, ptr(x9)); } },
+        { "v: STR d, STR d -> LDR q",
+          [](A& a) { a.str(d0, ptr(x9)); a.str(d0, ptr(x9, 8));
+                     a.ldr(q0, ptr(x9)); } },
+    };
+    run_stlf_cases(base, loops, unroll, vec, /*vec_chain=*/true, /*with_bare=*/true);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
