@@ -546,12 +546,188 @@ static void run_fpsr_tests(const BenchmarkParams& base) {
     run_fpsr_round_trip(base, "MSR FPSR,xzr; x->FMOV->FADD->MRS FPSR->x", FpsrTrip::ClearThenMrs);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Section 4: denormals under FZ / FIZ / AH
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Does the core have a denormal penalty at all, and does turning on a flush
+// mode remove it? Each pattern runs under every FPCR mode the core has:
+//
+//   default       FZ = 0: denormals are computed
+//   FZ            flush-to-zero. Without AH this flushes denormal inputs as
+//                 well as results (x86 DAZ + FTZ in one bit).
+//   FIZ           (AFP) flush denormal inputs only (x86 DAZ)
+//   AH            (AFP) alternate handling with no flushing: what an x86
+//                 guest with default MXCSR runs under
+//   AH+FZ+FIZ     (AFP) x86 DAZ + FTZ
+//
+// Operand notation in the row names: N normal, D denormal, "=D" a denormal
+// result (for N*N, one that underflows), e.g.
+//
+//   FADD lat N+D          acc(1.0) += D. A denormal operand on every op in
+//                         every mode; the result stays 1.0.
+//   FADD lat D+D=D        acc(D) += D, −= D alternately: denormal in, denormal
+//                         out, exact.
+//   FMUL lat N*N=D, D*N=N acc *= 1.5×2^-540, then *= its reciprocal: every
+//                         other op underflows to a denormal (inexact), the
+//                         next takes it back to normal.
+//   FMUL tput N*N=D       16 destinations, constant operands whose product
+//                         underflows. Not a chain, so the flush modes
+//                         exercise their flush on every op.
+//   FMUL tput D*N=N       16 destinations, denormal × 2^600 (2^70 for f32).
+//   FMLA lat N+D*N        acc(1.0) += D × 1.5
+//   FMLA lat D+D*N=D      acc(D) += ±D × 1.0
+//
+// In a flush mode a chain that feeds a denormal back (D+D=D, N*N=D/D*N=N,
+// D+D*N=D) collapses to zeros after its first step; that is the point of the
+// mode, and the N+D, tput N*N=D and tput D*N=N rows are the ones that still
+// meet a denormal on every op. Scalar FMLA is FMADD.
+//
+// Every row runs a fraction of the usual loop count: a microcoded denormal
+// assist is two orders of magnitude slower than the fast path.
+//
+// M5: no denormal penalty in any mode. The only movement is FMUL reading
+// 3.06 clk instead of 3.00 when denormals are in play (default mode) and
+// always under AH; FADD and FMLA read the same in every row.
+
+struct FpMode { const char* tag; uint64_t bits; bool afp; };
+static constexpr FpMode kFpModes[] = {
+    { "default",   0,                               false },
+    { "FZ",        kFpcrFZ,                         false },
+    { "FIZ",       kFpcrFIZ,                        true  },
+    { "AH",        kFpcrAH,                         true  },
+    { "AH+FZ+FIZ", kFpcrAH | kFpcrFZ | kFpcrFIZ,    true  },
+};
+
+// An f64 value and the f32 value used in its place for the vector rows.
+struct FpVal { double d; float f; };
+
+static FpVal bits_val(uint64_t b64, uint32_t b32) {
+    FpVal v;
+    memcpy(&v.d, &b64, sizeof(v.d));
+    memcpy(&v.f, &b32, sizeof(v.f));
+    return v;
+}
+
+enum class DenOp { Fadd, Fmul, Fmla };
+
+// One denormal pattern. Latency form: reg 0 is the accumulator, seeded with
+// `acc`, and op u uses constant (u & 1 ? c_odd : c_even) — and for FMLA also
+// `mul` as the second multiplicand. Throughput form (tput): 16 destinations,
+// each dst = c_even OP c_odd, nothing fed back.
+struct DenPattern {
+    const char* label;
+    DenOp       op;
+    bool        tput;
+    FpVal       acc, c_even, c_odd, mul;
+};
+
+static constexpr uint32_t kDenC0 = 16, kDenC1 = 17, kDenMul = 18;   // v24, v25, v26
+static constexpr uint64_t kDenLoops  = 500'000;
+static constexpr uint32_t kDenUnroll = 32;
+
+static void run_denormal_row(const BenchmarkParams& base, const FpMode& mode,
+                             const DenPattern& pat, bool vec)
+{
+    const FpOp     kind{ "", vec, false };
+    const uint64_t loops = scale_loops(kDenLoops);
+
+    auto fn = build_fpenv_loop(loops, kDenUnroll,
+        [&](a64::Assembler& a) {
+            fp_load(a, kind, kDenC0,  pat.c_even.d, pat.c_even.f);
+            fp_load(a, kind, kDenC1,  pat.c_odd.d,  pat.c_odd.f);
+            fp_load(a, kind, kDenMul, pat.mul.d,    pat.mul.f);
+            for (uint32_t i = 0; i < (pat.tput ? 16u : 1u); ++i)
+                fp_load(a, kind, i, pat.acc.d, pat.acc.f);
+            set_guest(a, mode.bits);
+            msr_fpcr(a, x21);
+        },
+        [&](a64::Assembler& a, uint32_t u) {
+            const uint32_t dst = pat.tput ? u % 16 : 0;
+            const uint32_t c   = (u & 1) ? kDenC1 : kDenC0;
+            if (vec) {
+                const Vec d = vr(dst).s4(), c0 = vr(kDenC0).s4(), c1 = vr(kDenC1).s4();
+                switch (pat.op) {
+                case DenOp::Fadd: a.fadd(d, d, vr(c).s4()); break;
+                case DenOp::Fmul: if (pat.tput) a.fmul(d, c0, c1); else a.fmul(d, d, vr(c).s4()); break;
+                case DenOp::Fmla: a.fmla(d, vr(c).s4(), vr(kDenMul).s4()); break;
+                }
+            } else {
+                const Vec d = vr(dst).d(), c0 = vr(kDenC0).d(), c1 = vr(kDenC1).d();
+                switch (pat.op) {
+                case DenOp::Fadd: a.fadd(d, d, vr(c).d()); break;
+                case DenOp::Fmul: if (pat.tput) a.fmul(d, c0, c1); else a.fmul(d, d, vr(c).d()); break;
+                case DenOp::Fmla: a.fmadd(d, vr(c).d(), vr(kDenMul).d(), d); break;
+                }
+            }
+        });
+
+    static const char* const kOpNames[2][3] = {
+        { "FADD f64",   "FMUL f64",   "FMADD f64"  },
+        { "FADD v4f32", "FMUL v4f32", "FMLA v4f32" },
+    };
+    char name[96];
+    snprintf(name, sizeof(name), "[%s] %s %s %s", mode.tag,
+             kOpNames[vec][static_cast<int>(pat.op)], pat.tput ? "tput" : "lat", pat.label);
+    run_one(name, fn, params_for(base, loops, kDenUnroll));
+}
+
+static void run_denormal_tests(const BenchmarkParams& base) {
+    section("Denormals under FPCR.FZ / FIZ / AH");
+    const bool afp = cpu_has(CpuFeature::AFP);
+    printf("  clk per FP operation. N = normal operand, D = denormal operand, \"=D\" =\n"
+           "  denormal result (for N*N: underflow). lat = one chain, tput = 16\n"
+           "  independent destinations. [mode] is what FPCR holds: FZ flushes inputs and\n"
+           "  results; FIZ (AFP) inputs only; AH (AFP) alternate handling, no flushing;\n"
+           "  AH+FZ+FIZ is x86 DAZ+FTZ. Chains that feed a denormal back run on zeros in\n"
+           "  the flush modes.\n");
+    if (!afp) skip_feature(CpuFeature::AFP, "the FIZ / AH modes");
+
+    const FpVal one   = { 1.0, 1.0f };
+    const FpVal n15   = { 1.5, 1.5f };
+    const FpVal n01   = { 0.1, 0.1f };
+    const FpVal ngrow = { 1.0000001, 1.0000001f };
+    const FpVal den   = bits_val(0x0000000000012345ull, 0x00012345u);
+    const FpVal dacc  = bits_val(0x0000000000123456ull, 0x00023456u);
+    const FpVal dpos  = bits_val(0x0000000000010000ull, 0x00000100u);
+    const FpVal dneg  = bits_val(0x8000000000010000ull, 0x80000100u);
+    const FpVal tiny  = { 0x1.23456789abcdep-500, 0x1.234568p-60f };   // normal; * down = D
+    const FpVal down  = { 0x1.8p-540,             0x1.8p-70f      };
+    const FpVal up    = { 0x1.5555555555555p+539, 0x1.555556p+69f };   // 1 / down
+    const FpVal ta    = { 0x1.8p-520,             0x1.8p-65f      };   // ta * tb = D
+    const FpVal tb    = { 0x1.2345p-530,          0x1.2345p-70f   };
+    const FpVal big   = { 0x1p+600,               0x1p+70f        };   // den * big = N
+
+    const DenPattern patterns[] = {
+        { "N+N",          DenOp::Fadd, false, n15,  n01,   n01,   one },
+        { "N+D",          DenOp::Fadd, false, one,  den,   den,   one },
+        { "D+D=D",        DenOp::Fadd, false, dacc, dpos,  dneg,  one },
+        { "N*N",          DenOp::Fmul, false, n15,  ngrow, ngrow, one },
+        { "N*N=D, D*N=N", DenOp::Fmul, false, tiny, down,  up,    one },
+        { "N*N",          DenOp::Fmul, true,  one,  n15,   ngrow, one },
+        { "N*N=D",        DenOp::Fmul, true,  one,  ta,    tb,    one },
+        { "D*N=N",        DenOp::Fmul, true,  one,  den,   big,   one },
+        { "N+N*N",        DenOp::Fmla, false, n15,  n01,   n01,   n01 },
+        { "N+D*N",        DenOp::Fmla, false, one,  den,   den,   n15 },
+        { "D+D*N=D",      DenOp::Fmla, false, dacc, dpos,  dneg,  one },
+    };
+
+    for (const FpMode& mode : kFpModes) {
+        if (mode.afp && !afp) continue;
+        printf("\n");
+        for (const bool vec : { false, true })
+            for (const DenPattern& pat : patterns)
+                run_denormal_row(base, mode, pat, vec);
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 void run_fpenv_tests(const BenchmarkParams& base_params) {
     run_fpcr_access_tests(base_params);
     run_fpcr_in_fp_code_tests(base_params);
     run_fpsr_tests(base_params);
+    run_denormal_tests(base_params);
 }
 
 } // namespace arm64bench::gen
