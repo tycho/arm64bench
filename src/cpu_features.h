@@ -28,6 +28,8 @@
 //      instruction faults is treated as absent, with a warning — that is the
 //      case that otherwise kills the process mid-test with SIGILL /
 //      0xC000001D. An Unknown feature is decided by the probe alone.
+//      FEAT_AFP adds no instruction, only FPCR bits, so its probe writes the
+//      bits and checks that they read back (they are RES0 without it).
 //
 // The probe runs for every feature on the first query (one handler install,
 // one pass) and results are cached; call cpu_has() from the main thread
@@ -57,6 +59,7 @@ enum class CpuFeature : uint8_t {
     SVE,        // FEAT_SVE    — scalable vectors (non-streaming)
     SVE2,       // FEAT_SVE2
     SME,        // FEAT_SME    — streaming SVE mode + ZA (Apple M4+, Cortex-X/A 2023+)
+    AFP,        // FEAT_AFP    — FPCR.FIZ/AH/NEP: x86-style denormal, NaN and scalar-merge rules
 
     Count_
 };
@@ -69,9 +72,9 @@ bool cpu_has(CpuFeature f);
 enum class FeatureReport : uint8_t { Absent, Present, Unknown };
 FeatureReport cpu_os_reports(CpuFeature f);
 
-// Result of executing the feature's probe instruction:
-//   1  executed normally
-//   0  raised an illegal-instruction trap
+// Result of executing the feature's probe:
+//   1  the instruction executed (FEAT_AFP: its FPCR bits read back as written)
+//   0  it raised an illegal-instruction trap (FEAT_AFP: the bits read back 0)
 //  -1  no probe is defined for this feature (SVE/SVE2/SME)
 int cpu_probe(CpuFeature f);
 

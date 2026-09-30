@@ -19,11 +19,16 @@
 //            once under an illegal-instruction trap. Operates on x0 (a
 //            64-byte scratch buffer), x1, x2 and v0 only — all caller-saved —
 //            so a faulting probe leaves nothing to restore. 0 = no probe.
+//   fpcr     for a feature that adds no instruction, only FPCR control bits
+//            (FEAT_AFP: FIZ, AH, NEP): the bits. They are RES0 without the
+//            feature, so the probe writes them, reads FPCR back, restores
+//            it, and the feature is there iff they stuck. 0 = not that kind.
 //
 // Field positions follow the Arm ARM (ID_AA64ISAR0_EL1: AES[7:4] SHA2[15:12]
 // CRC32[19:16] Atomic[23:20] SHA3[35:32] DP[47:44] FHM[51:48];
 // ID_AA64ISAR1_EL1: JSCVT[15:12] LRCPC[23:20] BF16[47:44] I8MM[55:52];
-// ID_AA64PFR0_EL1: AdvSIMD[23:20], where 0xF means no AdvSIMD at all).
+// ID_AA64PFR0_EL1: AdvSIMD[23:20], where 0xF means no AdvSIMD at all;
+// ID_AA64MMFR1_EL1: AFP[47:44]).
 
 #include "cpu_features.h"
 
@@ -72,6 +77,7 @@ constexpr uint64_t kHwcapASIMDDP  = 1ULL << 20;
 constexpr uint64_t kHwcapASIMDFHM = 1ULL << 23;
 constexpr uint64_t kHwcap2I8MM    = 1ULL << 13;
 constexpr uint64_t kHwcap2BF16    = 1ULL << 14;
+constexpr uint64_t kHwcap2AFP     = 1ULL << 20;
 constexpr uint64_t kHwcap2LRCPC3  = 1ULL << 46;
 constexpr uint64_t kHwcapSVE      = 1ULL << 22;
 constexpr uint64_t kHwcap2SVE2    = 1ULL << 1;
@@ -93,7 +99,7 @@ constexpr int kPfSve2   = 47;   // PF_ARM_SVE2_INSTRUCTIONS_AVAILABLE
 constexpr int kPfNone   = -1;
 
 // ── Windows registry ID register mirrors ────────────────────────────────────
-enum IdReg : uint8_t { kIdNone, kIdISAR0, kIdISAR1, kIdPFR0, kIdCount_ };
+enum IdReg : uint8_t { kIdNone, kIdISAR0, kIdISAR1, kIdPFR0, kIdMMFR1, kIdCount_ };
 
 struct IdField {
     uint8_t reg;    // IdReg
@@ -109,6 +115,7 @@ struct FeatureInfo {
     int         win_pf;        // Windows PF_* flag, or -1
     IdField     id;            // Windows ID register field, or {kIdNone}
     uint32_t    probe;         // probe instruction encoding, 0 = none
+    uint32_t    fpcr = 0;      // FPCR bits that must read back as written, 0 = none
 };
 
 constexpr FeatureInfo kFeatures[] = {
@@ -132,6 +139,7 @@ constexpr FeatureInfo kFeatures[] = {
     { "FEAT_SVE",     "FEAT_SVE",     kHwcapSVE,      0,             kPfSve,     { kIdNone,   0, 0 }, 0 },
     { "FEAT_SVE2",    "FEAT_SVE2",    0,              kHwcap2SVE2,   kPfSve2,    { kIdNone,   0, 0 }, 0 },
     { "FEAT_SME",     "FEAT_SME",     0,              kHwcap2SME,    kPfNone,    { kIdNone,   0, 0 }, 0 },
+    { "FEAT_AFP",     "FEAT_AFP",     0,              kHwcap2AFP,    kPfNone,    { kIdMMFR1, 44, 1 }, 0, 0x7 },        // FPCR.FIZ | AH | NEP
 };
 constexpr size_t kCount = static_cast<size_t>(CpuFeature::Count_);
 static_assert(sizeof(kFeatures) / sizeof(kFeatures[0]) == kCount,
@@ -145,7 +153,7 @@ static_assert(sizeof(kFeatures) / sizeof(kFeatures[0]) == kCount,
 // (MIDR_EL1 is "CP 4000"). This is what .NET and cpuinfo use.
 bool win_id_reg(uint8_t reg, uint64_t* out) {
     static const wchar_t* const kNames[kIdCount_] = {
-        nullptr, L"CP 4030", L"CP 4031", L"CP 4020" };
+        nullptr, L"CP 4030", L"CP 4031", L"CP 4020", L"CP 4039" };
     static uint64_t cache[kIdCount_] = {};
     static int8_t   state[kIdCount_] = {};   // 0 unread, 1 ok, -1 failed
     if (reg == kIdNone || reg >= kIdCount_) return false;
@@ -213,6 +221,28 @@ ProbeFn build_probe(asmjit::JitRuntime& rt, uint32_t insn) {
     return fn;
 }
 
+// FPCR-bit probe: set `bits` in FPCR, store what reads back to [x0], restore.
+// Nothing here can trap (FPCR is an EL0 register and unimplemented bits are
+// RES0); it goes through run_probe() anyway so both kinds share one path.
+ProbeFn build_fpcr_probe(asmjit::JitRuntime& rt, uint32_t bits) {
+    using namespace asmjit::a64;
+    asmjit::CodeHolder code;
+    if (code.init(rt.environment(), rt.cpu_features()) != asmjit::kErrorOk) return nullptr;
+    Assembler a(&code);
+    const asmjit::Imm fpcr(Predicate::SysReg::kFPCR);
+    a.mrs(x1, fpcr);
+    a.mov(x2, asmjit::Imm(bits));
+    a.orr(x2, x1, x2);
+    a.msr(fpcr, x2);
+    a.mrs(x2, fpcr);
+    a.msr(fpcr, x1);
+    a.str(x2, ptr(x0));
+    a.ret(x30);
+    ProbeFn fn = nullptr;
+    if (rt.add(&fn, &code) != asmjit::kErrorOk) return nullptr;
+    return fn;
+}
+
 #if defined(_WIN32)
 // The probe has no unwind info; the unwinder treats a function without a
 // .pdata entry as a leaf (pc ← lr, sp unchanged), which it is. Catch every
@@ -259,7 +289,7 @@ void probe_guard_end() {
 struct FeatureState {
     bool          init = false;
     FeatureReport os[kCount];
-    int8_t        probe[kCount];   // 1 executed, 0 faulted, -1 no probe
+    int8_t        probe[kCount];   // 1 passed, 0 faulted / bits did not stick, -1 no probe
     bool          has[kCount];
 };
 
@@ -278,11 +308,19 @@ FeatureState& state() {
         probe_guard_begin();
         for (size_t i = 0; i < kCount; ++i) {
             s.probe[i] = -1;
-            if (!kFeatures[i].probe) continue;
-            ProbeFn fn = build_probe(rt, kFeatures[i].probe);
-            if (!fn) continue;
-            s.probe[i] = run_probe(fn, scratch) ? 1 : 0;
-            rt.release(fn);
+            if (kFeatures[i].probe) {
+                ProbeFn fn = build_probe(rt, kFeatures[i].probe);
+                if (!fn) continue;
+                s.probe[i] = run_probe(fn, scratch) ? 1 : 0;
+                rt.release(fn);
+            } else if (const uint32_t bits = kFeatures[i].fpcr) {
+                ProbeFn fn = build_fpcr_probe(rt, bits);
+                if (!fn) continue;
+                uint64_t readback = 0;
+                const bool ran = run_probe(fn, &readback);
+                s.probe[i] = (ran && (readback & bits) == bits) ? 1 : 0;
+                rt.release(fn);
+            }
         }
         probe_guard_end();
     }
@@ -292,8 +330,9 @@ FeatureState& state() {
         case FeatureReport::Present:
             s.has[i] = s.probe[i] != 0;
             if (!s.has[i])
-                fprintf(stderr, "warning: the OS reports %s but its instruction raised an "
-                                "illegal-instruction trap; treating it as absent\n",
+                fprintf(stderr, "warning: the OS reports %s but its probe failed (illegal-"
+                                "instruction trap, or FPCR bits that read back as zero); "
+                                "treating it as absent\n",
                         kFeatures[i].name);
             break;
         case FeatureReport::Unknown:

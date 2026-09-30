@@ -552,7 +552,7 @@ static void test_cpu_features() {
     section("CPU features (runtime detection)");
 
     static constexpr uint32_t kCount = static_cast<uint32_t>(CpuFeature::Count_);
-    char line[512];
+    char line[768];
     size_t n = 0;
     bool stable = true;
     for (uint32_t i = 0; i < kCount; ++i) {
@@ -570,7 +570,8 @@ static void test_cpu_features() {
     // OS report versus instruction probe, per feature. "os" is what the OS
     // says (1/0/? for present/absent/unknown), "probe" is what happened when
     // one instruction of the feature was executed (ok/ILL/- for executed,
-    // trapped, no probe). The OS claiming a feature whose instruction traps
+    // trapped, no probe; for FEAT_AFP, whose probe is "do its FPCR bits
+    // stick", ILL means they read back as zero). The OS claiming a feature whose instruction traps
     // is the case that kills a benchmark run mid-test, so it is a hard FAIL;
     // a feature the OS hides is merely noted.
     n = 0;

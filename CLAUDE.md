@@ -119,6 +119,8 @@ All test code is JIT-emitted via AsmJit. The host compiler only sees C++ method 
   present whose probe traps is treated as absent with a warning on stderr; a feature the OS
   has no report for is decided by the probe. All probes run on the first `cpu_has()` call
   (one handler install, one pass; call it from the main thread before spawning threads).
+  FEAT_AFP adds FPCR bits rather than instructions, so its row carries the bits instead
+  (`kFeatures[].fpcr`) and the probe checks that they read back as written.
   `cpu_os_reports()` / `cpu_probe()` expose the two inputs; the selftest cross-checks them
   and FAILs on "reported present but trapped", which is the case that would otherwise kill a
   benchmark run mid-test.
@@ -651,3 +653,4 @@ platform to confirm. See "JIT and compile-time CPU feature macros" above.
 | FEAT_LRCPC / LRCPC2 / LRCPC3 | `FEAT_LRCPC` / `FEAT_LRCPC2` / `FEAT_LRCPC3` | ISAR1.LRCPC ≥ 1 / ≥ 2 / ≥ 3 (PF 45 for LRCPC) | LDAPR / LDAPUR / LDIAPP |
 | FEAT_SVE / SVE2 | `hw.optional.arm.FEAT_SVE` (absent on Apple) | `PF_ARM_SVE_INSTRUCTIONS_AVAILABLE` (46) / `PF_ARM_SVE2_…` (47) only — OS enablement | none |
 | FEAT_SME | `hw.optional.arm.FEAT_SME` (M4+) | no source; Unknown with no probe → absent | none |
+| FEAT_AFP | `hw.optional.arm.FEAT_AFP` (Linux: `HWCAP2_AFP`, bit 20) | MMFR1.AFP ≥ 1 (`CP 4039`; no PF flag) | not an instruction: write FPCR.FIZ/AH/NEP (bits 0–2, RES0 without AFP), read FPCR back, restore |
