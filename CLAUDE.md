@@ -1,6 +1,9 @@
 # arm64bench
 
-Precision microarchitecture benchmarking framework for ARM64/AArch64 processors. Measures CPU performance across integer ALU, memory hierarchy, branch prediction, and FP/NEON SIMD. Targets Apple Silicon (macOS), Windows ARM64, and Linux AArch64.
+Precision microarchitecture benchmarking framework for ARM64/AArch64
+processors. Measures CPU performance across integer ALU, memory hierarchy,
+branch prediction, and FP/NEON SIMD. Targets Apple Silicon (macOS), Windows
+ARM64, and Linux AArch64.
 
 ## Build
 
@@ -25,7 +28,8 @@ Targets: `arm64bench` (the benchmark), `arm64bench_core` (static library with ev
 `main()`), `arm64bench_selftest` (measurement-machinery tests). CTest registers `selftest` and
 `smoke` (= `arm64bench --all --smoke`).
 
-Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware PMU cycle counting; unprivileged runs fall back to Tier 2 ratio normalization.
+Run with `sudo ./arm64bench` on macOS 15+ (Sequoia/Tahoe) to enable hardware
+PMU cycle counting; unprivileged runs fall back to Tier 2 ratio normalization.
 
 ## Run
 
@@ -105,7 +109,11 @@ Default (no flags): runs integer and memory tests.
 
 ### JIT and compile-time CPU feature macros
 
-All test code is JIT-emitted via AsmJit. The host compiler only sees C++ method calls like `a.usdot(...)` — it never emits the target instruction itself. Therefore **compile-time feature macros (`__ARM_FEATURE_CRYPTO`, `__ARM_FEATURE_I8MM`, etc.) are never needed** to guard JIT test code. Use only runtime feature detection:
+All test code is JIT-emitted via AsmJit. The host compiler only sees C++ method
+calls like `a.usdot(...)` — it never emits the target instruction itself.
+Therefore **compile-time feature macros (`__ARM_FEATURE_CRYPTO`,
+`__ARM_FEATURE_I8MM`, etc.) are never needed** to guard JIT test code. Use only
+runtime feature detection:
 
 - **macOS**: `sysctlbyname("hw.optional.arm.FEAT_XXX", ...)` — comprehensive, reliable
 - **Windows**: the ID_AA64ISAR0/ISAR1/PFR0_EL1 values the kernel mirrors into the registry
@@ -234,14 +242,22 @@ section; use the shared pieces:
 
 1. Warm-up calls (default 2) to prime I-cache and prefetchers
 2. Brief sleep after warm-up to stabilize CPU frequency
-3. Elevate thread priority (`PriorityGuard`: `SCHED_FIFO` on POSIX, which on macOS is also what keeps the samples on P-cores; skipped for a `--cpu e` run on macOS)
-4. Per-sample mini warm-up (1 call) immediately before each timed sample, to re-prime L1 I/D-cache after any thread migration during the inter-sample sleep
+3. Elevate thread priority (`PriorityGuard`: `SCHED_FIFO` on POSIX, which on
+   macOS is also what keeps the samples on P-cores; skipped for a `--cpu e` run
+   on macOS)
+4. Per-sample mini warm-up (1 call) immediately before each timed sample, to
+   re-prime L1 I/D-cache after any thread migration during the inter-sample
+   sleep
 5. Tick-aligned sampling (`wait_for_tick()`) before each measurement
 6. 20ms inter-sample sleep for scheduler stability
 7. Discard slowest sample(s) to remove outlier preemptions
-8. Report min/median ns/insn, cycles/insn (direct from PMU if available, else ratio-normalized or derived from calibrated frequency), and CoV% with a `!` above 5 %: the spread of the PMU cycle counts when the PMU is the cycle source, of the wall times otherwise
+8. Report min/median ns/insn, cycles/insn (direct from PMU if available, else
+   ratio-normalized or derived from calibrated frequency), and CoV% with a `!`
+   above 5 %: the spread of the PMU cycle counts when the PMU is the cycle
+   source, of the wall times otherwise
 
-Console output cycle source indicators: `clk ` = PMU hardware, `clk~` = Tier 2 ratio, `clk*` = calibrated frequency, `clk?` = unknown.
+Console output cycle source indicators: `clk ` = PMU hardware, `clk~` = Tier
+2 ratio, `clk*` = calibrated frequency, `clk?` = unknown.
 
 ## Measurement Reliability: P-state and Clock Frequency
 
@@ -429,57 +445,69 @@ ops per instruction (vs 16 for SDOT). However, on Apple M5, benchmarking shows:
 - SMMLA throughput = 1/cycle (vs 2 SDOT/cycle)
 - **Net MAC throughput = identical to SDOT** (32 MACs/cycle either way)
 
-This indicates M5 implements SMMLA as two sequential SDOT micro-ops internally. There is no
-micro-architectural benefit to using SMMLA over SDOT on Apple M5. Whether Snapdragon Oryon has
-dedicated matrix-multiply hardware (and therefore higher SMMLA MAC throughput) is an open question.
+This indicates M5 implements SMMLA as two sequential SDOT micro-ops internally.
+There is no micro-architectural benefit to using SMMLA over SDOT on Apple M5.
+Whether Snapdragon Oryon has dedicated matrix-multiply hardware (and therefore
+higher SMMLA MAC throughput) is an open question.
 
 ### Fusion tests: what throughput can and cannot show (gen_frontend.cpp)
 
-A fused pair is one micro-op, so pairs/clk should match the cheaper single's rate. That only
-discriminates when the two halves would otherwise compete for the same resource. On M5 the
-branch unit and the ALUs are separate ports, so unfused CMP+B.NE can already reach the branch
-rate; the measured 0.41 clk/pair versus 0.35 for B.NE alone is consistent with either. ADRP+ADD
-at exactly the ADRP-alone rate, well under the sum, is the clearer case.
+A fused pair is one micro-op, so pairs/clk should match the cheaper single's
+rate. That only discriminates when the two halves would otherwise compete for
+the same resource. On M5 the branch unit and the ALUs are separate ports, so
+unfused CMP+B.NE can already reach the branch rate; the measured 0.41 clk/pair
+versus 0.35 for B.NE alone is consistent with either. ADRP+ADD at exactly the
+ADRP-alone rate, well under the sum, is the clearer case.
 
-The width-bound test (pair + 8 or 18 NOPs per group, so the loop runs at the front-end's 10
-slots/clk) asks a different question: does a fused pair save a front-end slot? On M5 the answer
-is no for every pair, including AESE+AESMC, which the crypto latency test shows is fused: every
-10-instruction group costs exactly 1.0 clk and every 20-instruction group 2.0. The 10/clk limit
-is instruction fetch/decode, upstream of fusion; fused pairs are one micro-op downstream but
-still two instructions to the front end. A core that fuses in decode and renames narrower than
-it decodes would show 0.9 there.
+The width-bound test (pair + 8 or 18 NOPs per group, so the loop runs at the
+front-end's 10 slots/clk) asks a different question: does a fused pair save
+a front-end slot? On M5 the answer is no for every pair, including AESE+AESMC,
+which the crypto latency test shows is fused: every 10-instruction group costs
+exactly 1.0 clk and every 20-instruction group 2.0. The 10/clk limit is
+instruction fetch/decode, upstream of fusion; fused pairs are one micro-op
+downstream but still two instructions to the front end. A core that fuses in
+decode and renames narrower than it decodes would show 0.9 there.
 
 ### Pointer-chase stride and set conflicts
 
-`gen_memory.cpp`'s latency sweep chases one node per cache line (64 B stride), so a buffer of B
-bytes occupies B bytes of every level and the boundaries land at the real capacities (M5: 3 clk
-through 128 KB, 12.9 clk at 256 KB). The other chase tests (`gen_ooo`, `gen_mlp`, `gen_prefetch`)
-use a 256 B node stride. That touches only every fourth set, so a buffer of B bytes holds B/4
-bytes of data in the cache; the level a buffer lands in is still decided by lines per set, so
-the boundary in *buffer* bytes is unchanged (a 128 KB buffer fits an 8-way 128 KB L1 at either
-stride), but anything that reasons in bytes of data (footprint, bandwidth, "how much of L2 is
-this") must divide by four. `gen_mlp.cpp` picks its footprints with that in mind (64 KB =
-L1-resident control, 2 MB = L2). If a test needs the full data capacity, use a 64 B stride;
+`gen_memory.cpp`'s latency sweep chases one node per cache line (64 B stride),
+so a buffer of B bytes occupies B bytes of every level and the boundaries land
+at the real capacities (M5: 3 clk through 128 KB, 12.9 clk at 256 KB). The
+other chase tests (`gen_ooo`, `gen_mlp`, `gen_prefetch`) use a 256 B node
+stride. That touches only every fourth set, so a buffer of B bytes holds B/4
+bytes of data in the cache; the level a buffer lands in is still decided by
+lines per set, so the boundary in *buffer* bytes is unchanged (a 128 KB buffer
+fits an 8-way 128 KB L1 at either stride), but anything that reasons in bytes
+of data (footprint, bandwidth, "how much of L2 is this") must divide by four.
+`gen_mlp.cpp` picks its footprints with that in mind (64 KB = L1-resident
+control, 2 MB = L2). If a test needs the full data capacity, use a 64 B stride;
 the random permutation defeats the next-line prefetcher either way.
 
 ### Out-of-order window probe: lessons (gen_ooo.cpp)
 
-- **Every timed call must traverse the whole pointer ring.** A partial walk revisits the same
-  nodes every call; the per-sample warm-up then leaves them in L2 and a "DRAM miss" silently
-  becomes an L2 hit (27 ns instead of 81 ns on M5). `loops = ring_nodes / misses_per_iteration`.
-- **Check overlap before trusting knees:** two independent chains with no fillers must cost the
-  same as one (`overlap factor ≈ 1.0`). If it is ~2–3×, the misses are not real misses.
-- **Fillers must not touch the structure you are not measuring.** `LDR xN` consumes an integer
-  physical register, so its knee is the int PRF; `LDR XZR` is a load-queue entry with no register.
-  NOPs on M5 show no limit to 2048 — they are apparently dropped before allocation.
-- **Two dependent misses per chain** double the shadow (~750 clk) so 2 × 2048 fillers stay inside it.
-- **Flags and branches are structures too.** `CMP x2, x3` allocates a flag physical register and
-  nothing else (knee ≈ 170–179 on M5); a never-taken `B.EQ` (flags set NE once in setup) allocates a
-  branch-order-buffer entry (knee ≈ 194–203; a taken-to-next-instruction B.NE gave the same knee on M5
-  but 42–51 vs 154–163 on the two Neoverse N2 CI legs, so keep it not taken). Both are smaller than the integer PRF, so a filler that sets flags or branches
-  measures those, not the PRF or ROB.
-- **Masked pointers** (`link ^ 0xA5A5…`, unmasked with EOR) defeat any data-dependent prefetcher;
-  M5 showed no plain-vs-masked difference (DIT made none either), but the sweeps use masked rings.
+- **Every timed call must traverse the whole pointer ring.** A partial walk
+  revisits the same nodes every call; the per-sample warm-up then leaves them
+  in L2 and a "DRAM miss" silently becomes an L2 hit (27 ns instead of 81 ns on
+  M5). `loops = ring_nodes / misses_per_iteration`.
+- **Check overlap before trusting knees:** two independent chains with no
+  fillers must cost the same as one (`overlap factor ≈ 1.0`). If it is ~2–3×,
+  the misses are not real misses.
+- **Fillers must not touch the structure you are not measuring.** `LDR xN`
+  consumes an integer physical register, so its knee is the int PRF; `LDR XZR`
+  is a load-queue entry with no register.  NOPs on M5 show no limit to 2048
+  — they are apparently dropped before allocation.
+- **Two dependent misses per chain** double the shadow (~750 clk) so 2 × 2048
+  fillers stay inside it.
+- **Flags and branches are structures too.** `CMP x2, x3` allocates a flag
+  physical register and nothing else (knee ≈ 170–179 on M5); a never-taken
+  `B.EQ` (flags set NE once in setup) allocates a branch-order-buffer entry
+  (knee ≈ 194–203; a taken-to-next-instruction B.NE gave the same knee on M5
+  but 42–51 vs 154–163 on the two Neoverse N2 CI legs, so keep it not taken).
+  Both are smaller than the integer PRF, so a filler that sets flags or
+  branches measures those, not the PRF or ROB.
+- **Masked pointers** (`link ^ 0xA5A5…`, unmasked with EOR) defeat any
+  data-dependent prefetcher; M5 showed no plain-vs-masked difference (DIT made
+  none either), but the sweeps use masked rings.
 
 ### Streaming SVE via SME (gen_sve.cpp)
 
